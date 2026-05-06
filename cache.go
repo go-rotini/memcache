@@ -37,6 +37,11 @@ type Cache[K comparable, V any] struct {
 	// from cfg.expireFunc, or nil when none is configured.
 	expireFunc func(key K, value V, meta Metadata) bool
 
+	// tags is the cache-level inverted index used by SetWithTags
+	// and InvalidateTag. Always non-nil; an empty index has zero
+	// memory cost beyond the struct itself.
+	tags *tagIndex[K]
+
 	shards    []*shard[K, V]
 	shardMask uint64
 
@@ -141,6 +146,7 @@ func build[K comparable, V any](cfg *config, allowUnbounded bool) (*Cache[K, V],
 		weigher:    weigher,
 		loader:     loader,
 		expireFunc: expireFunc,
+		tags:       newTagIndex[K](),
 		shards:     make([]*shard[K, V], shardCount),
 		shardMask:  uint64(shardCount - 1),
 		counters:   &statsCounters{},
@@ -586,6 +592,10 @@ func (c *Cache[K, V]) upsertWithAbsoluteExpiryLocked(
 		expireAt = sc.expireAt.UnixNano()
 	}
 	if existing, ok := s.entries[key]; ok {
+		var oldTags []string
+		if c.tags != nil && len(existing.tags) > 0 {
+			oldTags = append([]string(nil), existing.tags...)
+		}
 		c.counters.bytes.Add(-existing.weight + weight)
 		existing.value = value
 		existing.weight = weight
@@ -596,6 +606,12 @@ func (c *Cache[K, V]) upsertWithAbsoluteExpiryLocked(
 		// SetExpireAt always implies absolute, never sliding.
 		existing.flags &^= flagSliding
 		existing.slidingTTL = 0
+		if len(sc.tags) > 0 {
+			existing.tags = append(existing.tags[:0], sc.tags...)
+		} else {
+			existing.tags = existing.tags[:0]
+		}
+		c.retagLocked(key, oldTags, sc.tags)
 		s.expiryFix(existing)
 		s.policy.OnUpdate(existing)
 		if c.cfg.statsEnabled {
@@ -619,6 +635,7 @@ func (c *Cache[K, V]) upsertWithAbsoluteExpiryLocked(
 	s.entries[key] = e
 	s.expiryAdd(e)
 	s.policy.OnInsert(e)
+	c.retagLocked(key, nil, sc.tags)
 	c.counters.entries.Add(1)
 	c.counters.bytes.Add(weight)
 	if c.cfg.statsEnabled {
@@ -667,6 +684,9 @@ func (c *Cache[K, V]) Reset() {
 		}
 		s.expHeap = s.expHeap[:0]
 		s.mu.Unlock()
+	}
+	if c.tags != nil {
+		c.tags.reset()
 	}
 }
 
@@ -756,6 +776,12 @@ func (c *Cache[K, V]) upsertLocked(
 		expireAt = now + int64(effectiveTTL)
 	}
 	if existing, ok := s.entries[key]; ok {
+		// Capture the prior tag set before we overwrite the
+		// slice; retagLocked needs the full old set to untag.
+		var oldTags []string
+		if c.tags != nil && len(existing.tags) > 0 {
+			oldTags = append([]string(nil), existing.tags...)
+		}
 		c.counters.bytes.Add(-existing.weight + weight)
 		existing.value = value
 		existing.weight = weight
@@ -775,6 +801,7 @@ func (c *Cache[K, V]) upsertLocked(
 		} else {
 			existing.tags = existing.tags[:0]
 		}
+		c.retagLocked(key, oldTags, tags)
 		s.expiryFix(existing)
 		s.policy.OnUpdate(existing)
 		if c.cfg.statsEnabled {
@@ -802,6 +829,7 @@ func (c *Cache[K, V]) upsertLocked(
 	s.entries[key] = e
 	s.expiryAdd(e)
 	s.policy.OnInsert(e)
+	c.retagLocked(key, nil, tags)
 	c.counters.entries.Add(1)
 	c.counters.bytes.Add(weight)
 	if c.cfg.statsEnabled {
@@ -876,11 +904,16 @@ func (c *Cache[K, V]) callExpireFunc(e *entry[K, V]) (expired, panicked bool) {
 }
 
 // removeLocked deletes e from the shard and notifies the policy. The
-// caller must hold s.mu.
+// caller must hold s.mu. Tags carried by the entry are unindexed
+// from the cache-level tagIndex so future InvalidateTag calls do
+// not see this key.
 func (c *Cache[K, V]) removeLocked(s *shard[K, V], e *entry[K, V], reason EvictionReason) {
 	delete(s.entries, e.key)
 	s.expiryRemove(e)
 	s.policy.OnRemove(e)
+	if c.tags != nil && len(e.tags) > 0 {
+		c.tags.untag(e.key, e.tags)
+	}
 	c.counters.entries.Add(-1)
 	c.counters.bytes.Add(-e.weight)
 	if c.cfg.statsEnabled {
@@ -969,6 +1002,9 @@ func (c *Cache[K, V]) Clear() {
 		}
 		s.expHeap = s.expHeap[:0]
 		s.mu.Unlock()
+	}
+	if c.tags != nil {
+		c.tags.reset()
 	}
 }
 
@@ -1673,6 +1709,11 @@ func (c *Cache[K, V]) insertNegativeTombstoneLocked(s *shard[K, V], key K) {
 	now := c.cfg.clock.Now().UnixNano()
 	expireAt := now + int64(c.cfg.negativeTTL)
 	if existing, ok := s.entries[key]; ok {
+		// Negative tombstones carry no tags; untag the prior set.
+		if c.tags != nil && len(existing.tags) > 0 {
+			c.tags.untag(key, existing.tags)
+			existing.tags = existing.tags[:0]
+		}
 		var zero V
 		existing.value = zero
 		existing.weight = 1
@@ -1749,4 +1790,56 @@ func waitForFlight[V any](ctx context.Context, flight *flightCall[V]) (V, error)
 	case <-ctx.Done():
 		return zero, ctx.Err() //nolint:wrapcheck // pass ctx.Err verbatim
 	}
+}
+
+// GetMulti returns the cached value for each key in keys. Missing
+// or expired keys are absent from the returned map. The returned
+// map is freshly allocated; callers may mutate it freely.
+//
+// Each lookup goes through [Cache.Get], so refresh-ahead /
+// stale-while-revalidate / sliding-TTL touch all behave the same
+// as for individual gets.
+func (c *Cache[K, V]) GetMulti(keys []K) map[K]V {
+	if c.closed.Load() || len(keys) == 0 {
+		return map[K]V{}
+	}
+	out := make(map[K]V, len(keys))
+	for _, k := range keys {
+		if v, ok := c.Get(k); ok {
+			out[k] = v
+		}
+	}
+	return out
+}
+
+// SetMulti stores every (key, value) in items. On the first error,
+// SetMulti returns immediately; entries successfully stored before
+// the failure remain in the cache (no rollback). Useful when callers
+// can tolerate partial state and want lower per-call overhead than
+// many [Cache.Set] invocations.
+func (c *Cache[K, V]) SetMulti(items map[K]V) error {
+	if c.closed.Load() {
+		return ErrClosed
+	}
+	for k, v := range items {
+		if err := c.Set(k, v); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// DeleteMulti removes every key in keys. Returns the number of
+// entries actually removed (absent keys are silently skipped).
+func (c *Cache[K, V]) DeleteMulti(keys []K) int {
+	if c.closed.Load() || len(keys) == 0 {
+		return 0
+	}
+	count := 0
+	for _, k := range keys {
+		if c.Delete(k) {
+			count++
+		}
+	}
+	return count
 }
