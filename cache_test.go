@@ -299,6 +299,40 @@ func TestWithWeigherCountsBytes(t *testing.T) {
 	}
 }
 
+func TestApplyJitterBounds(t *testing.T) {
+	const ttl = 1000 * time.Millisecond
+	const jitter = 100 * time.Millisecond
+	for range 200 {
+		out := applyJitter(ttl, jitter)
+		if out < ttl-jitter || out > ttl+jitter {
+			t.Fatalf("applyJitter out of range: got %v, want %v ± %v", out, ttl, jitter)
+		}
+	}
+}
+
+func TestApplyJitterClampsToQuarterTTL(t *testing.T) {
+	// Jitter > ttl/4 should be clamped to ttl/4 to keep results positive.
+	const ttl = 100 * time.Millisecond
+	const jitter = ttl // larger than ttl/4
+	for range 50 {
+		out := applyJitter(ttl, jitter)
+		// Clamped jitter is ttl/4 = 25ms, so result is in [75ms, 125ms].
+		if out < ttl-(ttl/4) || out > ttl+(ttl/4) {
+			t.Fatalf("clamped jitter out of range: got %v", out)
+		}
+	}
+}
+
+func TestApplyJitterDisabled(t *testing.T) {
+	// Zero or negative jitter must be a no-op.
+	if applyJitter(time.Second, 0) != time.Second {
+		t.Error("zero jitter should not modify TTL")
+	}
+	if applyJitter(time.Second, -time.Second) != time.Second {
+		t.Error("negative jitter should not modify TTL")
+	}
+}
+
 func TestNextPowerOfTwo(t *testing.T) {
 	cases := []struct{ in, want int }{
 		{0, 1}, {1, 1}, {2, 2}, {3, 4}, {7, 8},

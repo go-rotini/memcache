@@ -2,6 +2,7 @@ package memcache
 
 import (
 	"fmt"
+	"math/rand/v2"
 	"sync/atomic"
 	"time"
 
@@ -131,6 +132,25 @@ func build[K comparable, V any](cfg *config, allowUnbounded bool) (*Cache[K, V],
 	}
 
 	return c, nil
+}
+
+// applyJitter returns ttl with uniform jitter in [-j, +j]. Per the
+// spec, jitter is clamped to ttl/4 to keep the resulting expiry
+// strictly positive even on aggressive jitter settings. Returns ttl
+// unmodified when j is non-positive.
+func applyJitter(ttl, j time.Duration) time.Duration {
+	if j <= 0 {
+		return ttl
+	}
+	if j > ttl/4 {
+		j = ttl / 4
+	}
+	if j <= 0 {
+		return ttl
+	}
+	// rand.Int64N(2*j) is in [0, 2*j); subtract j to get [-j, +j-1].
+	delta := rand.Int64N(int64(2*j)) - int64(j)
+	return ttl + time.Duration(delta)
 }
 
 // perShardBudget computes the per-shard target entry count from a
@@ -470,7 +490,7 @@ func (c *Cache[K, V]) setLocked(key K, value V, ttl time.Duration, sliding bool,
 	now := c.cfg.clock.Now().UnixNano()
 	var expireAt int64
 	if ttl > 0 {
-		expireAt = now + int64(ttl)
+		expireAt = now + int64(applyJitter(ttl, c.cfg.ttlJitter))
 	}
 
 	s.mu.Lock()
