@@ -4,6 +4,9 @@ import (
 	"errors"
 	"fmt"
 	"reflect"
+	"runtime"
+	"strconv"
+	"sync"
 	"time"
 )
 
@@ -17,6 +20,64 @@ var (
 	// returns a [ComputeAction] outside the defined set.
 	errUnknownComputeAction = errors.New("memcache: unknown ComputeAction")
 )
+
+// activeCompute is a process-wide registry of goroutines currently
+// inside a Compute callback. Maps `goroutineID -> struct{}`. The
+// re-entrancy detector consults this on every Compute entry — if
+// the current goroutine is already in the map, the callback has
+// re-entered the cache and we panic with [ErrComputeReentrant]
+// rather than deadlocking on the shard mutex.
+//
+// The cost is one `runtime.Stack` parse per Compute call (to
+// extract the goroutine ID). Acceptable per spec §19.2.6 given
+// how nasty the deadlock would otherwise be to debug.
+var activeCompute sync.Map
+
+// goroutineID returns the calling goroutine's ID by parsing
+// `runtime.Stack`'s "goroutine N [...]:" prefix. Allocates a small
+// scratch buffer; cost is dominated by stack-trace formatting.
+//
+// Returns 0 if parsing fails (defensive — the package would still
+// detect re-entrancy at the next Compute frame, just with
+// different IDs).
+func goroutineID() uint64 {
+	var buf [64]byte
+	n := runtime.Stack(buf[:], false)
+	// Layout: "goroutine N [status]:\n..."
+	const prefix = "goroutine "
+	if n < len(prefix) || string(buf[:len(prefix)]) != prefix {
+		return 0
+	}
+	rest := buf[len(prefix):n]
+	end := 0
+	for end < len(rest) && rest[end] >= '0' && rest[end] <= '9' {
+		end++
+	}
+	id, err := strconv.ParseUint(string(rest[:end]), 10, 64)
+	if err != nil {
+		return 0
+	}
+	return id
+}
+
+// reentryGuard registers the current goroutine as "in compute" and
+// returns an unregister closure for the deferred cleanup. The
+// caller MUST `defer` the returned function; otherwise nested
+// Computes leak guard slots.
+//
+// Panics with [ErrComputeReentrant] when the current goroutine is
+// already in the registry — i.e., a Compute callback called back
+// into Compute on the cache.
+func reentryGuard() func() {
+	gid := goroutineID()
+	if gid == 0 {
+		return func() {}
+	}
+	if _, loaded := activeCompute.LoadOrStore(gid, struct{}{}); loaded {
+		panic(ErrComputeReentrant)
+	}
+	return func() { activeCompute.Delete(gid) }
+}
 
 // Compute atomically applies fn to the entry for key. fn receives
 // the current value (or the zero V when absent) and a presence
@@ -51,6 +112,7 @@ func (c *Cache[K, V]) Compute(
 	if fn == nil {
 		return zero, errNilComputeFn
 	}
+	defer reentryGuard()()
 
 	s := c.shardFor(key)
 	now := c.cfg.clock.Now().UnixNano()
@@ -113,6 +175,7 @@ func (c *Cache[K, V]) ComputeIfAbsent(
 	if fn == nil {
 		return zero, false, errNilComputeFn
 	}
+	defer reentryGuard()()
 
 	s := c.shardFor(key)
 	now := c.cfg.clock.Now().UnixNano()
@@ -161,6 +224,7 @@ func (c *Cache[K, V]) ComputeIfPresent(
 	if fn == nil {
 		return zero, errNilComputeFn
 	}
+	defer reentryGuard()()
 
 	s := c.shardFor(key)
 	now := c.cfg.clock.Now().UnixNano()
@@ -208,6 +272,7 @@ func (c *Cache[K, V]) Update(key K, fn func(cur V) V) (V, error) {
 	if c.closed.Load() {
 		return zero, ErrClosed
 	}
+	defer reentryGuard()()
 	s := c.shardFor(key)
 	now := c.cfg.clock.Now().UnixNano()
 	s.mu.Lock()

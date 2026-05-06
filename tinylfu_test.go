@@ -23,8 +23,8 @@ func TestTinyLFUInsertGoesToWindow(t *testing.T) {
 	a := makeTinyLFUEntry("a")
 	p.OnInsert(a)
 	n := a.policyData.(*tinyLFUNode[string, int])
-	if n.inMain {
-		t.Error("new insert should land in Window, not Main")
+	if n.region != regionWindow {
+		t.Errorf("new insert region = %v, want %v", n.region, regionWindow)
 	}
 }
 
@@ -43,21 +43,20 @@ func TestTinyLFUAccessBumpsSketch(t *testing.T) {
 }
 
 func TestTinyLFUVictimWithSpareMainPromotesWindow(t *testing.T) {
-	// budget=100 → window=1, main=99. Insert 2 entries: window
-	// over-budget after second insert; first should promote to Main.
+	// budget=100 → window=1, protected≈79, probationary≈20. Insert
+	// 2 entries: window over-budget after second insert; first
+	// should demote to Probationary (free space).
 	p := newTinyLFU[string, int](100, noopHasher)
 	a := makeTinyLFUEntry("a")
 	b := makeTinyLFUEntry("b")
 	p.OnInsert(a)
 	p.OnInsert(b)
-	// Now windowSize=2 > windowBudget=1; main has spare capacity.
 	v := p.Victim()
 	if v != nil {
-		t.Errorf("with spare Main, Victim should promote not evict; got %v", v)
+		t.Errorf("with spare Probationary, Victim should demote not evict; got %v", v)
 	}
-	// "a" should be in Main now.
-	if !a.policyData.(*tinyLFUNode[string, int]).inMain {
-		t.Error("first inserted entry should have promoted to Main")
+	if got := a.policyData.(*tinyLFUNode[string, int]).region; got != regionProbationary {
+		t.Errorf("first inserted entry region = %v, want %v", got, regionProbationary)
 	}
 }
 
@@ -122,11 +121,38 @@ func TestTinyLFUReset(t *testing.T) {
 }
 
 func TestTinyLFUBudgetSplit(t *testing.T) {
-	// budget=200 → window=2 (1%), main=198.
+	// budget=200 → window=2 (1%), main=198 → protected≈158
+	// (80%), probationary≈40 (20%). Sum is 200.
 	p := newTinyLFU[string, int](200, noopHasher)
-	if p.windowBudget != 2 || p.mainBudget != 198 {
-		t.Errorf("split: window=%d main=%d, want 2, 198",
-			p.windowBudget, p.mainBudget)
+	if p.windowBudget != 2 {
+		t.Errorf("windowBudget = %d, want 2", p.windowBudget)
+	}
+	if p.protectedBudget+p.probationaryBudget+p.windowBudget != 200 {
+		t.Errorf("budgets do not sum to total: window=%d protected=%d probationary=%d",
+			p.windowBudget, p.protectedBudget, p.probationaryBudget)
+	}
+	// Protected should be roughly 3-4× probationary (80/20 split).
+	if p.protectedBudget < 3*p.probationaryBudget {
+		t.Errorf("protected (%d) too small vs probationary (%d) — expected ~80/20 split",
+			p.protectedBudget, p.probationaryBudget)
+	}
+}
+
+func TestTinyLFUProbationaryHitPromotesToProtected(t *testing.T) {
+	p := newTinyLFU[string, int](100, noopHasher)
+	a := makeTinyLFUEntry("a")
+	b := makeTinyLFUEntry("b")
+	p.OnInsert(a)
+	p.OnInsert(b)
+	// Drive a victim cycle to demote a to Probationary.
+	_ = p.Victim()
+	if got := a.policyData.(*tinyLFUNode[string, int]).region; got != regionProbationary {
+		t.Fatalf("setup: a should be in Probationary; got %v", got)
+	}
+	// A hit on a Probationary entry promotes to Protected.
+	p.OnAccess(a)
+	if got := a.policyData.(*tinyLFUNode[string, int]).region; got != regionProtected {
+		t.Errorf("after hit, a region = %v, want %v", got, regionProtected)
 	}
 }
 

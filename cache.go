@@ -789,10 +789,18 @@ func (c *Cache[K, V]) GetWithExpiry(key K) (V, time.Time, bool) {
 // [WithDefaultTTL] (use [Cache.SetWithTTL] when you need to bypass
 // the value's preference). If V implements [CacheTagger], its
 // CacheTags() are merged into the entry's tag set.
+//
+// After insertion, any [WithGroup]-bounded group whose name is in
+// the entry's tags is shrunk back to its configured capacity by
+// evicting the oldest member if necessary.
 func (c *Cache[K, V]) Set(key K, value V) error {
 	ttl := extractCacheableTTL(value, c.cfg.defaultTTL)
 	tags := extractCacheableTags(value)
-	return c.setLocked(key, value, ttl, c.cfg.slidingTTL, tags)
+	if err := c.setLocked(key, value, ttl, c.cfg.slidingTTL, tags); err != nil {
+		return err
+	}
+	c.enforceGroupBudgets(tags)
+	return nil
 }
 
 // SetWithTTL stores value under key with the given TTL. A TTL of 0
@@ -850,8 +858,6 @@ func (c *Cache[K, V]) SetWithOptions(key K, value V, opts ...SetOption) error {
 
 	s := c.shardFor(key)
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if sc.hasExpiry {
 		c.upsertWithAbsoluteExpiryLocked(s, key, value, weight, sc)
 	} else {
@@ -859,6 +865,11 @@ func (c *Cache[K, V]) SetWithOptions(key K, value V, opts ...SetOption) error {
 			effectiveTTL(sc.ttl, c.cfg.ttlJitter),
 			sc.sliding, int64(sc.ttl), sc.tags)
 	}
+	s.mu.Unlock()
+	// Group enforcement runs OUTSIDE the shard lock so it can
+	// take other shards' locks freely without inverting the
+	// standard "shard then index" lock order.
+	c.enforceGroupBudgets(sc.tags)
 	return nil
 }
 
@@ -1989,6 +2000,7 @@ func (c *Cache[K, V]) loadOrJoin(
 
 	// Already-in-flight: join the existing call.
 	if flight, ok := s.inflight[key]; ok {
+		flight.join()
 		s.mu.Unlock()
 		if c.cfg.statsEnabled {
 			c.counters.loadCoalesced.Add(1)
@@ -2009,17 +2021,28 @@ func (c *Cache[K, V]) loadOrJoin(
 		return zero, ErrLoaderRateLimited
 	}
 
-	// Leader path: create a new flight, launch the loader.
-	flight := newFlightCall[V]()
+	// Leader path: create a new flight with a cancellable
+	// context. The flight's refcount starts at 1 (the leader
+	// itself). Followers `join()` to bump it; ctx-cancel exits
+	// `leave()` to decrement. When the count reaches zero we
+	// cancel loaderCtx — the Loader sees ctx.Done and can abort.
+	loaderCtx, cancel := c.newLoaderCtx()
+	flight := newFlightCall[V](cancel)
 	s.inflight[key] = flight
 	s.mu.Unlock()
 
-	// runLoader manages its own context (Background +
-	// WithLoaderTimeout). Detaching from the caller's ctx is
-	// intentional: a single canceling caller must not abort the
-	// load while other waiters still want it.
-	go c.runLoader(s, key, flight, fn) //nolint:contextcheck // detached by design
+	go c.runLoader(loaderCtx, s, key, flight, fn) //nolint:contextcheck // detached by design
 	return waitForFlight(ctx, flight)
+}
+
+// newLoaderCtx builds the loader's context. Always cancellable so
+// ctx-aggregation can fire; honors [WithLoaderTimeout] when
+// configured.
+func (c *Cache[K, V]) newLoaderCtx() (context.Context, context.CancelFunc) {
+	if c.cfg.loaderTimeout > 0 {
+		return context.WithTimeout(context.Background(), c.cfg.loaderTimeout)
+	}
+	return context.WithCancel(context.Background())
 }
 
 // runLoader executes fn in a fresh goroutine, persists the result
@@ -2030,16 +2053,14 @@ func (c *Cache[K, V]) loadOrJoin(
 // stored val/err under happens-before guarantees from the channel
 // close.
 func (c *Cache[K, V]) runLoader(
+	loaderCtx context.Context,
 	s *shard[K, V], key K, flight *flightCall[V],
 	fn func(ctx context.Context, key K) (V, time.Duration, error),
 ) {
 	defer close(flight.done)
-
-	loaderCtx := context.Background()
-	if c.cfg.loaderTimeout > 0 {
-		var cancel context.CancelFunc
-		loaderCtx, cancel = context.WithTimeout(loaderCtx, c.cfg.loaderTimeout)
-		defer cancel()
+	// Always release the cancellable context the leader prepared.
+	if flight.cancel != nil {
+		defer flight.cancel()
 	}
 
 	// Concurrency cap: acquire a slot before invoking the loader.
@@ -2221,14 +2242,19 @@ func (c *Cache[K, V]) triggerAsyncRefreshLocked(s *shard[K, V], key K) {
 	if _, busy := s.inflight[key]; busy {
 		return
 	}
-	flight := newFlightCall[V]()
+	loaderCtx, cancel := c.newLoaderCtx()
+	flight := newFlightCall[V](cancel)
 	s.inflight[key] = flight
-	go c.runLoader(s, key, flight, c.loader.Load)
+	go c.runLoader(loaderCtx, s, key, flight, c.loader.Load)
 }
 
 // waitForFlight blocks until the flight resolves or ctx is canceled.
-// On ctx cancel the loader keeps running (other waiters may still
-// want the result); the canceling waiter just returns ctx.Err.
+// On ctx cancel the canceling waiter decrements the flight's
+// refcount via [flightCall.leave]; the loader keeps running while
+// any other waiter is still interested. When ALL waiters have
+// canceled, leave's atomic decrement reaches zero and the flight's
+// stored cancel function fires — the Loader's context goes Done
+// and (if it respects ctx) the load aborts with ctx.Canceled.
 func waitForFlight[V any](ctx context.Context, flight *flightCall[V]) (V, error) {
 	var zero V
 	select {
@@ -2238,6 +2264,7 @@ func waitForFlight[V any](ctx context.Context, flight *flightCall[V]) (V, error)
 		}
 		return flight.val, nil
 	case <-ctx.Done():
+		flight.leave()
 		return zero, ctx.Err() //nolint:wrapcheck // pass ctx.Err verbatim
 	}
 }

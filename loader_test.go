@@ -155,6 +155,101 @@ func TestStampede1000Goroutines(t *testing.T) {
 	}
 }
 
+func TestCtxAggregationCancelsLoaderWhenAllCancel(t *testing.T) {
+	// Two waiters; both cancel their ctx → loader's ctx.Done
+	// fires and the loader returns ctx.Canceled.
+	cancelObserved := atomic.Bool{}
+	loader := LoaderFunc[string, int](func(ctx context.Context, _ string) (int, time.Duration, error) {
+		<-ctx.Done()
+		cancelObserved.Store(true)
+		return 0, 0, ctx.Err()
+	})
+	c, _ := New[string, int](
+		WithMaxEntries(4),
+		WithLoader[string, int](loader),
+	)
+	defer c.Close()
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	r1 := make(chan error, 1)
+	r2 := make(chan error, 1)
+	go func() { _, err := c.GetOrLoad(ctx1, "k"); r1 <- err }()
+	// Give first goroutine time to register the flight before
+	// the second joins.
+	time.Sleep(10 * time.Millisecond)
+	go func() { _, err := c.GetOrLoad(ctx2, "k"); r2 <- err }()
+	time.Sleep(10 * time.Millisecond)
+
+	// Cancel both.
+	cancel1()
+	cancel2()
+
+	for range 2 {
+		select {
+		case err := <-r1:
+			if !errors.Is(err, context.Canceled) {
+				t.Errorf("waiter 1 = %v, want context.Canceled", err)
+			}
+			r1 = nil
+		case err := <-r2:
+			if !errors.Is(err, context.Canceled) {
+				t.Errorf("waiter 2 = %v, want context.Canceled", err)
+			}
+			r2 = nil
+		case <-time.After(2 * time.Second):
+			t.Fatal("waiters did not return")
+		}
+	}
+	// Loader observation runs in a separate goroutine — poll
+	// briefly for the flag to flip rather than racing.
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		if cancelObserved.Load() {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Error("loader's ctx did not see Done after all waiters canceled")
+}
+
+func TestCtxPartialCancelKeepsLoaderRunning(t *testing.T) {
+	// One waiter cancels; the other doesn't. Loader keeps running
+	// and the surviving waiter receives the value.
+	hold := make(chan struct{})
+	loader := LoaderFunc[string, int](func(_ context.Context, _ string) (int, time.Duration, error) {
+		<-hold
+		return 99, 0, nil
+	})
+	c, _ := New[string, int](
+		WithMaxEntries(4),
+		WithLoader[string, int](loader),
+	)
+	defer c.Close()
+
+	ctx1, cancel1 := context.WithCancel(context.Background())
+	r1 := make(chan error, 1)
+	r2 := make(chan int, 1)
+	go func() { _, err := c.GetOrLoad(ctx1, "k"); r1 <- err }()
+	time.Sleep(10 * time.Millisecond)
+	go func() {
+		v, _ := c.GetOrLoad(context.Background(), "k")
+		r2 <- v
+	}()
+	time.Sleep(10 * time.Millisecond)
+
+	// Cancel only the first waiter.
+	cancel1()
+	if err := <-r1; !errors.Is(err, context.Canceled) {
+		t.Errorf("waiter 1 = %v, want context.Canceled", err)
+	}
+	// Loader still alive — release it.
+	close(hold)
+	if v := <-r2; v != 99 {
+		t.Errorf("surviving waiter = %d, want 99", v)
+	}
+}
+
 func TestGetOrLoadCtxCancelDoesNotAbortLoader(t *testing.T) {
 	hold := make(chan struct{})
 	loader := &countingLoader{value: 1, holdCh: hold}

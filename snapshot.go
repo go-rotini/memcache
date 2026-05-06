@@ -478,12 +478,19 @@ func (c *Cache[K, V]) writeRecord(w io.Writer, snap *entrySnapshot[K, V]) error 
 	return nil
 }
 
-// marshalValue runs the snapshot encoding for a value. When the
-// value's type implements [SnapshotMarshaler] the cache delegates
-// to it; otherwise the cache's [Codec] handles encoding. Both V
-// and *V are tried so types whose Marshal method has a pointer
-// receiver work even when V is a value type.
+// marshalValue runs the snapshot encoding for a value. Order of
+// dispatch:
+//
+//  1. Apply the `cache:"..."` struct-tag filter — fields tagged
+//     `-` or `secret` are zeroed in a defensive copy so they
+//     don't leak into the snapshot. Caches whose V type has no
+//     such tags (the common case) skip the copy.
+//  2. If the (possibly-filtered) value implements
+//     [SnapshotMarshaler], delegate to it. Both V and *V are
+//     tried so pointer-receiver methods on value V types work.
+//  3. Otherwise fall back to the cache's configured [Codec].
 func (c *Cache[K, V]) marshalValue(value V) ([]byte, error) {
+	value = applySnapshotFilter(value)
 	if m, ok := any(value).(SnapshotMarshaler); ok {
 		return m.SnapshotMarshal()
 	}

@@ -195,6 +195,81 @@ func (c *Cache[K, V]) Tags(key K) []string {
 	return append([]string(nil), e.tags...)
 }
 
+// enforceGroupBudgets bounds every configured group whose name
+// appears in tags by evicting the oldest members (by inserted
+// time) until the group's member count is within the configured
+// capacity. Called from public Set-style methods AFTER the shard
+// lock is released so it can take per-key shard locks freely
+// without inverting the standard lock order.
+//
+// Race tolerance: between checking len(members) and evicting,
+// concurrent Sets may push the group further over. enforceGroupBudgets
+// only brings the count down to capacity FROM ITS PERSPECTIVE; a
+// subsequent Set will run another pass. The bound is therefore
+// soft (eventually consistent) rather than strictly enforced
+// per-Set.
+func (c *Cache[K, V]) enforceGroupBudgets(tags []string) {
+	if len(c.cfg.groups) == 0 || len(tags) == 0 || c.tags == nil {
+		return
+	}
+	for _, tag := range tags {
+		capacity, ok := c.cfg.groups[tag]
+		if !ok {
+			continue
+		}
+		c.shrinkGroup(tag, capacity)
+	}
+}
+
+// shrinkGroup evicts oldest-first members of group `tag` until at
+// most `capacity` members remain.
+func (c *Cache[K, V]) shrinkGroup(tag string, capacity int) {
+	for {
+		members := c.tags.snapshot(tag)
+		if len(members) <= capacity {
+			return
+		}
+		oldestKey, ok := c.findOldestMember(members)
+		if !ok {
+			return
+		}
+		s := c.shardFor(oldestKey)
+		s.mu.Lock()
+		if e, exists := s.entries[oldestKey]; exists {
+			c.removeLocked(s, e, EvictReasonTag)
+		}
+		s.mu.Unlock()
+	}
+}
+
+// findOldestMember returns the key with the oldest `inserted`
+// timestamp from members. Returns (zero K, false) when members is
+// empty or every key has been concurrently removed.
+func (c *Cache[K, V]) findOldestMember(members []K) (K, bool) {
+	var oldestKey K
+	var oldestTime int64
+	found := false
+	for _, k := range members {
+		s := c.shardFor(k)
+		s.mu.RLock()
+		e, ok := s.entries[k]
+		var t int64
+		if ok {
+			t = e.inserted
+		}
+		s.mu.RUnlock()
+		if !ok {
+			continue
+		}
+		if !found || t < oldestTime {
+			oldestKey = k
+			oldestTime = t
+			found = true
+		}
+	}
+	return oldestKey, found
+}
+
 // retagLocked updates the tag index when an entry's tag set
 // changes. The caller MUST hold the shard write lock for key. Pass
 // nil for either slice to indicate "no tags on that side".

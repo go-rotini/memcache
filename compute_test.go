@@ -300,6 +300,63 @@ func TestComputeOnExpiredEntryTreatsAsAbsent(t *testing.T) {
 	}
 }
 
+func TestComputeReentrancyPanic(t *testing.T) {
+	c, _ := New[string, int](WithMaxEntries(4))
+	defer c.Close()
+	_ = c.Set("k", 1)
+
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal("expected panic on re-entrant Compute")
+		}
+		err, ok := r.(error)
+		if !ok || !errors.Is(err, ErrComputeReentrant) {
+			t.Errorf("panic value = %v, want ErrComputeReentrant", r)
+		}
+	}()
+	_, _ = c.Compute("k", func(int, bool) (int, ComputeAction, error) {
+		// Re-enter the cache from within the callback.
+		_, _ = c.Compute("other", func(int, bool) (int, ComputeAction, error) {
+			return 0, ComputeNoOp, nil
+		})
+		return 0, ComputeNoOp, nil
+	})
+	t.Fatal("Compute should have panicked")
+}
+
+func TestComputeReentrancyDeferredCleanup(t *testing.T) {
+	// After a Compute exits cleanly, subsequent Computes from the
+	// same goroutine MUST work — confirms the registry properly
+	// removes the goroutine on normal exit.
+	c, _ := New[string, int](WithMaxEntries(4))
+	defer c.Close()
+	for i := range 3 {
+		_, err := c.Compute(itoaSimple(i), func(int, bool) (int, ComputeAction, error) {
+			return i, ComputeStore, nil
+		})
+		if err != nil {
+			t.Fatalf("Compute %d: %v", i, err)
+		}
+	}
+}
+
+func TestComputeReentrancyAcrossGoroutinesAllowed(t *testing.T) {
+	// Re-entrancy detection is per-goroutine — concurrent Computes
+	// from distinct goroutines must NOT trip the guard.
+	c, _ := New[string, int](WithMaxEntries(64))
+	defer c.Close()
+	var wg sync.WaitGroup
+	for i := range 16 {
+		wg.Go(func() {
+			_, _ = c.Compute(itoaSimple(i), func(int, bool) (int, ComputeAction, error) {
+				return i, ComputeStore, nil
+			})
+		})
+	}
+	wg.Wait()
+}
+
 func TestComputeClosedReturnsErrClosed(t *testing.T) {
 	c, _ := New[string, int](WithMaxEntries(4))
 	_ = c.Close()

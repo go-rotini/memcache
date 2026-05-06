@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func TestSetWithTagsIndexesEntry(t *testing.T) {
@@ -263,6 +264,77 @@ func TestWithMaxTagsTotalRejects(t *testing.T) {
 	var ce *CapacityError
 	if !errors.As(err, &ce) || ce.LimitField != "MaxTagsTotal" {
 		t.Errorf("expected CapacityError(MaxTagsTotal); got %v", err)
+	}
+}
+
+func TestWithGroupCapsMembers(t *testing.T) {
+	c, _ := New[string, int](
+		WithMaxEntries(64),
+		WithGroup("session", 3),
+	)
+	defer c.Close()
+
+	// Add 5 entries with the "session" tag — capacity 3, so the
+	// oldest 2 should be evicted as we exceed the cap.
+	clk := NewFakeClock(time.Unix(0, 0))
+	c.cfg.clock = clk // Use fake clock for deterministic ordering.
+	for _, k := range []string{"a", "b", "c", "d", "e"} {
+		clk.Advance(time.Second)
+		if err := c.SetWithTags(k, 1, "session"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// "session" should now have at most 3 members.
+	members := c.tags.snapshot("session")
+	if len(members) != 3 {
+		t.Errorf("session group members = %d, want 3", len(members))
+	}
+	// "a" and "b" should be evicted (oldest by inserted).
+	if c.Has("a") || c.Has("b") {
+		t.Error("oldest members of bounded group should be evicted")
+	}
+	// "c", "d", "e" should survive.
+	for _, k := range []string{"c", "d", "e"} {
+		if !c.Has(k) {
+			t.Errorf("recent member %q should survive", k)
+		}
+	}
+}
+
+func TestWithGroupOnlyAffectsMatchingTags(t *testing.T) {
+	c, _ := New[string, int](
+		WithMaxEntries(32),
+		WithGroup("bounded", 2),
+	)
+	defer c.Close()
+
+	for _, k := range []string{"a", "b", "c"} {
+		_ = c.SetWithTags(k, 1, "bounded")
+	}
+	// Tags that aren't groups should be unaffected by the cap.
+	for _, k := range []string{"x", "y", "z"} {
+		_ = c.SetWithTags(k, 1, "unbounded")
+	}
+	if got := len(c.tags.snapshot("bounded")); got != 2 {
+		t.Errorf("bounded group size = %d, want 2", got)
+	}
+	if got := len(c.tags.snapshot("unbounded")); got != 3 {
+		t.Errorf("unbounded tag size = %d, want 3", got)
+	}
+}
+
+func TestWithGroupZeroDisables(t *testing.T) {
+	c, _ := New[string, int](
+		WithMaxEntries(32),
+		WithGroup("g", 5),
+		WithGroup("g", 0), // disable
+	)
+	defer c.Close()
+	for _, k := range []string{"a", "b", "c", "d", "e", "f"} {
+		_ = c.SetWithTags(k, 1, "g")
+	}
+	if got := len(c.tags.snapshot("g")); got != 6 {
+		t.Errorf("disabled group cap should leave all 6; got %d", got)
 	}
 }
 

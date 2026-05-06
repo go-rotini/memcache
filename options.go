@@ -144,6 +144,12 @@ type config struct {
 	// maxTagsTotal caps the number of distinct tags the
 	// cache-level [tagIndex] may carry. 0 disables the cap.
 	maxTagsTotal int
+
+	// groups is `name → capacity` for capacity-bounded tag
+	// groups. After a Set whose tags include `name`, the cache
+	// enforces `member count <= capacity` for that group by
+	// evicting the oldest member (by inserted time).
+	groups map[string]int
 }
 
 // defaultConfig returns the package's baseline configuration. It is
@@ -354,6 +360,30 @@ func WithBulkLoader[K comparable, V any](l BulkLoader[K, V]) Option {
 // capacity.
 func WithLoaderRateLimit(perSecond int) Option {
 	return func(c *config) { c.loaderRatePerSecond = perSecond }
+}
+
+// WithGroup defines a capacity-bounded tag group. After a Set
+// whose tags include `name`, the cache enforces that no more than
+// `capacity` entries simultaneously carry that tag — surplus
+// entries are evicted oldest-first (by insertion time) under
+// [EvictReasonTag].
+//
+// Multiple WithGroup options may be supplied (one per group); the
+// last call for a given name wins.
+//
+// A non-positive capacity removes any prior registration for that
+// name.
+func WithGroup(name string, capacity int) Option {
+	return func(c *config) {
+		if c.groups == nil {
+			c.groups = make(map[string]int)
+		}
+		if capacity <= 0 {
+			delete(c.groups, name)
+			return
+		}
+		c.groups[name] = capacity
+	}
 }
 
 // WithMaxTagsPerEntry caps the number of tags carried by any

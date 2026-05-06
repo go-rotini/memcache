@@ -2,88 +2,107 @@ package memcache
 
 import "github.com/go-rotini/memcache/internal/sketch"
 
-// tinyLFUPolicy implements a simplified W-TinyLFU eviction policy
-// (Einziger et al., ACM TOS 2017).
+// tinyLFUPolicy implements a W-TinyLFU eviction policy with the
+// full three-segment layout (Einziger et al., ACM TOS 2017):
 //
-// Two intrusive LRU lists make up the cache's storage: a small
-// "window" LRU holds recent insertions, and a "main" LRU holds the
-// long-lived working set. A 4-bit count-min sketch records access
-// frequency for every key the policy has seen. When the window
-// overflows, the demoted candidate must defeat the LRU tail of the
-// main region in a sketch comparison to be admitted; otherwise the
-// candidate is evicted.
+//   - Window LRU (1% of capacity): freshly inserted entries.
+//   - Probationary LRU (~20% of Main): entries demoted from Window
+//     that won admission against Probationary's tail; the "trial"
+//     segment that supplies eviction victims.
+//   - Protected LRU (~80% of Main): hot working set. An entry
+//     promoted here came from a hit in Probationary, signaling
+//     reuse. Eviction never targets Protected directly; instead a
+//     full Protected demotes its LRU tail back to Probationary.
 //
-// This v0 implementation merges the spec's "protected/probationary"
-// split into a single Main LRU, keeping correctness while postponing
-// the tuning work to a follow-up. The admission gate, sketch aging,
-// and window/main split are all in place.
+// A 4-bit count-min sketch records access frequencies; the
+// admission gate at Window→Probationary uses sketch frequencies.
+// Sketch aging (halving every 2 × budget operations) keeps
+// estimates responsive.
 //
 // tinyLFUPolicy is NOT safe for concurrent use.
 type tinyLFUPolicy[K comparable, V any] struct {
-	// Window LRU. windowHead is MRU, windowTail is LRU (next demote).
-	windowHead, windowTail *tinyLFUNode[K, V]
-	windowSize             int
-	windowBudget           int
+	// Window LRU.
+	windowHead, windowTail   *tinyLFUNode[K, V]
+	windowSize, windowBudget int
 
-	// Main LRU. mainHead is MRU, mainTail is LRU (next victim from
-	// Main once admission demands it).
-	mainHead, mainTail *tinyLFUNode[K, V]
-	mainSize           int
-	mainBudget         int
+	// Protected LRU (the larger, "hot" main segment).
+	protectedHead, protectedTail   *tinyLFUNode[K, V]
+	protectedSize, protectedBudget int
 
-	// Frequency sketch. Tracks recent access counts.
+	// Probationary LRU (smaller "trial" segment, source of victims).
+	probationaryHead, probationaryTail   *tinyLFUNode[K, V]
+	probationarySize, probationaryBudget int
+
+	// Frequency sketch.
 	sketch *sketch.CountMinSketch
 	hasher func(K) uint64
 
-	// Operation counter for aging. When ops >= ageThreshold the
-	// sketch is halved and the counter resets.
+	// Operation counter for sketch aging.
 	ops          uint64
 	ageThreshold uint64
 }
 
+// tinyLFURegion enumerates the three segments an entry can live in.
+type tinyLFURegion uint8
+
+const (
+	regionWindow       tinyLFURegion = 0
+	regionProtected    tinyLFURegion = 1
+	regionProbationary tinyLFURegion = 2
+)
+
 // tinyLFUNode is the intrusive LRU node attached to entry.policyData.
-// `inMain` distinguishes which list owns it.
 type tinyLFUNode[K comparable, V any] struct {
 	entry      *entry[K, V]
 	next, prev *tinyLFUNode[K, V]
-	inMain     bool
+	region     tinyLFURegion
 }
 
 // newTinyLFU constructs a fresh policy sized for the given shard
-// budget. hasher may be nil; in that case the sketch falls back to a
-// degenerate hash that still produces correct semantics on tests.
+// budget. hasher may be nil; in that case the sketch falls back to
+// a degenerate hash that still produces correct semantics on
+// tests.
 func newTinyLFU[K comparable, V any](budget int, hasher func(K) uint64) *tinyLFUPolicy[K, V] {
-	window, main := tinyLFUSplitBudget(budget)
+	window, protected, probationary := tinyLFUSplitBudget(budget)
 	expected := max(budget, 64)
 	cms := sketch.New(expected, nil)
 	threshold := tinyLFUAgeThreshold(budget)
 	return &tinyLFUPolicy[K, V]{
-		windowBudget: window,
-		mainBudget:   main,
-		sketch:       cms,
-		hasher:       hasher,
-		ageThreshold: threshold,
+		windowBudget:       window,
+		protectedBudget:    protected,
+		probationaryBudget: probationary,
+		sketch:             cms,
+		hasher:             hasher,
+		ageThreshold:       threshold,
 	}
 }
 
-// tinyLFUSplitBudget computes (window, main) sub-budgets. Window is
-// ~1% of total, never larger than the total itself.
-func tinyLFUSplitBudget(budget int) (window, main int) {
+// tinyLFUSplitBudget computes (window, protected, probationary)
+// sub-budgets. Window is ~1% of total; the remaining "Main" pool
+// is split 80% Protected / 20% Probationary per the W-TinyLFU
+// paper. Each sub-budget floors at 1 when the total budget allows
+// any entries at all.
+func tinyLFUSplitBudget(budget int) (window, protected, probationary int) {
 	if budget <= 0 {
-		return 0, 0
+		return 0, 0, 0
 	}
 	window = max(budget/100, 1)
 	if window >= budget {
+		// Tiny budgets — keep window at 1, leave at most one slot
+		// elsewhere.
 		window = 1
 	}
-	main = max(budget-window, 1)
-	return window, main
+	main := max(budget-window, 1)
+	protected = max((main*80)/100, 1)
+	if protected >= main {
+		protected = max(main-1, 1)
+	}
+	probationary = max(main-protected, 1)
+	return window, protected, probationary
 }
 
 // tinyLFUAgeThreshold returns the operation count between sketch
-// aging passes for the given budget. The W-TinyLFU paper specifies
-// 2 × budget; for tiny budgets we floor at 128 so the sketch sees
-// enough activity to be useful.
+// aging passes for the given budget.
 func tinyLFUAgeThreshold(budget int) uint64 {
 	t := uint64(2 * budget)
 	if t == 0 {
@@ -92,12 +111,13 @@ func tinyLFUAgeThreshold(budget int) uint64 {
 	return t
 }
 
-// SetBudget recomputes the Window/Main sub-budgets and aging
+// SetBudget recomputes all three sub-budgets and the aging
 // threshold to match a new total.
 func (p *tinyLFUPolicy[K, V]) SetBudget(budget int) {
-	window, main := tinyLFUSplitBudget(budget)
+	window, protected, probationary := tinyLFUSplitBudget(budget)
 	p.windowBudget = window
-	p.mainBudget = main
+	p.protectedBudget = protected
+	p.probationaryBudget = probationary
 	p.ageThreshold = tinyLFUAgeThreshold(budget)
 }
 
@@ -106,25 +126,43 @@ func (p *tinyLFUPolicy[K, V]) SetBudget(budget int) {
 func (p *tinyLFUPolicy[K, V]) OnInsert(e *entry[K, V]) {
 	n := &tinyLFUNode[K, V]{entry: e}
 	e.policyData = n
-	p.pushWindowHead(n)
+	p.pushHead(n, regionWindow)
 	p.observe(e.key)
 }
 
-// OnAccess promotes the entry to its list's MRU position and bumps
-// the sketch.
+// OnAccess updates LRU position and bumps the sketch. A hit in
+// Probationary triggers promotion to Protected — the signal that
+// the entry is hot enough to graduate from the trial segment.
+// Promotion may force a Protected→Probationary demotion to keep
+// Protected within budget.
 func (p *tinyLFUPolicy[K, V]) OnAccess(e *entry[K, V]) {
 	n, ok := e.policyData.(*tinyLFUNode[K, V])
 	if !ok || n == nil {
 		return
 	}
-	if n.inMain {
-		if n != p.mainHead {
-			p.unlinkMain(n)
-			p.pushMainHead(n)
+	switch n.region {
+	case regionWindow:
+		if n != p.windowHead {
+			p.unlink(n)
+			p.pushHead(n, regionWindow)
 		}
-	} else if n != p.windowHead {
-		p.unlinkWindow(n)
-		p.pushWindowHead(n)
+	case regionProtected:
+		if n != p.protectedHead {
+			p.unlink(n)
+			p.pushHead(n, regionProtected)
+		}
+	case regionProbationary:
+		// Promote: Probationary → Protected.
+		p.unlink(n)
+		p.pushHead(n, regionProtected)
+		// If Protected is now over budget, demote its tail back
+		// to Probationary's head (it remains a candidate but
+		// shows fresh activity by being at MRU of probationary).
+		for p.protectedSize > p.protectedBudget && p.protectedTail != nil {
+			demote := p.protectedTail
+			p.unlink(demote)
+			p.pushHead(demote, regionProbationary)
+		}
 	}
 	p.observe(e.key)
 }
@@ -134,111 +172,119 @@ func (p *tinyLFUPolicy[K, V]) OnUpdate(e *entry[K, V]) {
 	p.OnAccess(e)
 }
 
-// OnRemove unlinks e from whichever list holds it.
+// OnRemove unlinks e from whichever segment holds it.
 func (p *tinyLFUPolicy[K, V]) OnRemove(e *entry[K, V]) {
 	n, ok := e.policyData.(*tinyLFUNode[K, V])
 	if !ok || n == nil {
 		return
 	}
-	if n.inMain {
-		p.unlinkMain(n)
-	} else {
-		p.unlinkWindow(n)
-	}
+	p.unlink(n)
 	n.entry = nil
 	n.next, n.prev = nil, nil
 	e.policyData = nil
 }
 
-// Victim runs the W-TinyLFU eviction step. The Window's LRU tail is
-// the candidate; if Main has spare capacity it's admitted directly,
-// otherwise its sketch frequency must beat Main's LRU tail to take
-// the latter's slot.
+// Victim runs the W-TinyLFU eviction step. Order of attention:
+//  1. Window over budget: candidate = window tail. If
+//     Probationary has spare capacity, demote in. Else compete
+//     against Probationary's tail via sketch frequency.
+//  2. Probationary over budget: evict its tail.
+//  3. Protected over budget: demote its tail to Probationary
+//     (no eviction yet — go around).
+//  4. None over budget: return nil.
 func (p *tinyLFUPolicy[K, V]) Victim() *entry[K, V] {
-	for range p.windowSize + p.mainSize + 1 {
+	for range p.windowSize + p.protectedSize + p.probationarySize + 1 {
 		if p.windowSize > p.windowBudget && p.windowTail != nil {
 			candidate := p.windowTail
-			if p.mainSize < p.mainBudget {
-				// Free space in Main: just promote.
-				p.unlinkWindow(candidate)
-				p.pushMainHead(candidate)
-				continue
+			if v := p.handleWindowDemotion(candidate); v != nil {
+				return v
 			}
-			if p.mainTail == nil {
-				// Main is empty by configuration — evict the
-				// window tail directly.
-				p.unlinkWindow(candidate)
-				return candidate.entry
-			}
-			candFreq := p.estimate(candidate.entry.key)
-			victim := p.mainTail
-			vicFreq := p.estimate(victim.entry.key)
-			if candFreq > vicFreq {
-				// Candidate wins admission: take victim's slot.
-				p.unlinkWindow(candidate)
-				p.unlinkMain(victim)
-				p.pushMainHead(candidate)
-				return victim.entry
-			}
-			// Main entry is hotter; evict the candidate.
-			p.unlinkWindow(candidate)
-			return candidate.entry
+			continue
 		}
-		if p.mainSize > p.mainBudget && p.mainTail != nil {
-			n := p.mainTail
-			p.unlinkMain(n)
+		if p.probationarySize > p.probationaryBudget && p.probationaryTail != nil {
+			n := p.probationaryTail
+			p.unlink(n)
 			return n.entry
+		}
+		if p.protectedSize > p.protectedBudget && p.protectedTail != nil {
+			demote := p.protectedTail
+			p.unlink(demote)
+			p.pushHead(demote, regionProbationary)
+			continue
 		}
 		return nil
 	}
-	// Defensive fallback.
-	if p.windowTail != nil {
-		n := p.windowTail
-		p.unlinkWindow(n)
-		return n.entry
-	}
-	if p.mainTail != nil {
-		n := p.mainTail
-		p.unlinkMain(n)
-		return n.entry
+	// Defensive fallback — pick anything we have.
+	for _, tail := range []*tinyLFUNode[K, V]{p.probationaryTail, p.windowTail, p.protectedTail} {
+		if tail != nil {
+			p.unlink(tail)
+			return tail.entry
+		}
 	}
 	return nil
 }
 
-// Len returns the total number of entries tracked.
-func (p *tinyLFUPolicy[K, V]) Len() int { return p.windowSize + p.mainSize }
-
-// Reset clears both LRU lists and re-initializes the sketch state.
-func (p *tinyLFUPolicy[K, V]) Reset() {
-	for n := p.windowHead; n != nil; {
-		nxt := n.next
-		if n.entry != nil {
-			n.entry.policyData = nil
-		}
-		n.entry = nil
-		n.next, n.prev = nil, nil
-		n = nxt
+// handleWindowDemotion runs the Window→Probationary admission
+// step. Returns a non-nil entry when the candidate (or the
+// probationary tail it displaced) should be evicted; nil when the
+// candidate was just demoted in and the loop should continue.
+func (p *tinyLFUPolicy[K, V]) handleWindowDemotion(candidate *tinyLFUNode[K, V]) *entry[K, V] {
+	if p.probationarySize < p.probationaryBudget {
+		// Free space — just demote.
+		p.unlink(candidate)
+		p.pushHead(candidate, regionProbationary)
+		return nil
 	}
-	for n := p.mainHead; n != nil; {
-		nxt := n.next
-		if n.entry != nil {
-			n.entry.policyData = nil
+	if p.probationaryTail == nil {
+		// No room in Probationary at all — evict the candidate.
+		p.unlink(candidate)
+		return candidate.entry
+	}
+	candFreq := p.estimate(candidate.entry.key)
+	victim := p.probationaryTail
+	vicFreq := p.estimate(victim.entry.key)
+	if candFreq > vicFreq {
+		// Candidate wins admission: take victim's slot.
+		p.unlink(candidate)
+		p.unlink(victim)
+		p.pushHead(candidate, regionProbationary)
+		return victim.entry
+	}
+	// Probationary tail is hotter; evict the candidate.
+	p.unlink(candidate)
+	return candidate.entry
+}
+
+// Len returns the total number of entries tracked.
+func (p *tinyLFUPolicy[K, V]) Len() int {
+	return p.windowSize + p.protectedSize + p.probationarySize
+}
+
+// Reset clears every segment and the sketch.
+func (p *tinyLFUPolicy[K, V]) Reset() {
+	for _, head := range []*tinyLFUNode[K, V]{p.windowHead, p.protectedHead, p.probationaryHead} {
+		for n := head; n != nil; {
+			nxt := n.next
+			if n.entry != nil {
+				n.entry.policyData = nil
+			}
+			n.entry = nil
+			n.next, n.prev = nil, nil
+			n = nxt
 		}
-		n.entry = nil
-		n.next, n.prev = nil, nil
-		n = nxt
 	}
 	p.windowHead, p.windowTail = nil, nil
-	p.mainHead, p.mainTail = nil, nil
-	p.windowSize, p.mainSize = 0, 0
+	p.protectedHead, p.protectedTail = nil, nil
+	p.probationaryHead, p.probationaryTail = nil, nil
+	p.windowSize, p.protectedSize, p.probationarySize = 0, 0, 0
 	if p.sketch != nil {
 		p.sketch.Reset()
 	}
 	p.ops = 0
 }
 
-// observe records an access to key in the sketch and triggers aging
-// when ops crosses the configured threshold.
+// observe records an access in the sketch and triggers aging when
+// ops crosses the configured threshold.
 func (p *tinyLFUPolicy[K, V]) observe(key K) {
 	if p.sketch == nil {
 		return
@@ -260,8 +306,7 @@ func (p *tinyLFUPolicy[K, V]) estimate(key K) uint8 {
 }
 
 // hashKey returns a stable uint64 hash of key. Falls back to a
-// degenerate constant when no hasher is configured; the sketch
-// remains correct (collisions just accumulate).
+// degenerate constant when no hasher is configured.
 func (p *tinyLFUPolicy[K, V]) hashKey(key K) uint64 {
 	if p.hasher == nil {
 		return 0
@@ -269,66 +314,73 @@ func (p *tinyLFUPolicy[K, V]) hashKey(key K) uint64 {
 	return p.hasher(key)
 }
 
-func (p *tinyLFUPolicy[K, V]) pushWindowHead(n *tinyLFUNode[K, V]) {
-	n.inMain = false
+// pushHead inserts n at the head of the named segment, updating
+// node region and segment size. Caller must have already detached
+// n from any prior list.
+func (p *tinyLFUPolicy[K, V]) pushHead(n *tinyLFUNode[K, V], region tinyLFURegion) {
+	n.region = region
 	n.prev = nil
-	n.next = p.windowHead
-	if p.windowHead != nil {
-		p.windowHead.prev = n
-	} else {
-		p.windowTail = n
+	switch region {
+	case regionWindow:
+		n.next = p.windowHead
+		if p.windowHead != nil {
+			p.windowHead.prev = n
+		} else {
+			p.windowTail = n
+		}
+		p.windowHead = n
+		p.windowSize++
+	case regionProtected:
+		n.next = p.protectedHead
+		if p.protectedHead != nil {
+			p.protectedHead.prev = n
+		} else {
+			p.protectedTail = n
+		}
+		p.protectedHead = n
+		p.protectedSize++
+	case regionProbationary:
+		n.next = p.probationaryHead
+		if p.probationaryHead != nil {
+			p.probationaryHead.prev = n
+		} else {
+			p.probationaryTail = n
+		}
+		p.probationaryHead = n
+		p.probationarySize++
 	}
-	p.windowHead = n
-	p.windowSize++
 }
 
-func (p *tinyLFUPolicy[K, V]) pushMainHead(n *tinyLFUNode[K, V]) {
-	n.inMain = true
-	n.prev = nil
-	n.next = p.mainHead
-	if p.mainHead != nil {
-		p.mainHead.prev = n
-	} else {
-		p.mainTail = n
+// unlink removes n from its current segment, decrementing that
+// segment's size. Safe to call once; subsequent calls on a node
+// whose pointers have been nil'd are no-ops.
+func (p *tinyLFUPolicy[K, V]) unlink(n *tinyLFUNode[K, V]) {
+	switch n.region {
+	case regionWindow:
+		p.unlinkSegment(n, &p.windowHead, &p.windowTail, &p.windowSize)
+	case regionProtected:
+		p.unlinkSegment(n, &p.protectedHead, &p.protectedTail, &p.protectedSize)
+	case regionProbationary:
+		p.unlinkSegment(n, &p.probationaryHead, &p.probationaryTail, &p.probationarySize)
 	}
-	p.mainHead = n
-	p.mainSize++
 }
 
-func (p *tinyLFUPolicy[K, V]) unlinkWindow(n *tinyLFUNode[K, V]) {
+// unlinkSegment is the shared list-detach helper.
+func (p *tinyLFUPolicy[K, V]) unlinkSegment(n *tinyLFUNode[K, V], head, tail **tinyLFUNode[K, V], size *int) {
 	switch {
 	case n.prev != nil:
 		n.prev.next = n.next
-	case p.windowHead == n:
-		p.windowHead = n.next
+	case *head == n:
+		*head = n.next
 	default:
 		return
 	}
 	switch {
 	case n.next != nil:
 		n.next.prev = n.prev
-	case p.windowTail == n:
-		p.windowTail = n.prev
+	case *tail == n:
+		*tail = n.prev
 	}
 	n.next, n.prev = nil, nil
-	p.windowSize--
-}
-
-func (p *tinyLFUPolicy[K, V]) unlinkMain(n *tinyLFUNode[K, V]) {
-	switch {
-	case n.prev != nil:
-		n.prev.next = n.next
-	case p.mainHead == n:
-		p.mainHead = n.next
-	default:
-		return
-	}
-	switch {
-	case n.next != nil:
-		n.next.prev = n.prev
-	case p.mainTail == n:
-		p.mainTail = n.prev
-	}
-	n.next, n.prev = nil, nil
-	p.mainSize--
+	*size--
 }
