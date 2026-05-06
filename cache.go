@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"os"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -63,6 +64,12 @@ type Cache[K comparable, V any] struct {
 	// can unconditionally bump entries/bytes; the disable flag
 	// suppresses Hits/Misses/Inserts updates.
 	counters *statsCounters
+
+	// autoSaveStop signals the auto-save goroutine to exit;
+	// autoSaveDone closes once the goroutine has returned.
+	// Both are nil when WithAutoSave is not configured.
+	autoSaveStop chan struct{}
+	autoSaveDone chan struct{}
 
 	closed atomic.Bool
 }
@@ -181,7 +188,77 @@ func build[K comparable, V any](cfg *config, allowUnbounded bool) (*Cache[K, V],
 		c.shards[i] = newShard(newPolicy[K, V](cfg.policy, pcfg), perShard)
 	}
 
+	if err := c.applyAutoLoad(); err != nil {
+		return nil, err
+	}
+	c.startAutoSave()
+
 	return c, nil
+}
+
+// applyAutoLoad attempts a one-shot LoadFile when [WithAutoLoad]
+// is configured. Missing files are treated as "no warm state to
+// load" — not an error. Any other error fails New unless
+// [WithAutoLoadIgnoreErrors] is set, in which case it is logged
+// and swallowed.
+func (c *Cache[K, V]) applyAutoLoad() error {
+	if c.cfg.autoLoadPath == "" {
+		return nil
+	}
+	if _, statErr := os.Stat(c.cfg.autoLoadPath); errors.Is(statErr, os.ErrNotExist) {
+		return nil
+	}
+	_, err := c.LoadFile(c.cfg.autoLoadPath)
+	if err == nil {
+		return nil
+	}
+	if c.cfg.autoLoadIgnore {
+		if c.cfg.logger != nil {
+			c.cfg.logger.Warn("memcache: auto-load failed, continuing with empty cache",
+				"path", c.cfg.autoLoadPath, "err", err)
+		}
+		return nil
+	}
+	return err
+}
+
+// startAutoSave launches the periodic snapshot goroutine when
+// [WithAutoSave] is configured. The goroutine ticks at the
+// configured interval, writes a snapshot, and exits cleanly when
+// Cache.Close fires the autoSaveStop channel.
+func (c *Cache[K, V]) startAutoSave() {
+	if c.cfg.autoSavePath == "" || c.cfg.autoSaveInterval <= 0 {
+		return
+	}
+	c.autoSaveStop = make(chan struct{})
+	c.autoSaveDone = make(chan struct{})
+	go c.runAutoSave()
+}
+
+// runAutoSave is the periodic-snapshot goroutine body.
+func (c *Cache[K, V]) runAutoSave() {
+	defer close(c.autoSaveDone)
+	tick := make(chan struct{}, 1)
+	fire := func() {
+		select {
+		case tick <- struct{}{}:
+		default:
+		}
+	}
+	timer := c.cfg.clock.AfterFunc(c.cfg.autoSaveInterval, fire)
+	defer timer.Stop()
+	for {
+		select {
+		case <-c.autoSaveStop:
+			return
+		case <-tick:
+			if err := c.SaveFile(c.cfg.autoSavePath); err != nil && c.cfg.logger != nil {
+				c.cfg.logger.Warn("memcache: auto-save failed",
+					"path", c.cfg.autoSavePath, "err", err)
+			}
+			timer.Reset(c.cfg.autoSaveInterval)
+		}
+	}
 }
 
 // applyJitter returns ttl with uniform jitter in [-j, +j]. Per the
@@ -805,13 +882,31 @@ func (c *Cache[K, V]) Reset() {
 }
 
 // Close releases all resources, stops every shard's janitor goroutine,
+// stops the auto-save goroutine after writing a final snapshot,
 // closes every active subscriber channel, and disables further
 // operations. Subsequent calls return nil — Close is idempotent.
 // Reads and writes after Close return their zero/error path
 // ([ErrClosed] for writes; the zero value with ok=false for reads).
+//
+// A final auto-save error is logged via the configured slog.Logger
+// but does not propagate from Close — there is no useful action a
+// caller can take at shutdown time.
 func (c *Cache[K, V]) Close() error {
 	if !c.closed.CompareAndSwap(false, true) {
 		return nil
+	}
+	// Final snapshot BEFORE stopping janitors / clearing entries.
+	// saveFileTo bypasses the closed check (closed is already true
+	// here) so the final auto-save can persist live cache state.
+	if c.cfg.autoSavePath != "" {
+		if err := c.saveFileTo(c.cfg.autoSavePath); err != nil && c.cfg.logger != nil {
+			c.cfg.logger.Warn("memcache: final auto-save failed",
+				"path", c.cfg.autoSavePath, "err", err)
+		}
+	}
+	if c.autoSaveStop != nil {
+		close(c.autoSaveStop)
+		<-c.autoSaveDone
 	}
 	c.stopAllJanitors()
 	c.Reset()

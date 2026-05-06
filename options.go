@@ -69,6 +69,22 @@ type config struct {
 	// by [Cache.Subscribe] when the caller passes buf <= 0.
 	eventsBuffer int
 
+	// maxSnapshotBytes caps Load input. 0 lets snapshot.go's
+	// defaultMaxSnapshotBytes apply (256 MiB).
+	maxSnapshotBytes int64
+
+	// autoSavePath, when non-empty, enables a per-cache goroutine
+	// that periodically writes a snapshot to disk.
+	autoSavePath     string
+	autoSaveInterval time.Duration
+
+	// autoLoadPath, when non-empty, attempts to populate the
+	// cache from a snapshot at construction time. autoLoadIgnore
+	// suppresses I/O errors so a missing-or-corrupt snapshot does
+	// not block New.
+	autoLoadPath   string
+	autoLoadIgnore bool
+
 	// Hook callbacks. Each is type-erased into the config and
 	// type-asserted into the typed shape at cache construction.
 	onHit    any // func(K, V)
@@ -328,6 +344,48 @@ func WithRefreshAhead(refreshAt float64) Option {
 // staleFor <= 0 disables SWR.
 func WithStaleWhileRevalidate(staleFor time.Duration) Option {
 	return func(c *config) { c.swrStaleFor = staleFor }
+}
+
+// WithMaxSnapshotBytes caps the size of snapshots accepted by
+// [Cache.Load] and [Cache.LoadFile]. A non-positive value falls
+// back to the package default (256 MiB). Use this to harden the
+// cache against corrupt or hostile snapshot files that would
+// otherwise OOM the process during Load.
+func WithMaxSnapshotBytes(n int64) Option {
+	return func(c *config) { c.maxSnapshotBytes = n }
+}
+
+// WithAutoSave instructs the cache to persist a snapshot to path
+// every interval. Saving is performed by a per-cache goroutine
+// started during construction; [Cache.Close] writes a final
+// snapshot before tearing the goroutine down. Errors during
+// auto-save are logged via the configured slog.Logger and do not
+// fail subsequent saves.
+//
+// A non-positive interval disables the periodic save (useful when
+// pairing only WithAutoLoad with a manual SaveFile on shutdown).
+func WithAutoSave(path string, interval time.Duration) Option {
+	return func(c *config) {
+		c.autoSavePath = path
+		c.autoSaveInterval = interval
+	}
+}
+
+// WithAutoLoad attempts to populate the cache from a snapshot at
+// path during [New]. A missing file is treated as "no snapshot to
+// load" (not an error). Any other error during load fails
+// construction unless [WithAutoLoadIgnoreErrors] is also set.
+func WithAutoLoad(path string) Option {
+	return func(c *config) { c.autoLoadPath = path }
+}
+
+// WithAutoLoadIgnoreErrors makes [WithAutoLoad] swallow load
+// errors and log them through the configured slog.Logger instead
+// of aborting [New]. Recommended for CLIs where a corrupt or
+// version-mismatched snapshot should fall back to an empty cache
+// rather than refuse to start.
+func WithAutoLoadIgnoreErrors(b bool) Option {
+	return func(c *config) { c.autoLoadIgnore = b }
 }
 
 // WithEventsBuffer sets the default buffer size used by
