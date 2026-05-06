@@ -1,6 +1,7 @@
 package memcache
 
 import (
+	"errors"
 	"slices"
 	"sort"
 	"sync"
@@ -221,6 +222,47 @@ func TestDeleteMulti(t *testing.T) {
 	}
 	if !c.Has("c") {
 		t.Error("untouched key should remain")
+	}
+}
+
+func TestWithMaxTagsPerEntryRejects(t *testing.T) {
+	c, _ := New[string, int](
+		WithMaxEntries(4),
+		WithMaxTagsPerEntry(2),
+	)
+	defer c.Close()
+	if err := c.SetWithTags("k", 1, "a", "b"); err != nil {
+		t.Fatalf("at-cap should succeed: %v", err)
+	}
+	err := c.SetWithTags("k2", 2, "a", "b", "c")
+	if err == nil {
+		t.Fatal("over-cap should error")
+	}
+	var ce *CapacityError
+	if !errors.As(err, &ce) || ce.LimitField != "MaxTagsPerEntry" {
+		t.Errorf("expected CapacityError(MaxTagsPerEntry); got %v", err)
+	}
+	if !errors.Is(err, ErrTooManyTags) {
+		t.Errorf("error should chain to ErrTooManyTags; got %v", err)
+	}
+}
+
+func TestWithMaxTagsTotalRejects(t *testing.T) {
+	c, _ := New[string, int](
+		WithMaxEntries(8),
+		WithMaxTagsTotal(3),
+	)
+	defer c.Close()
+	for _, k := range []string{"a", "b", "c"} {
+		if err := c.SetWithTags("k-"+k, 0, k); err != nil {
+			t.Fatalf("Set with tag %q: %v", k, err)
+		}
+	}
+	// Adding a fourth distinct tag should bust the cap.
+	err := c.SetWithTags("k-d", 0, "d")
+	var ce *CapacityError
+	if !errors.As(err, &ce) || ce.LimitField != "MaxTagsTotal" {
+		t.Errorf("expected CapacityError(MaxTagsTotal); got %v", err)
 	}
 }
 

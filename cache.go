@@ -34,6 +34,20 @@ type Cache[K comparable, V any] struct {
 	// loader is the typed loader resolved from cfg.loader, or nil.
 	loader Loader[K, V]
 
+	// bulkLoader is the typed bulk-loader resolved from
+	// cfg.bulkLoader, or nil. When nil, [Cache.GetMultiOrLoad]
+	// falls back to a single-loader fan-out.
+	bulkLoader BulkLoader[K, V]
+
+	// loaderLimiter throttles loader invocations when
+	// [WithLoaderRateLimit] is configured. nil means "unlimited".
+	loaderLimiter *rateLimiter
+
+	// loadSlots is a counting semaphore that caps in-flight loader
+	// calls when [WithMaxConcurrentLoads] is configured. nil
+	// means "unlimited".
+	loadSlots chan struct{}
+
 	// expireFunc is the typed per-entry expiry predicate resolved
 	// from cfg.expireFunc, or nil when none is configured.
 	expireFunc func(key K, value V, meta Metadata) bool
@@ -55,6 +69,10 @@ type Cache[K comparable, V any] struct {
 	onEvict  func(K, V, EvictionReason)
 	onExpire func(K, V)
 	onLoad   func(K, V, time.Duration, error)
+
+	// tracer is always non-nil. Resolves from cfg.tracer or
+	// falls back to [noopTracer].
+	tracer Tracer
 
 	shards    []*shard[K, V]
 	shardMask uint64
@@ -146,6 +164,10 @@ func build[K comparable, V any](cfg *config, allowUnbounded bool) (*Cache[K, V],
 	if err != nil {
 		return nil, err
 	}
+	bulkLoader, err := resolveBulkLoader[K, V](cfg.bulkLoader)
+	if err != nil {
+		return nil, err
+	}
 	expireFunc, err := resolveExpireFunc[K, V](cfg.expireFunc)
 	if err != nil {
 		return nil, err
@@ -164,22 +186,34 @@ func build[K comparable, V any](cfg *config, allowUnbounded bool) (*Cache[K, V],
 
 	shardCount := nextPowerOfTwo(max(cfg.shards, 1))
 
+	var loadSlots chan struct{}
+	if cfg.maxConcurrentLoads > 0 {
+		loadSlots = make(chan struct{}, cfg.maxConcurrentLoads)
+	}
+	tracer := cfg.tracer
+	if tracer == nil {
+		tracer = noopTracer{}
+	}
 	c := &Cache[K, V]{
-		cfg:        cfg,
-		hasher:     hasher,
-		weigher:    weigher,
-		loader:     loader,
-		expireFunc: expireFunc,
-		tags:       newTagIndex[K](),
-		events:     newEventBus[K, V](),
-		onHit:      hooks.onHit,
-		onMiss:     hooks.onMiss,
-		onEvict:    hooks.onEvict,
-		onExpire:   hooks.onExpire,
-		onLoad:     hooks.onLoad,
-		shards:     make([]*shard[K, V], shardCount),
-		shardMask:  uint64(shardCount - 1),
-		counters:   &statsCounters{},
+		cfg:           cfg,
+		hasher:        hasher,
+		weigher:       weigher,
+		loader:        loader,
+		bulkLoader:    bulkLoader,
+		loaderLimiter: newRateLimiter(cfg.loaderRatePerSecond, cfg.clock),
+		loadSlots:     loadSlots,
+		expireFunc:    expireFunc,
+		tags:          newTagIndex[K](),
+		events:        newEventBus[K, V](),
+		onHit:         hooks.onHit,
+		onMiss:        hooks.onMiss,
+		onEvict:       hooks.onEvict,
+		onExpire:      hooks.onExpire,
+		onLoad:        hooks.onLoad,
+		tracer:        tracer,
+		shards:        make([]*shard[K, V], shardCount),
+		shardMask:     uint64(shardCount - 1),
+		counters:      &statsCounters{},
 	}
 
 	perShard := perShardBudget(cfg.maxEntries, shardCount)
@@ -192,6 +226,7 @@ func build[K comparable, V any](cfg *config, allowUnbounded bool) (*Cache[K, V],
 		return nil, err
 	}
 	c.startAutoSave()
+	publishExpvar(c)
 
 	return c, nil
 }
@@ -400,6 +435,24 @@ func resolveHooks[K comparable, V any](cfg *config) (resolvedHooks[K, V], error)
 	return out, nil
 }
 
+// resolveBulkLoader returns the typed BulkLoader[K, V] from a
+// type-erased any, or nil when none is configured.
+//
+//nolint:nilnil // (nil, nil) signals "no bulk loader configured".
+func resolveBulkLoader[K comparable, V any](raw any) (BulkLoader[K, V], error) {
+	if raw == nil {
+		return nil, nil
+	}
+	l, ok := raw.(BulkLoader[K, V])
+	if !ok {
+		return nil, &ConfigError{
+			Field:   "BulkLoader",
+			Message: fmt.Sprintf("type mismatch: bulk loader does not match cache type parameters (%T)", raw),
+		}
+	}
+	return l, nil
+}
+
 // resolveLoader returns the typed Loader[K, V] from a type-erased
 // any, or nil when none is configured. A nil loader is a valid state.
 //
@@ -434,11 +487,13 @@ func resolveHasher[K comparable](raw any) (func(K) uint64, error) {
 	return defaultHasher[K](), nil
 }
 
-// defaultHasher returns a hasher specialized for common K types. For
-// string keys it uses SipHash-2-4 with a fixed key seed; for other
-// types the fallback is fmt-based and slow but correct. A future
-// refinement may add fast paths for integer-like K via type
-// switching.
+// defaultHasher returns a hasher specialized for common K types.
+// String and []byte keys go through SipHash-2-4 (HashDoS-resistant).
+// Numeric keys (int / uint families, plus boolean) use a single
+// splitmix64 mix — orders of magnitude faster than going through
+// SipHash and entirely sufficient since the key is already a fixed
+// number of bits. Anything else falls through to a fmt-based
+// stringification + SipHash; correct but slow.
 func defaultHasher[K comparable]() func(K) uint64 {
 	const k0 = uint64(0x0706050403020100)
 	const k1 = uint64(0x0f0e0d0c0b0a0908)
@@ -448,6 +503,33 @@ func defaultHasher[K comparable]() func(K) uint64 {
 			return sketch.HashString(k0, k1, v)
 		case []byte:
 			return sketch.SipHash24(k0, k1, v)
+		case int:
+			return sketch.MixUint64(uint64(v))
+		case int8:
+			return sketch.MixUint64(uint64(v))
+		case int16:
+			return sketch.MixUint64(uint64(v))
+		case int32:
+			return sketch.MixUint64(uint64(v))
+		case int64:
+			return sketch.MixUint64(uint64(v))
+		case uint:
+			return sketch.MixUint64(uint64(v))
+		case uint8:
+			return sketch.MixUint64(uint64(v))
+		case uint16:
+			return sketch.MixUint64(uint64(v))
+		case uint32:
+			return sketch.MixUint64(uint64(v))
+		case uint64:
+			return sketch.MixUint64(v)
+		case uintptr:
+			return sketch.MixUint64(uint64(v))
+		case bool:
+			if v {
+				return sketch.MixUint64(1)
+			}
+			return sketch.MixUint64(0)
 		default:
 			s := fmt.Sprintf("%v", k)
 			return sketch.HashString(k0, k1, s)
@@ -743,6 +825,9 @@ func (c *Cache[K, V]) SetWithOptions(key K, value V, opts ...SetOption) error {
 	if sc.hasTTL && sc.ttl < 0 {
 		return ErrInvalidTTL
 	}
+	if err := c.checkTagLimits(key, sc.tags); err != nil {
+		return err
+	}
 
 	// Determine effective weight.
 	var weight int64
@@ -938,8 +1023,6 @@ func (c *Cache[K, V]) recordMiss() {
 }
 
 // setLocked performs the shared write-path used by Set / SetWithTTL.
-// extraTags is ignored for now; the tagging system lands in a future
-// commit.
 func (c *Cache[K, V]) setLocked(key K, value V, ttl time.Duration, sliding bool, tags []string) error {
 	if c.closed.Load() {
 		return ErrClosed
@@ -948,11 +1031,29 @@ func (c *Cache[K, V]) setLocked(key K, value V, ttl time.Duration, sliding bool,
 	if err != nil {
 		return err
 	}
+	if err := c.checkTagLimits(key, tags); err != nil {
+		return err
+	}
 	s := c.shardFor(key)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	c.upsertLocked(s, key, value, weight, effectiveTTL(ttl, c.cfg.ttlJitter), sliding, int64(ttl), tags)
 	return nil
+}
+
+// checkTagLimits decorates a [Cache.validateTagLimits] result
+// with the offending key and the [ErrTooManyTags] sentinel cause
+// before returning it to the caller.
+func (c *Cache[K, V]) checkTagLimits(key K, tags []string) error {
+	err := c.validateTagLimits(tags)
+	if err == nil {
+		return nil
+	}
+	if ce, _ := errors.AsType[*CapacityError](err); ce != nil {
+		ce.Key = key
+		ce.Cause = ErrTooManyTags
+	}
+	return err
 }
 
 // computeWeight returns the configured weight of value and validates
@@ -1845,6 +1946,8 @@ func (c *Cache[K, V]) loadOrJoin(
 	fn func(ctx context.Context, key K) (V, time.Duration, error),
 ) (V, error) {
 	var zero V
+	ctx, span := c.tracer.Start(ctx, "memcache.load", Attr{Key: "key", Value: any(key)})
+	defer func() { span.End(nil) }()
 	s := c.shardFor(key)
 	s.mu.Lock()
 	now := c.cfg.clock.Now().UnixNano()
@@ -1893,6 +1996,19 @@ func (c *Cache[K, V]) loadOrJoin(
 		return waitForFlight(ctx, flight)
 	}
 
+	// Rate limit BEFORE registering a flight so a rejected leader
+	// doesn't leave a phantom inflight entry. The shard lock is
+	// still held — the limiter is a fast atomic-style check, so
+	// holding briefly is fine.
+	if c.loaderLimiter != nil && !c.loaderLimiter.Allow() {
+		s.mu.Unlock()
+		if c.cfg.statsEnabled {
+			c.counters.loadErrors.Add(1)
+		}
+		c.publishEvent(Event[K, V]{Kind: EventLoadRateLimited, Key: key, At: c.cfg.clock.Now()})
+		return zero, ErrLoaderRateLimited
+	}
+
 	// Leader path: create a new flight, launch the loader.
 	flight := newFlightCall[V]()
 	s.inflight[key] = flight
@@ -1924,6 +2040,28 @@ func (c *Cache[K, V]) runLoader(
 		var cancel context.CancelFunc
 		loaderCtx, cancel = context.WithTimeout(loaderCtx, c.cfg.loaderTimeout)
 		defer cancel()
+	}
+
+	// Concurrency cap: acquire a slot before invoking the loader.
+	// Releasing happens after the loader returns. When the cap is
+	// configured but no slot is available, callers wait until one
+	// frees — bounded by the loader timeout above.
+	if c.loadSlots != nil {
+		select {
+		case c.loadSlots <- struct{}{}:
+			defer func() { <-c.loadSlots }()
+		case <-loaderCtx.Done():
+			flight.err = ErrLoaderTooManyInFlight
+			s.mu.Lock()
+			delete(s.inflight, key)
+			if c.cfg.statsEnabled {
+				c.counters.loadsTotal.Add(1)
+				c.counters.loadErrors.Add(1)
+			}
+			s.mu.Unlock()
+			c.publishEvent(Event[K, V]{Kind: EventLoadError, Key: key, Err: flight.err, At: c.cfg.clock.Now()})
+			return
+		}
 	}
 
 	val, ttl, err := fn(loaderCtx, key)
@@ -2154,4 +2292,81 @@ func (c *Cache[K, V]) DeleteMulti(keys []K) int {
 		}
 	}
 	return count
+}
+
+// GetMultiOrLoad returns the cached value for each key in keys.
+// Cache hits are returned directly; misses are coalesced into a
+// single [BulkLoader.LoadMulti] call when [WithBulkLoader] is
+// configured. Without a bulk loader, the cache falls back to
+// per-key [Cache.GetOrLoad] (each missing key triggers an
+// individual Loader call, but singleflight still deduplicates
+// concurrent callers for the same missing key).
+//
+// The returned map contains exactly the keys that resolved
+// successfully — keys whose Loader returned an error or whose
+// per-key LoadResult.Err was non-nil are absent. The first
+// transport-level error from LoadMulti aborts the call.
+func (c *Cache[K, V]) GetMultiOrLoad(ctx context.Context, keys []K) (map[K]V, error) {
+	if c.closed.Load() {
+		return nil, ErrClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err //nolint:wrapcheck // pass ctx.Err verbatim
+	}
+	if len(keys) == 0 {
+		return map[K]V{}, nil
+	}
+
+	out := make(map[K]V, len(keys))
+	var missing []K
+	for _, k := range keys {
+		// Get does not need ctx for cache hits; cancellation is
+		// honored before the bulk-load path.
+		if v, ok := c.Get(k); ok { //nolint:contextcheck // cache lookup needs no context
+			out[k] = v
+		} else {
+			missing = append(missing, k)
+		}
+	}
+	if len(missing) == 0 {
+		return out, nil
+	}
+
+	// Without a bulk loader, fall back to per-key loads. Loader
+	// errors are NOT propagated — callers see the present subset
+	// and can detect missing keys via len(out) < len(keys).
+	if c.bulkLoader == nil {
+		if c.loader == nil {
+			return out, ErrNoLoader
+		}
+		for _, k := range missing {
+			if v, err := c.GetOrLoad(ctx, k); err == nil {
+				out[k] = v
+			}
+		}
+		return out, nil
+	}
+
+	loaded, err := c.bulkLoader.LoadMulti(ctx, missing)
+	if err != nil {
+		return out, err
+	}
+	for k, res := range loaded {
+		if res.Err != nil {
+			continue
+		}
+		ttl := res.TTL
+		if ttl == 0 {
+			ttl = c.cfg.defaultTTL
+		}
+		// Caller always sees the loaded value; if SetWithTTL
+		// fails (e.g., MaxValueWeight), the cache simply
+		// doesn't retain it for the next call.
+		if setErr := c.SetWithTTL(k, res.Value, ttl); setErr != nil && c.cfg.logger != nil {
+			c.cfg.logger.Debug("memcache: GetMultiOrLoad set failed",
+				"err", setErr)
+		}
+		out[k] = res.Value
+	}
+	return out, nil
 }

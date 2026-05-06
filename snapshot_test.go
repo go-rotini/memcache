@@ -251,6 +251,33 @@ func TestSnapshotPreservesTags(t *testing.T) {
 	}
 }
 
+func TestSnapshotMetadataRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "snap.gob")
+	src, _ := New[string, int](
+		WithMaxEntries(4),
+		WithSnapshotMetadata(map[string]string{
+			"app_version": "1.4.2",
+			"git_sha":     "abc123",
+		}),
+	)
+	defer src.Close()
+	_ = src.Set("k", 1)
+	if err := src.SaveFile(path); err != nil {
+		t.Fatal(err)
+	}
+	info, err := InspectSnapshot(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Metadata["app_version"] != "1.4.2" {
+		t.Errorf("Metadata[app_version] = %q, want 1.4.2", info.Metadata["app_version"])
+	}
+	if info.Metadata["git_sha"] != "abc123" {
+		t.Errorf("Metadata[git_sha] = %q, want abc123", info.Metadata["git_sha"])
+	}
+}
+
 func TestInspectSnapshot(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "snap.gob")

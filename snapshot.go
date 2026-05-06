@@ -20,7 +20,14 @@ const snapshotMagic = "RTNI"
 
 // snapshotVersion is the on-disk format version. Writers stamp
 // this; readers reject anything they don't understand.
-const snapshotVersion uint8 = 1
+//
+// Version history:
+//   - v1: original format (magic + version + codec + name +
+//     saveTime + count + records + CRC32C).
+//   - v2 (current): adds a length-prefixed string→string metadata
+//     bag immediately after `name`, supporting [WithSnapshotMetadata]
+//     and [InspectSnapshot]'s Metadata accessor.
+const snapshotVersion uint8 = 2
 
 // defaultMaxSnapshotBytes caps Load input when [WithMaxSnapshotBytes]
 // is not set — protects against OOM on a corrupt or hostile file.
@@ -332,7 +339,9 @@ func (c *Cache[K, V]) applySnapshot(snap entrySnapshot[K, V]) {
 	c.evictWhileOverBudgetLocked(s)
 }
 
-// writeHeader emits the fixed-shape file header.
+// writeHeader emits the fixed-shape file header. v2 adds a
+// metadata map between `name` and `saveTime` so InspectSnapshot
+// can recover it without scanning the records section.
 func (c *Cache[K, V]) writeHeader(w io.Writer, count int64) error {
 	if _, err := io.WriteString(w, snapshotMagic); err != nil {
 		return wrapSaveErr("magic", err)
@@ -346,6 +355,9 @@ func (c *Cache[K, V]) writeHeader(w io.Writer, count int64) error {
 	if err := writeString(w, c.cfg.name); err != nil {
 		return wrapSaveErr("name", err)
 	}
+	if err := writeMetadata(w, c.cfg.snapshotMetadata); err != nil {
+		return wrapSaveErr("metadata", err)
+	}
 	if err := binary.Write(w, binary.LittleEndian, c.cfg.clock.Now().UnixNano()); err != nil {
 		return wrapSaveErr("saveTime", err)
 	}
@@ -353,6 +365,70 @@ func (c *Cache[K, V]) writeHeader(w io.Writer, count int64) error {
 		return wrapSaveErr("count", err)
 	}
 	return nil
+}
+
+// writeMetadata emits a length-prefixed map. uint16 count then
+// (key, value) string pairs. Keys are sorted so saves are
+// deterministic given the same metadata.
+func writeMetadata(w io.Writer, meta map[string]string) error {
+	if len(meta) > 65535 {
+		return errFieldTooBig
+	}
+	if err := binary.Write(w, binary.LittleEndian, uint16(len(meta))); err != nil {
+		return err
+	}
+	if len(meta) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(meta))
+	for k := range meta {
+		keys = append(keys, k)
+	}
+	sortStrings(keys)
+	for _, k := range keys {
+		if err := writeString(w, k); err != nil {
+			return err
+		}
+		if err := writeString(w, meta[k]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// readMetadata is the inverse of writeMetadata. Returns an empty
+// (non-nil) map when the snapshot carries no metadata, so callers
+// can range over the result without nil-checking.
+func readMetadata(r io.Reader) (map[string]string, error) {
+	var n uint16
+	if err := binary.Read(r, binary.LittleEndian, &n); err != nil {
+		return nil, err
+	}
+	out := make(map[string]string, n)
+	for range int(n) {
+		k, err := readString(r)
+		if err != nil {
+			return nil, err
+		}
+		v, err := readString(r)
+		if err != nil {
+			return nil, err
+		}
+		out[k] = v
+	}
+	return out, nil
+}
+
+// sortStrings is a tiny helper to keep snapshot.go free of a
+// `sort` import. The metadata sets are at most 65k entries; a
+// simple insertion sort is fine for typical sizes (≤16) and stays
+// linear-ish for larger.
+func sortStrings(a []string) {
+	for i := 1; i < len(a); i++ {
+		for j := i; j > 0 && a[j-1] > a[j]; j-- {
+			a[j-1], a[j] = a[j], a[j-1]
+		}
+	}
 }
 
 // writeRecord emits one entry's serialized form. Key goes through
@@ -467,6 +543,10 @@ func readSnapshotHeader(r io.Reader, h hash.Hash32) (*SnapshotInfo, error) {
 	if err != nil {
 		return nil, &SnapshotError{Op: "load", Message: "reading name", Err: err}
 	}
+	metadata, err := readMetadata(tee)
+	if err != nil {
+		return nil, &SnapshotError{Op: "load", Message: "reading metadata", Err: err}
+	}
 	var saveTime, count int64
 	if err := binary.Read(tee, binary.LittleEndian, &saveTime); err != nil {
 		return nil, &SnapshotError{Op: "load", Message: "reading saveTime", Err: err}
@@ -478,10 +558,11 @@ func readSnapshotHeader(r io.Reader, h hash.Hash32) (*SnapshotInfo, error) {
 		return nil, &SnapshotError{Op: "load", Message: "negative count", Err: ErrSnapshotCorrupt}
 	}
 	info := &SnapshotInfo{
-		Version: version,
-		Codec:   codec,
-		Name:    name,
-		Count:   count,
+		Version:  version,
+		Codec:    codec,
+		Name:     name,
+		Count:    count,
+		Metadata: metadata,
 	}
 	if saveTime != 0 {
 		info.SaveTime = time.Unix(0, saveTime)

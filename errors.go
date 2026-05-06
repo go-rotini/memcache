@@ -98,16 +98,29 @@ type CapacityError struct {
 	Key        any
 	Reason     string
 	LimitField string
+	// Cause is the underlying sentinel (e.g. [ErrTooManyTags]).
+	// Optional — populated only when the limit field has a
+	// dedicated sentinel.
+	Cause error
 }
 
 func (e *CapacityError) Error() string {
 	return fmt.Sprintf("memcache: capacity (%s): %s", e.LimitField, e.Reason)
 }
 
-// Is reports whether target is a *CapacityError.
+// Unwrap returns the underlying sentinel cause, if any.
+func (e *CapacityError) Unwrap() error { return e.Cause }
+
+// Is reports whether target is a *CapacityError or the cached
+// sentinel cause.
 func (e *CapacityError) Is(target error) bool {
-	_, ok := target.(*CapacityError)
-	return ok
+	if _, ok := target.(*CapacityError); ok {
+		return true
+	}
+	if e.Cause != nil && errors.Is(e.Cause, target) {
+		return true
+	}
+	return false
 }
 
 // LoadError wraps an error returned by a Loader.

@@ -2,6 +2,7 @@ package memcache
 
 import (
 	"log/slog"
+	"maps"
 	"runtime"
 	"time"
 )
@@ -85,6 +86,20 @@ type config struct {
 	autoLoadPath   string
 	autoLoadIgnore bool
 
+	// snapshotMetadata is an arbitrary key/value bag persisted
+	// alongside the snapshot header (spec §9.10). Useful for
+	// auditing — e.g. embedding the binary's git SHA so callers
+	// can detect cross-version snapshots before loading.
+	snapshotMetadata map[string]string
+
+	// tracer is the optional [Tracer] for span emission on
+	// cache operations. When nil, the cache uses a no-op tracer.
+	tracer Tracer
+
+	// expvarName, when non-empty, registers the cache's Stats
+	// snapshot under that name in stdlib `expvar`.
+	expvarName string
+
 	// Hook callbacks. Each is type-erased into the config and
 	// type-asserted into the typed shape at cache construction.
 	onHit    any // func(K, V)
@@ -111,7 +126,24 @@ type config struct {
 	weigher    any
 	hasher     any
 	loader     any
+	bulkLoader any
 	expireFunc any
+
+	// loaderRatePerSecond bounds the number of Loader invocations
+	// per second across the cache. 0 disables rate limiting.
+	loaderRatePerSecond int
+
+	// maxConcurrentLoads caps the number of in-flight Loader calls
+	// across the cache. 0 disables the cap.
+	maxConcurrentLoads int
+
+	// maxTagsPerEntry caps the number of tags an individual entry
+	// can carry. 0 disables the per-entry cap.
+	maxTagsPerEntry int
+
+	// maxTagsTotal caps the number of distinct tags the
+	// cache-level [tagIndex] may carry. 0 disables the cap.
+	maxTagsTotal int
 }
 
 // defaultConfig returns the package's baseline configuration. It is
@@ -299,6 +331,72 @@ func WithLoader[K comparable, V any](l Loader[K, V]) Option {
 	}
 }
 
+// WithBulkLoader attaches a [BulkLoader] used by
+// [Cache.GetMultiOrLoad]. When configured, missing keys in a
+// bulk-get are coalesced into a single LoadMulti call rather than
+// firing one [Loader] invocation per key.
+func WithBulkLoader[K comparable, V any](l BulkLoader[K, V]) Option {
+	return func(c *config) {
+		if l != nil {
+			c.bulkLoader = l
+		}
+	}
+}
+
+// WithLoaderRateLimit bounds the number of Loader invocations per
+// second across the cache. Excess callers receive
+// [ErrLoaderRateLimited] rather than blocking; their context is
+// not consulted (the limiter rejects synchronously).
+//
+// A non-positive value disables rate limiting. The limiter is a
+// simple steady-rate token bucket sized at perSecond tokens with
+// refill rate perSecond/second; it does not allow bursts above its
+// capacity.
+func WithLoaderRateLimit(perSecond int) Option {
+	return func(c *config) { c.loaderRatePerSecond = perSecond }
+}
+
+// WithMaxTagsPerEntry caps the number of tags carried by any
+// single entry. [Cache.SetWithTags] / [SetTags] / [CacheTagger]
+// inputs that exceed the limit cause the affected Set call to
+// return [*CapacityError] wrapping [ErrTooManyTags] without
+// inserting the entry.
+//
+// 0 (the default) disables the per-entry cap.
+func WithMaxTagsPerEntry(n int) Option {
+	return func(c *config) {
+		if n >= 0 {
+			c.maxTagsPerEntry = n
+		}
+	}
+}
+
+// WithMaxTagsTotal caps the number of distinct tags the cache's
+// inverted index may carry across all entries. When a Set would
+// introduce a new tag past the limit, the call returns
+// [*CapacityError] wrapping [ErrTooManyTags] without inserting.
+// Existing entries on already-known tags are unaffected.
+//
+// 0 disables the cache-wide cap.
+func WithMaxTagsTotal(n int) Option {
+	return func(c *config) {
+		if n >= 0 {
+			c.maxTagsTotal = n
+		}
+	}
+}
+
+// WithMaxConcurrentLoads caps the number of in-flight Loader calls
+// across the cache. When the cap is reached, further [Cache.GetOrLoad]
+// callers wait until a slot opens, returning their context's error
+// (or [ErrLoaderTooManyInFlight] when the wait times out via
+// [WithLoaderTimeout]).
+//
+// A non-positive value disables the cap.
+func WithMaxConcurrentLoads(n int) Option {
+	return func(c *config) { c.maxConcurrentLoads = n }
+}
+
 // WithNegativeCache enables caching of "not found" results. When a
 // Loader returns [ErrNotFound], the cache stores a tombstone with
 // the supplied TTL; subsequent Get/GetOrLoad calls return
@@ -344,6 +442,59 @@ func WithRefreshAhead(refreshAt float64) Option {
 // staleFor <= 0 disables SWR.
 func WithStaleWhileRevalidate(staleFor time.Duration) Option {
 	return func(c *config) { c.swrStaleFor = staleFor }
+}
+
+// WithExpvar registers the cache's Stats under the given name in
+// stdlib `expvar`. The published variable is a JSON-shaped object
+// keyed on the snake-case stat names (`hits`, `misses`, …,
+// `entries`, `bytes`, `capacity`, `hit_rate_permille`).
+//
+// Useful for `/debug/vars` integrations: drop the option in,
+// expose `expvar.Handler()` from your HTTP server, and the
+// cache's counters are visible immediately.
+//
+// If a variable with the same name has already been published in
+// this process the call is silently a no-op (avoiding the panic
+// stdlib's `expvar.Publish` would otherwise raise on duplicate
+// registration).
+func WithExpvar(name string) Option {
+	return func(c *config) {
+		if name != "" {
+			c.expvarName = name
+		}
+	}
+}
+
+// WithTracer attaches a [Tracer] for span emission on cache
+// operations. Spans are emitted around `Get`, `Set`, the loader,
+// eviction, and snapshot save/load paths. See the [Tracer] doc
+// for the catalog of span names.
+func WithTracer(t Tracer) Option {
+	return func(c *config) {
+		if t != nil {
+			c.tracer = t
+		}
+	}
+}
+
+// WithSnapshotMetadata embeds a key/value map in the snapshot
+// header. The metadata is exposed by [InspectSnapshot] so callers
+// can audit a snapshot's environment of origin (e.g., embed
+// `app_version` and refuse to load snapshots from incompatible
+// builds). Up to 65535 keys; each key and value are length-
+// prefixed `uint32` strings. The map is copied on the option call
+// so subsequent mutation by the caller does not affect future
+// saves.
+//
+// Calling this option more than once replaces the metadata wholesale.
+func WithSnapshotMetadata(meta map[string]string) Option {
+	return func(c *config) {
+		if meta == nil {
+			c.snapshotMetadata = nil
+			return
+		}
+		c.snapshotMetadata = maps.Clone(meta)
+	}
 }
 
 // WithMaxSnapshotBytes caps the size of snapshots accepted by

@@ -474,6 +474,210 @@ func TestNegativeCacheRespected(t *testing.T) {
 	_ = c
 }
 
+// bulkLoaderFunc adapts a function to BulkLoader.
+type bulkLoaderFunc[K comparable, V any] func(ctx context.Context, keys []K) (map[K]LoadResult[V], error)
+
+func (f bulkLoaderFunc[K, V]) LoadMulti(ctx context.Context, keys []K) (map[K]LoadResult[V], error) {
+	return f(ctx, keys)
+}
+
+func TestGetMultiOrLoadHitsBypassLoader(t *testing.T) {
+	calls := atomic.Int64{}
+	bl := bulkLoaderFunc[string, int](func(_ context.Context, keys []string) (map[string]LoadResult[int], error) {
+		calls.Add(1)
+		out := map[string]LoadResult[int]{}
+		for _, k := range keys {
+			out[k] = LoadResult[int]{Value: len(k)}
+		}
+		return out, nil
+	})
+	c, _ := New[string, int](
+		WithMaxEntries(8),
+		WithBulkLoader[string, int](bl),
+	)
+	defer c.Close()
+	_ = c.Set("alice", 1)
+	_ = c.Set("bob", 2)
+	got, err := c.GetMultiOrLoad(context.Background(), []string{"alice", "bob"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["alice"] != 1 || got["bob"] != 2 || len(got) != 2 {
+		t.Errorf("GetMultiOrLoad full hit = %v", got)
+	}
+	if calls.Load() != 0 {
+		t.Errorf("bulk loader fired %d times on full-hit; want 0", calls.Load())
+	}
+}
+
+func TestGetMultiOrLoadCoalescesMisses(t *testing.T) {
+	calls := atomic.Int64{}
+	var seenKeys atomic.Pointer[[]string]
+	bl := bulkLoaderFunc[string, int](func(_ context.Context, keys []string) (map[string]LoadResult[int], error) {
+		calls.Add(1)
+		copyKeys := append([]string(nil), keys...)
+		seenKeys.Store(&copyKeys)
+		out := map[string]LoadResult[int]{}
+		for _, k := range keys {
+			out[k] = LoadResult[int]{Value: len(k)}
+		}
+		return out, nil
+	})
+	c, _ := New[string, int](
+		WithMaxEntries(8),
+		WithBulkLoader[string, int](bl),
+	)
+	defer c.Close()
+	got, err := c.GetMultiOrLoad(context.Background(), []string{"alice", "bob", "carol"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["alice"] != 5 || got["bob"] != 3 || got["carol"] != 5 {
+		t.Errorf("GetMultiOrLoad = %v", got)
+	}
+	if calls.Load() != 1 {
+		t.Errorf("bulk loader called %d times; want 1 (coalesce)", calls.Load())
+	}
+	// Loaded values cached for subsequent calls.
+	v, _ := c.Get("alice")
+	if v != 5 {
+		t.Errorf("loaded value not cached; Get(alice) = %d", v)
+	}
+}
+
+func TestGetMultiOrLoadFallsBackToSingleLoader(t *testing.T) {
+	calls := atomic.Int64{}
+	loader := LoaderFunc[string, int](func(_ context.Context, k string) (int, time.Duration, error) {
+		calls.Add(1)
+		return len(k), 0, nil
+	})
+	// No WithBulkLoader → fall through to per-key Loader.
+	c, _ := New[string, int](
+		WithMaxEntries(8),
+		WithLoader[string, int](loader),
+	)
+	defer c.Close()
+	got, err := c.GetMultiOrLoad(context.Background(), []string{"alice", "bob"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["alice"] != 5 || got["bob"] != 3 {
+		t.Errorf("fallback path produced %v", got)
+	}
+	if calls.Load() != 2 {
+		t.Errorf("Loader fired %d times; want 2 (per-key)", calls.Load())
+	}
+}
+
+func TestGetMultiOrLoadNoLoader(t *testing.T) {
+	c, _ := New[string, int](WithMaxEntries(4))
+	defer c.Close()
+	_ = c.Set("k", 1)
+	// Hit-only path — no loader configured but no misses either.
+	got, err := c.GetMultiOrLoad(context.Background(), []string{"k"})
+	if err != nil {
+		t.Errorf("GetMultiOrLoad on full-hit without loader = %v; want nil", err)
+	}
+	if got["k"] != 1 {
+		t.Errorf("got = %v", got)
+	}
+	// Miss-with-no-loader returns ErrNoLoader along with whatever
+	// hits we collected.
+	_, err = c.GetMultiOrLoad(context.Background(), []string{"k", "missing"})
+	if !errors.Is(err, ErrNoLoader) {
+		t.Errorf("missing-key without loader = %v; want ErrNoLoader", err)
+	}
+}
+
+func TestLoaderRateLimitRejects(t *testing.T) {
+	clk := NewFakeClock(time.Unix(0, 0))
+	loader := LoaderFunc[string, int](func(_ context.Context, _ string) (int, time.Duration, error) {
+		return 1, 0, nil
+	})
+	c, _ := New[string, int](
+		WithMaxEntries(64),
+		WithClock(clk),
+		WithLoader[string, int](loader),
+		WithLoaderRateLimit(2), // 2 tokens/sec, bucket cap 2
+	)
+	defer c.Close()
+	// First two consume the bucket.
+	if _, err := c.GetOrLoad(context.Background(), "a"); err != nil {
+		t.Fatalf("first call: %v", err)
+	}
+	if _, err := c.GetOrLoad(context.Background(), "b"); err != nil {
+		t.Fatalf("second call: %v", err)
+	}
+	// Third should be rate-limited (no time advanced).
+	_, err := c.GetOrLoad(context.Background(), "c")
+	if !errors.Is(err, ErrLoaderRateLimited) {
+		t.Errorf("third call = %v, want ErrLoaderRateLimited", err)
+	}
+}
+
+func TestLoaderRateLimitRefillsOverTime(t *testing.T) {
+	clk := NewFakeClock(time.Unix(0, 0))
+	loader := LoaderFunc[string, int](func(_ context.Context, _ string) (int, time.Duration, error) {
+		return 1, 0, nil
+	})
+	c, _ := New[string, int](
+		WithMaxEntries(64),
+		WithClock(clk),
+		WithLoader[string, int](loader),
+		WithLoaderRateLimit(1),
+	)
+	defer c.Close()
+	if _, err := c.GetOrLoad(context.Background(), "a"); err != nil {
+		t.Fatal(err)
+	}
+	// Bucket empty.
+	if _, err := c.GetOrLoad(context.Background(), "b"); !errors.Is(err, ErrLoaderRateLimited) {
+		t.Fatalf("expected rate-limit, got %v", err)
+	}
+	// After 2 seconds, at least one token should have refilled.
+	clk.Advance(2 * time.Second)
+	if _, err := c.GetOrLoad(context.Background(), "c"); err != nil {
+		t.Errorf("after refill, GetOrLoad = %v; want nil", err)
+	}
+}
+
+func TestMaxConcurrentLoadsCaps(t *testing.T) {
+	hold := make(chan struct{})
+	release := make(chan struct{})
+	calls := atomic.Int64{}
+	loader := LoaderFunc[string, int](func(_ context.Context, _ string) (int, time.Duration, error) {
+		calls.Add(1)
+		hold <- struct{}{} // signal start
+		<-release          // block until released
+		return 1, 0, nil
+	})
+	c, _ := New[string, int](
+		WithMaxEntries(64),
+		WithLoader[string, int](loader),
+		WithMaxConcurrentLoads(2),
+		WithLoaderTimeout(50*time.Millisecond),
+	)
+	defer c.Close()
+
+	// Fire two loads to fill the slots.
+	r1 := make(chan error, 1)
+	r2 := make(chan error, 1)
+	go func() { _, err := c.GetOrLoad(context.Background(), "a"); r1 <- err }()
+	go func() { _, err := c.GetOrLoad(context.Background(), "b"); r2 <- err }()
+	<-hold
+	<-hold
+	// Slots full. Third should time out waiting for a slot.
+	_, err := c.GetOrLoad(context.Background(), "c")
+	if !errors.Is(err, ErrLoaderTooManyInFlight) {
+		t.Errorf("third loader = %v, want ErrLoaderTooManyInFlight", err)
+	}
+	// Release the held loaders.
+	release <- struct{}{}
+	release <- struct{}{}
+	<-r1
+	<-r2
+}
+
 func TestLoaderFuncAdapter(t *testing.T) {
 	var fn LoaderFunc[string, int] = func(_ context.Context, key string) (int, time.Duration, error) {
 		return len(key), 0, nil

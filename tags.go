@@ -1,6 +1,9 @@
 package memcache
 
-import "sync"
+import (
+	"fmt"
+	"sync"
+)
 
 // tagIndex maps each tag to the set of keys carrying it. Lives at
 // the cache level (not per-shard) because a single InvalidateTag
@@ -205,4 +208,42 @@ func (c *Cache[K, V]) retagLocked(key K, oldTags, newTags []string) {
 	if len(newTags) > 0 {
 		c.tags.tag(key, newTags)
 	}
+}
+
+// validateTagLimits checks that the proposed tag set respects
+// [WithMaxTagsPerEntry] and [WithMaxTagsTotal]. Returns a
+// [*CapacityError] wrapping [ErrTooManyTags] when either bound
+// would be violated; nil otherwise.
+//
+// The newDistinctTagsCount calculation is approximate — it walks
+// tags and checks the cache-level index for membership, accepting
+// a small race window where a concurrent Set might also be
+// introducing a new tag and both observers see "OK". The cap
+// remains a soft bound; absolute enforcement requires a stricter
+// (and much slower) cross-shard atomic check.
+func (c *Cache[K, V]) validateTagLimits(tags []string) error {
+	if c.cfg.maxTagsPerEntry > 0 && len(tags) > c.cfg.maxTagsPerEntry {
+		return &CapacityError{
+			Reason:     fmt.Sprintf("entry has %d tags; max is %d", len(tags), c.cfg.maxTagsPerEntry),
+			LimitField: "MaxTagsPerEntry",
+		}
+	}
+	if c.cfg.maxTagsTotal > 0 && c.tags != nil {
+		c.tags.mu.RLock()
+		current := len(c.tags.keysByTag)
+		newDistinct := 0
+		for _, t := range tags {
+			if _, ok := c.tags.keysByTag[t]; !ok {
+				newDistinct++
+			}
+		}
+		c.tags.mu.RUnlock()
+		if current+newDistinct > c.cfg.maxTagsTotal {
+			return &CapacityError{
+				Reason:     fmt.Sprintf("introducing %d new tags would exceed cache-level cap %d", newDistinct, c.cfg.maxTagsTotal),
+				LimitField: "MaxTagsTotal",
+			}
+		}
+	}
+	return nil
 }

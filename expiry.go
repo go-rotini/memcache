@@ -158,12 +158,24 @@ func (c *Cache[K, V]) stopJanitor(s *shard[K, V]) {
 	close(s.janitor.stop)
 }
 
+// janitorIdleShutdownTicks is how many consecutive idle ticks the
+// janitor must observe before exiting. Per spec §7.3 the
+// recommendation is 5; matches the "no TTL entries for 5 ×
+// JanitorInterval" formulation.
+const janitorIdleShutdownTicks = 5
+
 // runJanitor is the per-shard sweep loop. It wakes every configured
-// interval, sweeps expired entries from the heap, and re-arms.
-// Exits cleanly when stop is closed.
+// interval, sweeps expired entries from the heap, and re-arms. After
+// `janitorIdleShutdownTicks` consecutive idle ticks (no entries
+// removed AND the heap is empty) the goroutine exits and the
+// shard's `janitor.running` flag is cleared so the next TTL'd
+// insert can launch a fresh janitor via [Cache.startJanitorLocked].
+//
+// Exits early when stop is closed (Cache.Close).
 func (c *Cache[K, V]) runJanitor(s *shard[K, V]) {
 	stop := s.janitor.stop
 	tick := s.janitor.tick
+	idle := 0
 	for {
 		select {
 		case <-stop:
@@ -171,8 +183,39 @@ func (c *Cache[K, V]) runJanitor(s *shard[K, V]) {
 		case <-tick:
 			s.mu.Lock()
 			now := c.cfg.clock.Now().UnixNano()
-			c.sweepExpiredLocked(s, now)
+			removed := c.sweepExpiredLocked(s, now)
+			heapEmpty := s.expHeap.Len() == 0
 			s.mu.Unlock()
+
+			if removed == 0 && heapEmpty {
+				idle++
+				if idle >= janitorIdleShutdownTicks {
+					// Transition to "not running" UNDER the
+					// shard lock so a concurrent insert that
+					// observes running=true still sees a live
+					// goroutine. The shard lock is the same
+					// one [Cache.startJanitorLocked] takes
+					// when it CAS-es running false→true.
+					s.mu.Lock()
+					if s.expHeap.Len() == 0 {
+						// Confirm still idle; if the lock
+						// race introduced new TTL entries,
+						// stay alive.
+						s.janitor.running.Store(false)
+						if s.janitor.timer != nil {
+							s.janitor.timer.Stop()
+						}
+						s.mu.Unlock()
+						return
+					}
+					// Lost the race; reset idle counter and
+					// continue.
+					s.mu.Unlock()
+					idle = 0
+				}
+			} else {
+				idle = 0
+			}
 			if s.janitor.timer != nil {
 				s.janitor.timer.Reset(c.cfg.janitorInterval)
 			}
