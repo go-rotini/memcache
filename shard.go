@@ -15,10 +15,11 @@ type shard[K comparable, V any] struct {
 	policy  evictionPolicy[K, V]
 	pool    *entryPool[K, V]
 
-	// expHeap is a min-heap of *entry by expireAt. Entries without
-	// a TTL (expireAt == 0) are NOT in the heap; their heapIndex
-	// stays -1.
-	expHeap expiryHeap[K, V]
+	// ttl tracks pending expirations. Concrete type depends on
+	// [WithTTLBuckets] — the heap-backed backend is the default;
+	// the wheel-backed backend is opt-in via WithTTLBuckets.
+	// Always non-nil after newShard.
+	ttl ttlBackend[K, V]
 
 	// janitor coordinates the per-shard expiry sweep goroutine.
 	// Started lazily when the first TTL'd entry is inserted; stopped
@@ -48,10 +49,10 @@ type shard[K comparable, V any] struct {
 	hashIndex map[uint64]any
 }
 
-// newShard constructs a shard with the given policy and budget.
-// trackCollisions opts the shard into the per-insert
+// newShard constructs a shard with the given policy, budget, and
+// TTL backend. trackCollisions opts the shard into the per-insert
 // [WithCollisionTracking] check.
-func newShard[K comparable, V any](p evictionPolicy[K, V], budget int, trackCollisions bool) *shard[K, V] {
+func newShard[K comparable, V any](p evictionPolicy[K, V], budget int, trackCollisions bool, ttl ttlBackend[K, V]) *shard[K, V] {
 	s := &shard[K, V]{
 		entries:  make(map[K]*entry[K, V]),
 		policy:   p,
@@ -59,6 +60,7 @@ func newShard[K comparable, V any](p evictionPolicy[K, V], budget int, trackColl
 		budget:   budget,
 		inflight: make(map[K]*flightCall[V]),
 		errors:   make(map[K]*cachedError),
+		ttl:      ttl,
 	}
 	if trackCollisions {
 		s.hashIndex = make(map[uint64]any)

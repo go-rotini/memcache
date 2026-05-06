@@ -46,7 +46,17 @@ type entry[K comparable, V any] struct {
 	// heapIndex is the entry's position in its shard's expiry heap,
 	// or -1 when the entry has no TTL (and therefore is not tracked
 	// by the heap). Maintained by the heap's Swap/Push/Pop methods.
+	// Used only by the heap-based ttlBackend; nil-valued (-1) when
+	// the wheel-based backend is active.
 	heapIndex int
+
+	// wheelHandle is the back-pointer to the wheel entry tracking
+	// this expiration. Used only by the wheel-based ttlBackend
+	// ([WithTTLBuckets]); nil when the heap-based backend is
+	// active. The field is `any` rather than the concrete wheel
+	// type to keep entry independent of the wheel package — the
+	// wheel backend type-asserts to recover the *wheel.Entry.
+	wheelHandle any
 
 	// Tags (nil if untagged).
 	tags []string

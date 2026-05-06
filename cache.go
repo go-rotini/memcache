@@ -165,6 +165,24 @@ const configFieldMaxBytes = "MaxBytes"
 // build validates cfg and constructs a [Cache]. allowUnbounded
 // permits a cache with no entry/byte limit; otherwise an unbounded
 // configuration is rejected with [ErrUnbounded].
+// initShards populates c.shards with freshly-constructed per-shard
+// state. Factored out of [build] to keep that function under the
+// project's funlen budget; the work itself is straightforward —
+// allocate a policy, a TTL backend, and the shard wrapper for each
+// slot.
+func initShards[K comparable, V any](c *Cache[K, V], cfg *config, hasher func(K) uint64) {
+	perShard := perShardBudget(cfg.maxEntries, len(c.shards))
+	pcfg := policyConfig[K]{budget: perShard, hasher: hasher}
+	for i := range c.shards {
+		c.shards[i] = newShard(
+			newPolicy[K, V](cfg.policy, pcfg),
+			perShard,
+			cfg.collisionTracking,
+			newTTLBackend[K, V](cfg),
+		)
+	}
+}
+
 func build[K comparable, V any](cfg *config, allowUnbounded bool) (*Cache[K, V], error) {
 	// Surface deferred constructor errors (e.g., bad AES key
 	// length passed to WithEncryptedCodec) before doing any other
@@ -226,7 +244,7 @@ func build[K comparable, V any](cfg *config, allowUnbounded bool) (*Cache[K, V],
 	}
 	safeKeysCheck[K](cfg)
 	if cfg.ttlBuckets > 0 && cfg.logger != nil {
-		cfg.logger.Info("memcache: WithTTLBuckets is recognized but not yet wired into the cache's TTL backend; falling back to the per-shard expiry heap",
+		cfg.logger.Debug("memcache: WithTTLBuckets active; using hashed-wheel TTL backend",
 			"slots", cfg.ttlBuckets,
 			"tickPerBucket", cfg.ttlBucketsTickPerBucket)
 	}
@@ -276,11 +294,7 @@ func build[K comparable, V any](cfg *config, allowUnbounded bool) (*Cache[K, V],
 		counters:                   newStatsCounters(cfg.shardedStats, cfg.clock.Now()),
 	}
 
-	perShard := perShardBudget(cfg.maxEntries, shardCount)
-	pcfg := policyConfig[K]{budget: perShard, hasher: hasher}
-	for i := range c.shards {
-		c.shards[i] = newShard(newPolicy[K, V](cfg.policy, pcfg), perShard, cfg.collisionTracking)
-	}
+	initShards(c, cfg, hasher)
 
 	if err := c.applyAutoLoad(); err != nil {
 		return nil, err
@@ -1163,12 +1177,7 @@ func (c *Cache[K, V]) Reset() {
 		}
 		clear(s.entries)
 		s.policy.Reset()
-		// Drop heap state: every entry was returned to the pool so
-		// the slice's pointers must not be reused.
-		for i := range s.expHeap {
-			s.expHeap[i] = nil
-		}
-		s.expHeap = s.expHeap[:0]
+		s.ttl.Reset()
 		s.mu.Unlock()
 	}
 	if c.tags != nil {
@@ -1699,10 +1708,7 @@ func (c *Cache[K, V]) Clear() {
 		}
 		clear(s.entries)
 		s.policy.Reset()
-		for i := range s.expHeap {
-			s.expHeap[i] = nil
-		}
-		s.expHeap = s.expHeap[:0]
+		s.ttl.Reset()
 		s.mu.Unlock()
 	}
 	if c.tags != nil {

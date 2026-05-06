@@ -1,49 +1,42 @@
 package memcache
 
 import (
-	"container/heap"
 	"sync"
 	"sync/atomic"
 )
 
-// expiryHeap is a min-heap of *entry[K, V] ordered by expireAt
-// (unix nanos). It implements [container/heap.Interface]; the
-// container/heap package's free functions drive sift-up/sift-down.
-//
-// The heap is per-shard and protected by the shard's mutex. Entries
-// without a TTL (expireAt == 0) are NOT in the heap; their
-// heapIndex stays -1.
+// expiryHeap is the min-heap slice underlying [expiryHeapBackend].
+// Kept as a named type so it can implement [container/heap.Interface]
+// directly, which means heap.Push/Pop/Fix/Remove can drive it
+// without an additional wrapper. The slice is exposed publicly to
+// the heap-backed `expiryHeapBackend`; tests that need to inspect
+// ordering go through that backend, not the slice directly.
 type expiryHeap[K comparable, V any] []*entry[K, V]
 
-// Len reports the heap size. Required by [heap.Interface].
+// Len reports the heap size.
 func (h expiryHeap[K, V]) Len() int { return len(h) }
 
-// Less reports whether item i expires before item j. Required by
-// [heap.Interface].
+// Less reports whether item i expires before item j.
 func (h expiryHeap[K, V]) Less(i, j int) bool {
 	return h[i].expireAt.Load() < h[j].expireAt.Load()
 }
 
 // Swap exchanges items i and j and updates their cached heap
-// positions. Required by [heap.Interface].
+// positions.
 func (h expiryHeap[K, V]) Swap(i, j int) {
 	h[i], h[j] = h[j], h[i]
 	h[i].heapIndex = i
 	h[j].heapIndex = j
 }
 
-// Push appends x at the end. Required by [heap.Interface]; callers
-// should use [heap.Push] (which handles sift-up) rather than calling
-// this directly.
+// Push appends x at the end.
 func (h *expiryHeap[K, V]) Push(x any) {
 	e, _ := x.(*entry[K, V])
 	e.heapIndex = len(*h)
 	*h = append(*h, e)
 }
 
-// Pop removes and returns the last element. Required by
-// [heap.Interface]; callers should use [heap.Pop] (which handles
-// sift-down) rather than calling this directly.
+// Pop removes and returns the last element.
 func (h *expiryHeap[K, V]) Pop() any {
 	old := *h
 	n := len(old)
@@ -54,60 +47,24 @@ func (h *expiryHeap[K, V]) Pop() any {
 	return e
 }
 
-// expiryAdd inserts e into the shard's heap iff e has a non-zero
-// expireAt. Caller must hold s.mu.
-func (s *shard[K, V]) expiryAdd(e *entry[K, V]) {
-	if e.expireAt.Load() == 0 {
-		e.heapIndex = -1
-		return
-	}
-	heap.Push(&s.expHeap, e)
-}
+// expiryAdd delegates to the shard's TTL backend. Caller must hold s.mu.
+func (s *shard[K, V]) expiryAdd(e *entry[K, V]) { s.ttl.Add(e) }
 
-// expiryRemove drops e from the heap if it is currently tracked.
-// Caller must hold s.mu.
-func (s *shard[K, V]) expiryRemove(e *entry[K, V]) {
-	if e.heapIndex < 0 {
-		return
-	}
-	heap.Remove(&s.expHeap, e.heapIndex)
-}
+// expiryRemove delegates to the shard's TTL backend.
+func (s *shard[K, V]) expiryRemove(e *entry[K, V]) { s.ttl.Remove(e) }
 
-// expiryFix re-orders the heap after the entry's expireAt has
-// changed. Handles three cases:
-//   - entry was not in heap, now has TTL → push
-//   - entry was in heap, TTL cleared (expireAt=0) → remove
-//   - entry was in heap, TTL changed → fix in place (O(log n))
-//
-// Caller must hold s.mu.
-func (s *shard[K, V]) expiryFix(e *entry[K, V]) {
-	exp := e.expireAt.Load()
-	switch {
-	case e.heapIndex < 0 && exp > 0:
-		heap.Push(&s.expHeap, e)
-	case e.heapIndex >= 0 && exp == 0:
-		heap.Remove(&s.expHeap, e.heapIndex)
-	case e.heapIndex >= 0:
-		heap.Fix(&s.expHeap, e.heapIndex)
-	}
-}
+// expiryFix delegates to the shard's TTL backend.
+func (s *shard[K, V]) expiryFix(e *entry[K, V]) { s.ttl.Fix(e) }
 
-// sweepExpiredLocked pops expired entries from the heap and removes
-// them from the shard's map until the heap top is in the future or
-// empty. Returns the number of entries removed. Caller must hold
-// s.mu (write lock).
+// sweepExpiredLocked removes every entry whose expireAt ≤ now from
+// the shard. Returns the count. Caller must hold s.mu (write).
 func (c *Cache[K, V]) sweepExpiredLocked(s *shard[K, V], now int64) int {
-	count := 0
-	for s.expHeap.Len() > 0 {
-		e := s.expHeap[0]
-		if e.expireAt.Load() > now {
-			return count
-		}
+	expired := s.ttl.Sweep(now)
+	for _, e := range expired {
 		c.removeLocked(s, e, EvictReasonExpired)
 		c.counters.expirations.Add(1)
-		count++
 	}
-	return count
+	return len(expired)
 }
 
 // janitorState holds the per-shard janitor coordination. A nil-or-
@@ -184,7 +141,7 @@ func (c *Cache[K, V]) runJanitor(s *shard[K, V]) {
 			s.mu.Lock()
 			now := c.cfg.clock.Now().UnixNano()
 			removed := c.sweepExpiredLocked(s, now)
-			heapEmpty := s.expHeap.Len() == 0
+			heapEmpty := s.ttl.Len() == 0
 			s.mu.Unlock()
 
 			if removed == 0 && heapEmpty {
@@ -197,7 +154,7 @@ func (c *Cache[K, V]) runJanitor(s *shard[K, V]) {
 					// one [Cache.startJanitorLocked] takes
 					// when it CAS-es running false→true.
 					s.mu.Lock()
-					if s.expHeap.Len() == 0 {
+					if s.ttl.Len() == 0 {
 						// Confirm still idle; if the lock
 						// race introduced new TTL entries,
 						// stay alive.

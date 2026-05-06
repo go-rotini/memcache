@@ -86,8 +86,8 @@ func TestSetWithTTLPushesToHeap(t *testing.T) {
 	s := c.shardFor("k")
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.expHeap.Len() != 1 {
-		t.Errorf("heap.Len = %d, want 1 after TTL'd Set", s.expHeap.Len())
+	if s.ttl.Len() != 1 {
+		t.Errorf("heap.Len = %d, want 1 after TTL'd Set", s.ttl.Len())
 	}
 	if s.entries["k"].heapIndex != 0 {
 		t.Errorf("entry heapIndex = %d, want 0", s.entries["k"].heapIndex)
@@ -101,8 +101,8 @@ func TestSetWithoutTTLDoesNotTouchHeap(t *testing.T) {
 	s := c.shardFor("k")
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.expHeap.Len() != 0 {
-		t.Errorf("heap.Len = %d, want 0 for no-TTL entry", s.expHeap.Len())
+	if s.ttl.Len() != 0 {
+		t.Errorf("heap.Len = %d, want 0 for no-TTL entry", s.ttl.Len())
 	}
 	if s.entries["k"].heapIndex != -1 {
 		t.Errorf("no-TTL entry heapIndex = %d, want -1", s.entries["k"].heapIndex)
@@ -122,7 +122,8 @@ func TestUpdateChangesExpireAtFixesHeap(t *testing.T) {
 	_ = c.SetWithTTL("a", 1, time.Hour)
 	s := c.shardFor("a")
 	s.mu.RLock()
-	headKey := s.expHeap[0].key
+	hb, _ := s.ttl.(*expiryHeapBackend[string, int])
+	headKey := hb.heap[0].key
 	s.mu.RUnlock()
 	if headKey != "b" {
 		t.Errorf("heap min after update = %q, want %q", headKey, "b")
@@ -140,8 +141,8 @@ func TestDeleteRemovesFromHeap(t *testing.T) {
 	s := c.shardFor("k")
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	if s.expHeap.Len() != 0 {
-		t.Errorf("heap.Len after Delete = %d, want 0", s.expHeap.Len())
+	if s.ttl.Len() != 0 {
+		t.Errorf("heap.Len after Delete = %d, want 0", s.ttl.Len())
 	}
 }
 
