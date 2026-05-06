@@ -121,7 +121,7 @@ func (c *Cache[K, V]) Compute(
 
 	var current V
 	var present bool
-	if e, ok := s.entries[key]; ok && !c.entryExpiredLocked(e, now) && !e.flags.has(flagNegative) {
+	if e, ok := s.storage.get(key); ok && !c.entryExpiredLocked(e, now) && !e.flags.has(flagNegative) {
 		current = e.value
 		present = true
 	}
@@ -142,7 +142,7 @@ func (c *Cache[K, V]) Compute(
 			c.cfg.slidingTTL, int64(c.cfg.defaultTTL), nil)
 		return newValue, nil
 	case ComputeDelete:
-		if e, ok := s.entries[key]; ok {
+		if e, ok := s.storage.get(key); ok {
 			c.removeLocked(s, e, EvictReasonComputed)
 		}
 		return zero, nil
@@ -182,7 +182,7 @@ func (c *Cache[K, V]) ComputeIfAbsent(
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if e, ok := s.entries[key]; ok && !c.entryExpiredLocked(e, now) && !e.flags.has(flagNegative) {
+	if e, ok := s.storage.get(key); ok && !c.entryExpiredLocked(e, now) && !e.flags.has(flagNegative) {
 		return e.value, false, nil
 	}
 
@@ -231,7 +231,7 @@ func (c *Cache[K, V]) ComputeIfPresent(
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	e, ok := s.entries[key]
+	e, ok := s.storage.get(key)
 	if !ok || c.entryExpiredLocked(e, now) || e.flags.has(flagNegative) {
 		return zero, nil
 	}
@@ -278,7 +278,7 @@ func (c *Cache[K, V]) Update(key K, fn func(cur V) V) (V, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	e, ok := s.entries[key]
+	e, ok := s.storage.get(key)
 	if !ok || c.entryExpiredLocked(e, now) || e.flags.has(flagNegative) {
 		return zero, ErrNotFound
 	}
@@ -309,7 +309,7 @@ func (c *Cache[K, V]) CompareAndSwap(key K, old, newValue V) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	e, ok := s.entries[key]
+	e, ok := s.storage.get(key)
 	if !ok || c.entryExpiredLocked(e, now) || e.flags.has(flagNegative) {
 		return false
 	}

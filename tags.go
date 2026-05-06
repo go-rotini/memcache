@@ -135,7 +135,7 @@ func (c *Cache[K, V]) InvalidateTag(tag string) int {
 	for _, k := range keys {
 		s := c.shardFor(k)
 		s.mu.Lock()
-		if e, ok := s.entries[k]; ok {
+		if e, ok := s.storage.get(k); ok {
 			c.removeLocked(s, e, EvictReasonTag)
 			count++
 		}
@@ -169,7 +169,7 @@ func (c *Cache[K, V]) InvalidateTags(tags ...string) int {
 	for k := range doomed {
 		s := c.shardFor(k)
 		s.mu.Lock()
-		if e, ok := s.entries[k]; ok {
+		if e, ok := s.storage.get(k); ok {
 			c.removeLocked(s, e, EvictReasonTag)
 			count++
 		}
@@ -195,7 +195,7 @@ func (c *Cache[K, V]) Tags(key K) []string {
 	s := c.shardFor(key)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	e, ok := s.entries[key]
+	e, ok := s.storage.get(key)
 	if !ok {
 		return nil
 	}
@@ -238,7 +238,7 @@ func (c *Cache[K, V]) enforceGroupBudgets(tags []string) {
 // lag the actual entry state by the queue depth, so the loop's
 // terminating count comes from a live-walk of the snapshot rather
 // than the snapshot's raw length: every member is checked against
-// its owning shard, and only entries still in `s.entries` count
+// its owning shard, and only entries still in `s.storage` count
 // against the budget.
 func (c *Cache[K, V]) shrinkGroup(tag string, capacity int) {
 	for {
@@ -253,7 +253,7 @@ func (c *Cache[K, V]) shrinkGroup(tag string, capacity int) {
 		}
 		s := c.shardFor(oldestKey)
 		s.mu.Lock()
-		if e, exists := s.entries[oldestKey]; exists {
+		if e, exists := s.storage.get(oldestKey); exists {
 			c.removeLocked(s, e, EvictReasonTag)
 		}
 		s.mu.Unlock()
@@ -269,7 +269,7 @@ func (c *Cache[K, V]) countLiveMembers(members []K) int {
 	for _, k := range members {
 		s := c.shardFor(k)
 		s.mu.RLock()
-		if _, ok := s.entries[k]; ok {
+		if _, ok := s.storage.get(k); ok {
 			live++
 		}
 		s.mu.RUnlock()
@@ -287,7 +287,7 @@ func (c *Cache[K, V]) findOldestMember(members []K) (K, bool) {
 	for _, k := range members {
 		s := c.shardFor(k)
 		s.mu.RLock()
-		e, ok := s.entries[k]
+		e, ok := s.storage.get(k)
 		var t int64
 		if ok {
 			t = e.inserted

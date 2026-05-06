@@ -23,15 +23,16 @@ func (c *Cache[K, V]) Items() []KeyedItem[K, V] {
 	now := c.cfg.clock.Now().UnixNano()
 	for _, s := range c.shards {
 		s.mu.RLock()
-		for _, e := range s.entries {
+		s.storage.each(func(e *entry[K, V]) bool {
 			if e.expired(now) || e.flags.has(flagNegative) {
-				continue
+				return true
 			}
 			out = append(out, KeyedItem[K, V]{
 				Key:  e.key,
 				Item: e.item(),
 			})
-		}
+			return true
+		})
 		s.mu.RUnlock()
 	}
 	return out
@@ -48,7 +49,7 @@ func (c *Cache[K, V]) ItemMetadata(key K) (Metadata, bool) {
 	now := c.cfg.clock.Now().UnixNano()
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	e, ok := s.entries[key]
+	e, ok := s.storage.get(key)
 	if !ok || e.expired(now) || e.flags.has(flagNegative) {
 		return Metadata{}, false
 	}
@@ -127,16 +128,17 @@ func (c *Cache[K, V]) Histogram() Histogram {
 	now := c.cfg.clock.Now()
 	for _, s := range c.shards {
 		s.mu.RLock()
-		for _, e := range s.entries {
+		s.storage.each(func(e *entry[K, V]) bool {
 			if e.expired(now.UnixNano()) || e.flags.has(flagNegative) {
-				continue
+				return true
 			}
 			h.TotalEntries++
 			h.TotalWeight += e.weight
 			h.AgeBuckets[ageBucket(now.Sub(time.Unix(0, e.inserted)))]++
 			h.WeightBuckets[weightBucket(e.weight)]++
 			h.HitsBuckets[hitsBucket(e.hits.Load())]++
-		}
+			return true
+		})
 		s.mu.RUnlock()
 	}
 	return h

@@ -217,6 +217,12 @@ type config struct {
 	// but not yet active.
 	ttlBuckets              int
 	ttlBucketsTickPerBucket int
+
+	// flatStorage opts each shard into [flatStore] — a flat
+	// hash-probed table with linear probing and tombstone-driven
+	// compactions — instead of the default `map[K]*entry[K, V]`.
+	// Toggled by [WithFlatStorage].
+	flatStorage bool
 }
 
 // defaultConfig returns the package's baseline configuration. It is
@@ -410,6 +416,30 @@ func WithTTLBuckets(slots, tickPerBucket int) Option {
 		c.ttlBuckets = slots
 		c.ttlBucketsTickPerBucket = tickPerBucket
 	}
+}
+
+// WithFlatStorage opts each shard into a flat hash-probed storage
+// layout instead of the default Go map. The flat layout uses linear
+// probing with tombstone-driven compactions; per-entry overhead is
+// lower than the map's bucket-and-overflow structure and probes
+// keep cache lines hot, which can improve throughput on workloads
+// with small-to-mid sized values and modest churn.
+//
+// Trade-offs:
+//   - Lookups, inserts, and deletes are O(1) amortized but pay a
+//     slot-scan cost when clusters are dense.
+//   - Deletes leave tombstones until the next compaction; sustained
+//     churn-heavy workloads will see periodic rebuilds.
+//   - The number of compactions performed across all shards is
+//     reported as [Stats.Compactions]; a persistently-rising
+//     counter under steady state indicates the workload is
+//     compaction-dominated and the default map storage may serve
+//     it better.
+//
+// EXPERIMENTAL in v0; enable only when benchmarks for your workload
+// show a win.
+func WithFlatStorage() Option {
+	return func(c *config) { c.flatStorage = true }
 }
 
 // WithShardedStats requests per-CPU sharded counters for the

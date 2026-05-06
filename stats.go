@@ -126,6 +126,14 @@ type Stats struct {
 	// reducing tag churn.
 	TagCleanupBacklog int
 
+	// Compactions counts the cumulative number of storage rebuilds
+	// performed across all shards. Always 0 unless [WithFlatStorage]
+	// is enabled — the default map storage never compacts. A
+	// persistently-rising counter under steady-state load suggests
+	// the workload is dominated by tombstone churn and the default
+	// map storage may serve it better.
+	Compactions uint64
+
 	// Uptime is the wall-clock duration since [New] returned.
 	Uptime time.Duration
 

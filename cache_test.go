@@ -648,7 +648,8 @@ func TestSetWithOptionsTags(t *testing.T) {
 	// Tags currently sit on the entry; verify via internal field.
 	s := c.shardFor("k")
 	s.mu.RLock()
-	tags := append([]string(nil), s.entries["k"].tags...)
+	e, _ := s.storage.get("k")
+	tags := append([]string(nil), e.tags...)
 	s.mu.RUnlock()
 	if len(tags) != 2 || tags[0] != "a" || tags[1] != "b" {
 		t.Errorf("entry tags = %v, want [a b]", tags)

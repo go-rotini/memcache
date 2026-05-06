@@ -294,11 +294,11 @@ func (c *Cache[K, V]) snapshotEntries() []entrySnapshot[K, V] {
 	var out []entrySnapshot[K, V]
 	for _, s := range c.shards {
 		s.mu.RLock()
-		for _, e := range s.entries {
+		s.storage.each(func(e *entry[K, V]) bool {
 			// Skip TTL-expired and negative-cache tombstones —
 			// neither carries useful warm-restart state.
 			if e.expired(now) || e.flags.has(flagNegative) {
-				continue
+				return true
 			}
 			snap := entrySnapshot[K, V]{
 				key:      e.key,
@@ -313,7 +313,8 @@ func (c *Cache[K, V]) snapshotEntries() []entrySnapshot[K, V] {
 				snap.tags = append([]string(nil), e.tags...)
 			}
 			out = append(out, snap)
-		}
+			return true
+		})
 		s.mu.RUnlock()
 	}
 	return out
@@ -328,7 +329,7 @@ func (c *Cache[K, V]) applySnapshot(snap entrySnapshot[K, V]) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if existing, ok := s.entries[snap.key]; ok {
+	if existing, ok := s.storage.get(snap.key); ok {
 		// Overwrite path (Merge semantics, or Load-after-non-empty
 		// edge case).
 		c.removeLocked(s, existing, EvictReasonReplaced)
@@ -346,7 +347,7 @@ func (c *Cache[K, V]) applySnapshot(snap entrySnapshot[K, V]) {
 	if len(snap.tags) > 0 {
 		e.tags = append(e.tags[:0], snap.tags...)
 	}
-	s.entries[snap.key] = e
+	s.storage.set(snap.key, e)
 	s.expiryAdd(e)
 	s.policy.OnInsert(e)
 	c.retagLocked(snap.key, nil, snap.tags)

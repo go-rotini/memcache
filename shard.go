@@ -3,15 +3,20 @@ package memcache
 import "sync"
 
 // shard is one of the cache's hash-routed partitions. Each shard owns
-// its own map, eviction policy, and sync.Pool of entries; cross-shard
-// coordination is the cache-level concern (tags, snapshots, stats).
+// its own storage, eviction policy, and sync.Pool of entries;
+// cross-shard coordination is the cache-level concern (tags,
+// snapshots, stats).
 //
 // Concurrency: shard.mu protects all mutable state. The hot path
 // takes a single Lock or RLock — there are no nested shard locks
 // taken anywhere in the package.
 type shard[K comparable, V any] struct {
-	mu      sync.RWMutex
-	entries map[K]*entry[K, V]
+	mu sync.RWMutex
+	// storage is the entry-table abstraction. Default is a
+	// [mapStore] over `map[K]*entry[K, V]`; opt-in alternatives
+	// (currently [flatStore] via [WithFlatStorage]) implement the
+	// same [shardStore] interface.
+	storage shardStore[K, V]
 	policy  evictionPolicy[K, V]
 	pool    *entryPool[K, V]
 
@@ -32,8 +37,8 @@ type shard[K comparable, V any] struct {
 	inflight map[K]*flightCall[V]
 
 	// errors caches Loader errors when [WithErrorTTL] is enabled.
-	// Negative-cache (ErrNotFound) tombstones live on the entries
-	// map with flagNegative set, NOT here.
+	// Negative-cache (ErrNotFound) tombstones live on the storage
+	// table with flagNegative set, NOT here.
 	errors map[K]*cachedError
 
 	// budget is the per-shard target entry count. The cache divides
@@ -49,12 +54,12 @@ type shard[K comparable, V any] struct {
 	hashIndex map[uint64]any
 }
 
-// newShard constructs a shard with the given policy, budget, and
-// TTL backend. trackCollisions opts the shard into the per-insert
-// [WithCollisionTracking] check.
-func newShard[K comparable, V any](p evictionPolicy[K, V], budget int, trackCollisions bool, ttl ttlBackend[K, V]) *shard[K, V] {
+// newShard constructs a shard with the given policy, budget, TTL
+// backend, and storage. trackCollisions opts the shard into the
+// per-insert [WithCollisionTracking] check.
+func newShard[K comparable, V any](p evictionPolicy[K, V], budget int, trackCollisions bool, ttl ttlBackend[K, V], storage shardStore[K, V]) *shard[K, V] {
 	s := &shard[K, V]{
-		entries:  make(map[K]*entry[K, V]),
+		storage:  storage,
 		policy:   p,
 		pool:     newEntryPool[K, V](),
 		budget:   budget,

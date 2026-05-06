@@ -89,8 +89,9 @@ func TestSetWithTTLPushesToHeap(t *testing.T) {
 	if s.ttl.Len() != 1 {
 		t.Errorf("heap.Len = %d, want 1 after TTL'd Set", s.ttl.Len())
 	}
-	if s.entries["k"].heapIndex != 0 {
-		t.Errorf("entry heapIndex = %d, want 0", s.entries["k"].heapIndex)
+	e, _ := s.storage.get("k")
+	if e.heapIndex != 0 {
+		t.Errorf("entry heapIndex = %d, want 0", e.heapIndex)
 	}
 }
 
@@ -104,8 +105,9 @@ func TestSetWithoutTTLDoesNotTouchHeap(t *testing.T) {
 	if s.ttl.Len() != 0 {
 		t.Errorf("heap.Len = %d, want 0 for no-TTL entry", s.ttl.Len())
 	}
-	if s.entries["k"].heapIndex != -1 {
-		t.Errorf("no-TTL entry heapIndex = %d, want -1", s.entries["k"].heapIndex)
+	e, _ := s.storage.get("k")
+	if e.heapIndex != -1 {
+		t.Errorf("no-TTL entry heapIndex = %d, want -1", e.heapIndex)
 	}
 }
 
@@ -293,14 +295,16 @@ func TestSlidingTTLCoalesces(t *testing.T) {
 	s := c.shardFor("k")
 
 	s.mu.RLock()
-	first := s.entries["k"].lastAccess.Load()
+	e, _ := s.storage.get("k")
+	first := e.lastAccess.Load()
 	s.mu.RUnlock()
 
 	// Advance by less than slide/4 (15s) and read — coalesced.
 	clk.Advance(5 * time.Second)
 	_, _ = c.Get("k")
 	s.mu.RLock()
-	got := s.entries["k"].lastAccess.Load()
+	e, _ = s.storage.get("k")
+	got := e.lastAccess.Load()
 	s.mu.RUnlock()
 	if got != first {
 		t.Errorf("coalesced sliding-TTL Get advanced lastAccess from %d to %d", first, got)
@@ -310,7 +314,8 @@ func TestSlidingTTLCoalesces(t *testing.T) {
 	clk.Advance(20 * time.Second) // total 25s > 15s
 	_, _ = c.Get("k")
 	s.mu.RLock()
-	got = s.entries["k"].lastAccess.Load()
+	e, _ = s.storage.get("k")
+	got = e.lastAccess.Load()
 	s.mu.RUnlock()
 	if got == first {
 		t.Errorf("sliding-TTL Get past slide/4 should have advanced lastAccess; still at %d", got)

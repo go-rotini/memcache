@@ -145,9 +145,9 @@ func (c *Cache[K, V]) Clone() (*Cache[K, V], error) {
 	var staged []cloneEntry
 	for _, s := range c.shards {
 		s.mu.RLock()
-		for _, e := range s.entries {
+		s.storage.each(func(e *entry[K, V]) bool {
 			if e.expired(now) || e.flags.has(flagNegative) {
-				continue
+				return true
 			}
 			tagsCopy := append([]string(nil), e.tags...)
 			staged = append(staged, cloneEntry{
@@ -159,7 +159,8 @@ func (c *Cache[K, V]) Clone() (*Cache[K, V], error) {
 				tags:       tagsCopy,
 				flags:      e.flags,
 			})
-		}
+			return true
+		})
 		s.mu.RUnlock()
 	}
 
@@ -176,7 +177,7 @@ func (c *Cache[K, V]) Clone() (*Cache[K, V], error) {
 		ne.flags = ce.flags
 		ne.slidingTTL = ce.slidingTTL
 		ne.tags = ce.tags
-		ns.entries[ce.key] = ne
+		ns.storage.set(ce.key, ne)
 		ns.policy.OnInsert(ne)
 		clone.counters.entries.Add(1)
 		clone.counters.bytes.Add(ce.weight)

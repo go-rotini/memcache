@@ -104,15 +104,15 @@ func TestShardKeepsEntriesIsolated(t *testing.T) {
 
 func TestNewShardConstructor(t *testing.T) {
 	pol := newLRU[string, int]()
-	s := newShard[string, int](pol, 16, false, newExpiryHeapBackend[string, int]())
+	s := newShard[string, int](pol, 16, false, newExpiryHeapBackend[string, int](), newMapStore[string, int]())
 	if s.policy == nil {
 		t.Error("newShard returned shard with nil policy")
 	}
 	if s.budget != 16 {
 		t.Errorf("budget = %d, want 16", s.budget)
 	}
-	if s.entries == nil || len(s.entries) != 0 {
-		t.Error("newShard should produce an empty map")
+	if s.storage == nil || s.storage.length() != 0 {
+		t.Error("newShard should produce an empty storage")
 	}
 }
 
