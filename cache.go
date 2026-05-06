@@ -127,8 +127,9 @@ func build[K comparable, V any](cfg *config, allowUnbounded bool) (*Cache[K, V],
 	}
 
 	perShard := perShardBudget(cfg.maxEntries, shardCount)
+	pcfg := policyConfig[K]{budget: perShard, hasher: hasher}
 	for i := range c.shards {
-		c.shards[i] = newShard(newPolicy[K, V](cfg.policy), perShard)
+		c.shards[i] = newShard(newPolicy[K, V](cfg.policy, pcfg), perShard)
 	}
 
 	return c, nil

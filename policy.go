@@ -42,28 +42,41 @@ type evictionPolicy[K comparable, V any] interface {
 	Reset()
 }
 
+// policyConfig bundles the construction-time parameters that
+// individual eviction policies may consume.
+//
+// `budget` is the shard's target entry count (0 for byte-bounded or
+// unbounded caches). Capacity-aware policies (S3-FIFO, TinyLFU, 2Q,
+// ARC) use it to derive their internal size splits; simple policies
+// (LRU, LFU, FIFO) ignore it.
+//
+// `hasher` is the typed key hasher used by frequency-sketch-backed
+// policies (TinyLFU). Policies that don't need it ignore the field.
+type policyConfig[K comparable] struct {
+	budget int
+	hasher func(K) uint64
+}
+
 // newPolicy constructs the eviction policy implementation for the
 // requested [Policy] enum. The returned implementation is fresh; each
-// shard owns its own.
-//
-// Unsupported or not-yet-implemented policies fall back to FIFO so
-// that the cache remains usable while implementations are filled in.
-// New users select the policy through [WithPolicy], so this default
-// behavior is documented in the package overview.
-func newPolicy[K comparable, V any](p Policy) evictionPolicy[K, V] {
+// shard owns its own. Unrecognized policies fall back to LRU so the
+// cache remains usable.
+func newPolicy[K comparable, V any](p Policy, cfg policyConfig[K]) evictionPolicy[K, V] {
 	switch p {
 	case PolicyLRU:
 		return newLRU[K, V]()
 	case PolicyFIFO:
 		return newFIFO[K, V]()
 	case PolicyS3FIFO:
-		// S3-FIFO falls back to LRU until the dedicated
-		// implementation lands. Hit-rate guarantees in the spec
-		// apply only after the S3-FIFO policy is enabled.
-		return newLRU[K, V]()
-	case PolicyLFU, PolicyTinyLFU, PolicyARC, Policy2Q:
-		// Pending implementations; fall through to LRU.
-		return newLRU[K, V]()
+		return newS3FIFO[K, V](cfg.budget)
+	case PolicyLFU:
+		return newLFU[K, V]()
+	case PolicyTinyLFU:
+		return newTinyLFU[K, V](cfg.budget, cfg.hasher)
+	case Policy2Q:
+		return newTwoQ[K, V](cfg.budget)
+	case PolicyARC:
+		return newARC[K, V](cfg.budget)
 	default:
 		return newLRU[K, V]()
 	}
