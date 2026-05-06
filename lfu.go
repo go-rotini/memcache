@@ -122,6 +122,10 @@ func (p *lfuPolicy[K, V]) Victim() *entry[K, V] {
 // Len returns the number of entries tracked by the policy.
 func (p *lfuPolicy[K, V]) Len() int { return p.size }
 
+// SetBudget is a no-op: LFU does not track a capacity bound; the
+// cache's shard-level budget is the only signal it needs.
+func (p *lfuPolicy[K, V]) SetBudget(int) {}
+
 // Reset clears every bucket.
 func (p *lfuPolicy[K, V]) Reset() {
 	for _, list := range p.buckets {

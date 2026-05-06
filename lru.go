@@ -79,6 +79,10 @@ func (p *lruPolicy[K, V]) Victim() *entry[K, V] {
 // Len returns the number of entries tracked.
 func (p *lruPolicy[K, V]) Len() int { return p.size }
 
+// SetBudget is a no-op: LRU has no internal sub-budget; the cache's
+// shard-level budget is the only signal it needs.
+func (p *lruPolicy[K, V]) SetBudget(int) {}
+
 // Reset clears the entire list and detaches every node from its
 // entry. Callers must stop using the policy until they re-OnInsert
 // the entries they want to keep.

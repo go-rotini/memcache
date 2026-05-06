@@ -67,22 +67,40 @@ const s3FreqMax uint8 = 3
 // queue once entries arrive); the cache's eviction loop is what
 // actually triggers Victim, so degenerate budgets remain consistent.
 func newS3FIFO[K comparable, V any](budget int) *s3fifoPolicy[K, V] {
-	smallBudget := 0
-	mainBudget := 0
-	if budget > 0 {
-		// 10% to Small, rounded up so a budget of 1 still yields a
-		// usable Small queue.
-		smallBudget = (budget + 9) / 10
-		if smallBudget >= budget {
-			smallBudget = 1
-		}
-		mainBudget = max(budget-smallBudget, 1)
-	}
+	small, main := s3SplitBudget(budget)
 	return &s3fifoPolicy[K, V]{
-		smallBudget: smallBudget,
-		mainBudget:  mainBudget,
-		ghostBudget: mainBudget,
+		smallBudget: small,
+		mainBudget:  main,
+		ghostBudget: main,
 		ghostSet:    make(map[K]*s3GhostNode[K]),
+	}
+}
+
+// s3SplitBudget computes the (small, main) sub-budgets from a total.
+// Small gets ~10% (rounded up; never larger than budget itself), Main
+// gets the rest. Negative or zero total yields (0, 0).
+func s3SplitBudget(budget int) (small, main int) {
+	if budget <= 0 {
+		return 0, 0
+	}
+	small = (budget + 9) / 10
+	if small >= budget {
+		small = 1
+	}
+	main = max(budget-small, 1)
+	return small, main
+}
+
+// SetBudget recomputes the Small/Main/Ghost sub-budgets to match a
+// new total. The policy does not preemptively evict — the cache will
+// drive subsequent calls to Victim if the new budget is smaller.
+func (p *s3fifoPolicy[K, V]) SetBudget(budget int) {
+	small, main := s3SplitBudget(budget)
+	p.smallBudget = small
+	p.mainBudget = main
+	p.ghostBudget = main
+	for p.ghostSize > p.ghostBudget && p.ghostHead != nil {
+		p.unlinkGhost(p.ghostHead)
 	}
 }
 

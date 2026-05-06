@@ -79,6 +79,9 @@ func (p *fifoPolicy[K, V]) Victim() *entry[K, V] {
 // Len returns the number of entries tracked.
 func (p *fifoPolicy[K, V]) Len() int { return p.size }
 
+// SetBudget is a no-op: FIFO has no internal sub-budget.
+func (p *fifoPolicy[K, V]) SetBudget(int) {}
+
 // Reset clears the policy state.
 func (p *fifoPolicy[K, V]) Reset() {
 	for n := p.head; n != nil; {

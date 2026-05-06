@@ -1,10 +1,15 @@
 package memcache
 
 import (
+	"context"
 	"errors"
 	"testing"
 	"time"
 )
+
+func contextWithCancel() (context.Context, context.CancelFunc) {
+	return context.WithCancel(context.Background())
+}
 
 func TestNewRequiresBound(t *testing.T) {
 	_, err := New[string, int]()
@@ -690,6 +695,143 @@ func TestSetWithOptionsPriorityClamped(t *testing.T) {
 	}
 	if err := c.SetWithOptions("k2", 1, SetPriority(-500)); err != nil {
 		t.Errorf("SetWithOptions(SetPriority(-500)) = %v, want nil", err)
+	}
+}
+
+func TestResizeShrinksAndEvicts(t *testing.T) {
+	c, _ := New[string, int](WithMaxEntries(20), WithShards(1))
+	defer c.Close()
+	for i := range 15 {
+		_ = c.Set(itoaSimple(i), i)
+	}
+	before := c.Len()
+	evicted := c.Resize(4)
+	if evicted == 0 {
+		t.Error("Resize from 20 → 4 should evict entries")
+	}
+	if c.Len() >= before {
+		t.Errorf("Len after Resize = %d, expected to drop from %d", c.Len(), before)
+	}
+	if c.Capacity() != 4 {
+		t.Errorf("Capacity after Resize = %d, want 4", c.Capacity())
+	}
+}
+
+func TestResizeGrowDoesNotEvict(t *testing.T) {
+	c, _ := New[string, int](WithMaxEntries(8))
+	defer c.Close()
+	for i := range 5 {
+		_ = c.Set(itoaSimple(i), i)
+	}
+	before := c.Len()
+	evicted := c.Resize(100)
+	if evicted != 0 {
+		t.Errorf("Resize grow evicted %d entries; want 0", evicted)
+	}
+	if c.Len() != before {
+		t.Errorf("Resize grow lost entries: before=%d after=%d", before, c.Len())
+	}
+}
+
+func TestResizeNegativeIsNoop(t *testing.T) {
+	c, _ := New[string, int](WithMaxEntries(8))
+	defer c.Close()
+	_ = c.Set("k", 1)
+	if got := c.Resize(-1); got != 0 {
+		t.Errorf("Resize(-1) evicted %d, want 0", got)
+	}
+	if !c.Has("k") {
+		t.Error("Resize(-1) should not affect existing entries")
+	}
+}
+
+func TestSyncReturnsCtxErr(t *testing.T) {
+	c, _ := New[string, int](WithMaxEntries(4))
+	defer c.Close()
+	ctx, cancel := contextWithCancel()
+	cancel()
+	if err := c.Sync(ctx); err == nil {
+		t.Error("Sync with canceled ctx should return non-nil error")
+	}
+}
+
+func TestDeleteExpired(t *testing.T) {
+	clk := NewFakeClock(time.Unix(0, 0))
+	c, _ := New[string, int](WithMaxEntries(8), WithClock(clk))
+	defer c.Close()
+	_ = c.SetWithTTL("a", 1, time.Second)
+	_ = c.SetWithTTL("b", 2, time.Hour)
+	_ = c.Set("c", 3) // no TTL
+	clk.Advance(2 * time.Second)
+	n := c.DeleteExpired()
+	if n != 1 {
+		t.Errorf("DeleteExpired removed %d, want 1", n)
+	}
+	if c.Has("a") {
+		t.Error("expired entry 'a' should be removed")
+	}
+	if !c.Has("b") || !c.Has("c") {
+		t.Error("non-expired entries should remain")
+	}
+}
+
+func TestDeletePrefixOnStringKeys(t *testing.T) {
+	c, _ := New[string, int](WithMaxEntries(16))
+	defer c.Close()
+	for _, k := range []string{"user:42:name", "user:42:age", "user:7:name", "session:1"} {
+		_ = c.Set(k, 1)
+	}
+	n := c.DeletePrefix("user:42:")
+	if n != 2 {
+		t.Errorf("DeletePrefix removed %d, want 2", n)
+	}
+	if c.Has("user:42:name") || c.Has("user:42:age") {
+		t.Error("user:42:* entries should be gone")
+	}
+	if !c.Has("user:7:name") || !c.Has("session:1") {
+		t.Error("non-matching entries should survive")
+	}
+}
+
+func TestDeletePrefixUnsupportedKeyType(t *testing.T) {
+	// Int keys neither implement Prefixer nor are string —
+	// DeletePrefix is a no-op.
+	c, _ := New[int, string](WithMaxEntries(4))
+	defer c.Close()
+	_ = c.Set(1, "x")
+	if n := c.DeletePrefix("anything"); n != 0 {
+		t.Errorf("DeletePrefix on int-keyed cache removed %d, want 0", n)
+	}
+	if !c.Has(1) {
+		t.Error("non-Prefixer keys should be untouched")
+	}
+}
+
+func TestDeleteWhere(t *testing.T) {
+	c, _ := New[string, int](WithMaxEntries(8))
+	defer c.Close()
+	for i := range 5 {
+		_ = c.Set(itoaSimple(i), i)
+	}
+	n := c.DeleteWhere(func(_ string, v int) bool { return v%2 == 0 })
+	// Removes 0, 2, 4 → 3 entries.
+	if n != 3 {
+		t.Errorf("DeleteWhere removed %d, want 3", n)
+	}
+	if c.Len() != 2 {
+		t.Errorf("Len after DeleteWhere = %d, want 2", c.Len())
+	}
+}
+
+func TestDeleteWhereNilPredicate(t *testing.T) {
+	c, _ := New[string, int](WithMaxEntries(4))
+	defer c.Close()
+	_ = c.Set("k", 1)
+	if n := c.DeleteWhere(nil); n != 0 {
+		t.Errorf("DeleteWhere(nil) removed %d, want 0", n)
+	}
+	if !c.Has("k") {
+		t.Error("nil predicate should not delete anything")
 	}
 }
 

@@ -1,8 +1,10 @@
 package memcache
 
 import (
+	"context"
 	"fmt"
 	"math/rand/v2"
+	"strings"
 	"sync/atomic"
 	"time"
 
@@ -1042,4 +1044,204 @@ func (c *Cache[K, V]) PeekOrAdd(key K, value V) (V, bool, error) {
 		effectiveTTL(c.cfg.defaultTTL, c.cfg.ttlJitter),
 		c.cfg.slidingTTL, int64(c.cfg.defaultTTL), nil)
 	return value, false, nil
+}
+
+// Resize changes the cache's bound at runtime. When MaxEntries is the
+// configured bound, newSize is interpreted as the new entry budget;
+// when MaxBytes is the configured bound, newSize is the new byte
+// budget. Resize returns the number of entries evicted as a result
+// of shrinking; growing the cache evicts nothing.
+//
+// Per-shard sub-budgets are recomputed and propagated to each shard
+// and its eviction policy via [evictionPolicy.SetBudget]. Subsequent
+// Set/Compute calls drive any further eviction the policies need.
+func (c *Cache[K, V]) Resize(newSize int64) int {
+	if c.closed.Load() {
+		return 0
+	}
+	if newSize < 0 {
+		return 0
+	}
+
+	if c.cfg.maxEntries > 0 || c.cfg.maxBytes <= 0 {
+		c.cfg.maxEntries = int(newSize)
+	} else {
+		c.cfg.maxBytes = newSize
+	}
+
+	perShard := perShardBudget(c.cfg.maxEntries, len(c.shards))
+	evicted := 0
+	for _, s := range c.shards {
+		s.mu.Lock()
+		s.budget = perShard
+		s.policy.SetBudget(perShard)
+		evicted += c.shrinkShardLocked(s)
+		s.mu.Unlock()
+	}
+	return evicted
+}
+
+// shrinkShardLocked evicts policy-chosen victims until the shard is
+// within budget, recording each eviction under [EvictReasonResize].
+// Caller must hold s.mu.
+func (c *Cache[K, V]) shrinkShardLocked(s *shard[K, V]) int {
+	if s.budget <= 0 {
+		return 0
+	}
+	count := 0
+	for len(s.entries) > s.budget {
+		victim := s.policy.Victim()
+		if victim == nil {
+			return count
+		}
+		c.removeLocked(s, victim, EvictReasonResize)
+		c.counters.evictions.Add(1)
+		count++
+	}
+	return count
+}
+
+// Sync drains pending background work — async refreshes, async tag
+// cleanup, async tier-2 writes — and returns when the cache is in a
+// quiescent state. Returns the context's error if it cancels first.
+//
+// In v0 there is no background work to drain (refresh-ahead, async
+// writes, etc. are not yet implemented), so Sync just respects the
+// context. The signature is stable so callers can integrate today.
+func (c *Cache[K, V]) Sync(ctx context.Context) error {
+	if c.closed.Load() {
+		return ErrClosed
+	}
+	if err := ctx.Err(); err != nil {
+		return err //nolint:wrapcheck // pass through ctx.Err verbatim
+	}
+	return nil
+}
+
+// DeleteExpired performs an immediate sweep over every shard,
+// removing each entry whose TTL has elapsed. Returns the number of
+// entries removed. Useful in tests, in REPL `:gc`-style commands,
+// and after wall-clock jumps where the lazy/janitor paths might lag.
+func (c *Cache[K, V]) DeleteExpired() int {
+	if c.closed.Load() {
+		return 0
+	}
+	now := c.cfg.clock.Now().UnixNano()
+	count := 0
+	for _, s := range c.shards {
+		s.mu.Lock()
+		for _, e := range s.entries {
+			if e.expired(now) {
+				c.removeLocked(s, e, EvictReasonExpired)
+				c.counters.expirations.Add(1)
+				count++
+			}
+		}
+		s.mu.Unlock()
+	}
+	return count
+}
+
+// DeletePrefix removes every entry whose key begins with the given
+// prefix. Only valid when K is `string` or implements [Prefixer]. For
+// caches with other K types DeletePrefix is a no-op and returns 0;
+// callers can detect this case via [Prefixer] type assertions on
+// their own K type before calling.
+//
+// Iteration is O(n) shard-by-shard. Tag-based invalidation
+// ([Cache.InvalidateTag], Phase 7) is the preferred mechanism when
+// applicable.
+func (c *Cache[K, V]) DeletePrefix(prefix string) int {
+	if c.closed.Load() {
+		return 0
+	}
+	matcher := prefixMatcher[K](prefix)
+	if matcher == nil {
+		return 0
+	}
+	count := 0
+	for _, s := range c.shards {
+		s.mu.Lock()
+		for _, e := range s.entries {
+			if matcher(e.key) {
+				c.removeLocked(s, e, EvictReasonDeletedPrefix)
+				count++
+			}
+		}
+		s.mu.Unlock()
+	}
+	return count
+}
+
+// prefixMatcher returns a function that reports whether a K-typed
+// key matches the supplied prefix, or nil when K is neither `string`
+// nor a [Prefixer]-implementing type.
+func prefixMatcher[K comparable](prefix string) func(K) bool {
+	var zero K
+	if _, ok := any(zero).(string); ok {
+		return func(k K) bool {
+			s, _ := any(k).(string)
+			return strings.HasPrefix(s, prefix)
+		}
+	}
+	if _, ok := any(zero).(Prefixer); ok {
+		return func(k K) bool {
+			p, ok := any(k).(Prefixer)
+			return ok && p.HasPrefix(prefix)
+		}
+	}
+	return nil
+}
+
+// DeleteWhere removes every entry for which pred returns true when
+// called with the entry's (key, value). pred runs OUTSIDE the shard
+// write lock so it may freely call cache methods on other keys —
+// callers should still keep pred fast and side-effect-free.
+//
+// Iteration is shard-by-shard. Within each shard the cache snapshots
+// matching candidates under a read lock, evaluates pred outside any
+// lock, then re-acquires the write lock to delete the matches. As a
+// consequence, an entry that was modified between snapshot and
+// delete will still be removed if its pre-modification value
+// satisfied pred — documented eventual semantics.
+func (c *Cache[K, V]) DeleteWhere(pred func(key K, value V) bool) int {
+	if c.closed.Load() || pred == nil {
+		return 0
+	}
+	count := 0
+	type candidate struct {
+		key   K
+		value V
+	}
+	now := c.cfg.clock.Now().UnixNano()
+	for _, s := range c.shards {
+		var pairs []candidate
+		s.mu.RLock()
+		for _, e := range s.entries {
+			if e.expired(now) || e.flags.has(flagNegative) {
+				continue
+			}
+			pairs = append(pairs, candidate{key: e.key, value: e.value})
+		}
+		s.mu.RUnlock()
+
+		var doomed []K
+		for _, p := range pairs {
+			if pred(p.key, p.value) {
+				doomed = append(doomed, p.key)
+			}
+		}
+		if len(doomed) == 0 {
+			continue
+		}
+		s.mu.Lock()
+		for _, k := range doomed {
+			if e, ok := s.entries[k]; ok {
+				c.removeLocked(s, e, EvictReasonDeletedWhere)
+				count++
+			}
+		}
+		s.mu.Unlock()
+	}
+	return count
 }

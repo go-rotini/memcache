@@ -40,6 +40,17 @@ type evictionPolicy[K comparable, V any] interface {
 	// Reset clears all policy state. Used by [Cache.Reset] and
 	// [Cache.Clear].
 	Reset()
+
+	// SetBudget updates the policy's notion of capacity at runtime.
+	// Used by [Cache.Resize] so capacity-aware policies (S3-FIFO,
+	// TinyLFU, 2Q, ARC) can recompute their internal sub-budgets.
+	// Simple policies (LRU, LFU, FIFO) treat this as a no-op.
+	//
+	// Implementations are responsible for keeping their internal
+	// sub-budgets consistent — they may NOT cause an immediate
+	// eviction; that remains the cache's responsibility through
+	// subsequent calls to Victim.
+	SetBudget(budget int)
 }
 
 // policyConfig bundles the construction-time parameters that

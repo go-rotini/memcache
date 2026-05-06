@@ -50,17 +50,35 @@ type twoQGhostNode[K comparable] struct {
 // newTwoQ constructs an empty 2Q policy sized for the given shard
 // budget.
 func newTwoQ[K comparable, V any](budget int) *twoQPolicy[K, V] {
-	in, am, out := 0, 0, 0
-	if budget > 0 {
-		in = max((budget+3)/4, 1) // ~25%, rounded up
-		am = max(budget-in, 1)
-		out = max((budget+1)/2, 1) // ~50%
-	}
+	in, am, out := twoQSplitBudget(budget)
 	return &twoQPolicy[K, V]{
 		inBudget:  in,
 		amBudget:  am,
 		outBudget: out,
 		outSet:    make(map[K]*twoQGhostNode[K]),
+	}
+}
+
+// twoQSplitBudget computes A1in (~25%), Am (75%), and A1out (~50%)
+// sub-budgets from a total. Non-positive budgets yield zeros.
+func twoQSplitBudget(budget int) (in, am, out int) {
+	if budget <= 0 {
+		return 0, 0, 0
+	}
+	in = max((budget+3)/4, 1) // ~25%, rounded up
+	am = max(budget-in, 1)
+	out = max((budget+1)/2, 1) // ~50%
+	return in, am, out
+}
+
+// SetBudget recomputes A1in / Am / A1out sub-budgets at runtime.
+func (p *twoQPolicy[K, V]) SetBudget(budget int) {
+	in, am, out := twoQSplitBudget(budget)
+	p.inBudget = in
+	p.amBudget = am
+	p.outBudget = out
+	for p.outSize > p.outBudget && p.outHead != nil {
+		p.unlinkGhost(p.outHead)
 	}
 }
 

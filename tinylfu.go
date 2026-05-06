@@ -53,24 +53,10 @@ type tinyLFUNode[K comparable, V any] struct {
 // budget. hasher may be nil; in that case the sketch falls back to a
 // degenerate hash that still produces correct semantics on tests.
 func newTinyLFU[K comparable, V any](budget int, hasher func(K) uint64) *tinyLFUPolicy[K, V] {
-	window, main := 0, 0
-	if budget > 0 {
-		// Window: 1% of capacity, but at least 1.
-		window = max(budget/100, 1)
-		if window >= budget {
-			window = 1
-		}
-		main = max(budget-window, 1)
-	}
-	expected := budget
-	if expected < 1 {
-		expected = 64
-	}
+	window, main := tinyLFUSplitBudget(budget)
+	expected := max(budget, 64)
 	cms := sketch.New(expected, nil)
-	threshold := uint64(2 * budget)
-	if threshold == 0 {
-		threshold = 128
-	}
+	threshold := tinyLFUAgeThreshold(budget)
 	return &tinyLFUPolicy[K, V]{
 		windowBudget: window,
 		mainBudget:   main,
@@ -78,6 +64,41 @@ func newTinyLFU[K comparable, V any](budget int, hasher func(K) uint64) *tinyLFU
 		hasher:       hasher,
 		ageThreshold: threshold,
 	}
+}
+
+// tinyLFUSplitBudget computes (window, main) sub-budgets. Window is
+// ~1% of total, never larger than the total itself.
+func tinyLFUSplitBudget(budget int) (window, main int) {
+	if budget <= 0 {
+		return 0, 0
+	}
+	window = max(budget/100, 1)
+	if window >= budget {
+		window = 1
+	}
+	main = max(budget-window, 1)
+	return window, main
+}
+
+// tinyLFUAgeThreshold returns the operation count between sketch
+// aging passes for the given budget. The W-TinyLFU paper specifies
+// 2 × budget; for tiny budgets we floor at 128 so the sketch sees
+// enough activity to be useful.
+func tinyLFUAgeThreshold(budget int) uint64 {
+	t := uint64(2 * budget)
+	if t == 0 {
+		return 128
+	}
+	return t
+}
+
+// SetBudget recomputes the Window/Main sub-budgets and aging
+// threshold to match a new total.
+func (p *tinyLFUPolicy[K, V]) SetBudget(budget int) {
+	window, main := tinyLFUSplitBudget(budget)
+	p.windowBudget = window
+	p.mainBudget = main
+	p.ageThreshold = tinyLFUAgeThreshold(budget)
 }
 
 // OnInsert places the new entry at the head of the Window LRU and

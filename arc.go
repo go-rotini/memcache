@@ -68,13 +68,30 @@ type arcGhostNode[K comparable] struct {
 // newARC constructs an empty ARC policy sized for the given shard
 // capacity.
 func newARC[K comparable, V any](budget int) *arcPolicy[K, V] {
-	if budget < 1 {
-		budget = 1
-	}
 	return &arcPolicy[K, V]{
-		c:     budget,
+		c:     max(budget, 1),
 		b1Set: make(map[K]*arcGhostNode[K]),
 		b2Set: make(map[K]*arcGhostNode[K]),
+	}
+}
+
+// SetBudget updates ARC's notion of capacity (`c`) and clamps the
+// adaptive `p` parameter into the new range. Ghost lists are
+// trimmed so the |T_i|+|B_i| invariants still hold.
+func (p *arcPolicy[K, V]) SetBudget(budget int) {
+	p.c = max(budget, 1)
+	if p.p > p.c {
+		p.p = p.c
+	}
+	// Re-enforce |T1|+|B1| ≤ c by trimming B1.
+	limit1 := max(p.c-p.t1Size, 0)
+	for p.b1Size > limit1 && p.b1Tail != nil {
+		p.unlinkB1(p.b1Tail)
+	}
+	// Re-enforce |T2|+|B2| ≤ 2c.
+	limit2 := max(2*p.c-p.t2Size, 0)
+	for p.b2Size > limit2 && p.b2Tail != nil {
+		p.unlinkB2(p.b2Tail)
 	}
 }
 
