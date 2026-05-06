@@ -2,6 +2,7 @@ package memcache
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"math/rand/v2"
 	"strings"
@@ -363,6 +364,14 @@ func (c *Cache[K, V]) Peek(key K) (V, bool) {
 // Get returns the value stored for key, or the zero value of V and
 // false if absent or expired. Get does NOT invoke a configured
 // [Loader]; use [Cache.GetOrLoad] for that.
+//
+// When [WithRefreshAhead] is enabled, a successful hit on an entry
+// past `refreshAt × TTL` triggers an asynchronous Loader call (the
+// cached value continues to be returned).
+//
+// When [WithStaleWhileRevalidate] is enabled, a hit on an entry
+// whose TTL has elapsed by less than `staleFor` returns the stale
+// value AND triggers an asynchronous Loader refresh.
 func (c *Cache[K, V]) Get(key K) (V, bool) {
 	var zero V
 	if c.closed.Load() {
@@ -380,6 +389,14 @@ func (c *Cache[K, V]) Get(key K) (V, bool) {
 		return zero, false
 	}
 	if c.entryExpiredLocked(e, now) {
+		// Stale-while-revalidate: serve stale + trigger refresh.
+		if !e.flags.has(flagNegative) && c.shouldServeStale(e, now) {
+			c.triggerAsyncRefreshLocked(s, key)
+			e.hits.Add(1)
+			s.policy.OnAccess(e)
+			c.recordHit()
+			return e.value, true
+		}
 		c.removeLocked(s, e, EvictReasonExpired)
 		c.counters.expirations.Add(1)
 		c.recordMiss()
@@ -394,8 +411,56 @@ func (c *Cache[K, V]) Get(key K) (V, bool) {
 		s.expiryFix(e)
 	}
 	s.policy.OnAccess(e)
+	if c.shouldRefreshAhead(e, now) {
+		c.triggerAsyncRefreshLocked(s, key)
+	}
 	c.recordHit()
 	return e.value, true
+}
+
+// shouldRefreshAhead reports whether the entry has aged past the
+// configured refresh-ahead threshold.
+func (c *Cache[K, V]) shouldRefreshAhead(e *entry[K, V], now int64) bool {
+	if c.loader == nil {
+		return false
+	}
+	if c.cfg.refreshAheadAt <= 0 || c.cfg.refreshAheadAt >= 1 {
+		return false
+	}
+	if e.flags.has(flagNegative) {
+		return false
+	}
+	exp := e.expireAt.Load()
+	if exp == 0 {
+		return false
+	}
+	age := now - e.inserted
+	ttl := exp - e.inserted
+	if ttl <= 0 {
+		return false
+	}
+	threshold := int64(c.cfg.refreshAheadAt * float64(ttl))
+	return age >= threshold
+}
+
+// shouldServeStale reports whether SWR applies — the entry's TTL
+// has elapsed by less than the configured staleFor window. Returns
+// false for entries with no TTL or that are still fresh.
+func (c *Cache[K, V]) shouldServeStale(e *entry[K, V], now int64) bool {
+	if c.loader == nil {
+		return false
+	}
+	if c.cfg.swrStaleFor <= 0 {
+		return false
+	}
+	if e.flags.has(flagNegative) {
+		return false
+	}
+	exp := e.expireAt.Load()
+	if exp == 0 || exp > now {
+		return false
+	}
+	return now-exp < int64(c.cfg.swrStaleFor)
 }
 
 // GetWithExpiry returns the value, its absolute expiry time, and a
@@ -1348,4 +1413,340 @@ func (c *Cache[K, V]) DeleteWhere(pred func(key K, value V) bool) int {
 		s.mu.Unlock()
 	}
 	return count
+}
+
+// GetOrLoad returns the cached value for key, or invokes the
+// configured [Loader] when the key is absent (or expired, or marked
+// negative-cached past its window). Concurrent callers for the same
+// missing key share a single Loader invocation (singleflight); the
+// load count is bumped once and waiters that joined an in-flight
+// call increment Stats.LoadCoalesced.
+//
+// Returns [ErrNoLoader] when no [WithLoader] is configured,
+// [ErrClosed] after [Cache.Close], the caller's ctx error if ctx
+// cancels before the load resolves, or whatever the Loader returns.
+// On Loader [ErrNotFound] with [WithNegativeCache] active, a
+// negative-cache tombstone is recorded and the same error is
+// returned.
+func (c *Cache[K, V]) GetOrLoad(ctx context.Context, key K) (V, error) {
+	var zero V
+	if c.closed.Load() {
+		return zero, ErrClosed
+	}
+	if c.loader == nil {
+		return zero, ErrNoLoader
+	}
+	if err := ctx.Err(); err != nil {
+		return zero, err //nolint:wrapcheck // pass ctx.Err verbatim
+	}
+	return c.loadOrJoin(ctx, key, c.loader.Load)
+}
+
+// GetOrLoadFn is [Cache.GetOrLoad] with a per-call loader function.
+// Useful when a one-off load needs different semantics than the
+// cache-level [WithLoader]. fn is invoked at most once per
+// concurrent miss (singleflight by key).
+func (c *Cache[K, V]) GetOrLoadFn(
+	ctx context.Context, key K,
+	fn func(ctx context.Context, key K) (V, time.Duration, error),
+) (V, error) {
+	var zero V
+	if c.closed.Load() {
+		return zero, ErrClosed
+	}
+	if fn == nil {
+		return zero, ErrNoLoader
+	}
+	if err := ctx.Err(); err != nil {
+		return zero, err //nolint:wrapcheck // pass ctx.Err verbatim
+	}
+	return c.loadOrJoin(ctx, key, fn)
+}
+
+// Refresh asynchronously triggers a Loader call for key, replacing
+// the cached value when the load completes. Joins an existing
+// in-flight call instead of starting a duplicate. Returns
+// immediately with [ErrNoLoader] when no [WithLoader] is configured,
+// [ErrClosed] when the cache is closed, or ctx.Err if ctx is
+// already canceled.
+func (c *Cache[K, V]) Refresh(ctx context.Context, key K) error {
+	if c.closed.Load() {
+		return ErrClosed
+	}
+	if c.loader == nil {
+		return ErrNoLoader
+	}
+	if err := ctx.Err(); err != nil {
+		return err //nolint:wrapcheck // pass ctx.Err verbatim
+	}
+	c.triggerAsyncRefresh(c.shardFor(key), key)
+	return nil
+}
+
+// RefreshAll triggers a Loader call for every key currently in the
+// cache. Returns the number of refresh flights queued (skipping
+// keys that already have an in-flight load). Negative-cache
+// tombstones are NOT refreshed.
+//
+// Snapshot-and-iterate semantics: the key set is captured under
+// per-shard read locks, then refreshes are queued outside any lock.
+// Keys deleted between the snapshot and the queue attempt are
+// silently skipped.
+func (c *Cache[K, V]) RefreshAll(ctx context.Context) int {
+	if c.closed.Load() || c.loader == nil {
+		return 0
+	}
+	if err := ctx.Err(); err != nil {
+		_ = err
+		return 0
+	}
+	keys := c.Keys()
+	count := 0
+	for _, k := range keys {
+		s := c.shardFor(k)
+		s.mu.Lock()
+		if _, busy := s.inflight[k]; !busy {
+			//nolint:contextcheck // refresh runs detached
+			c.triggerAsyncRefreshLocked(s, k)
+			count++
+		}
+		s.mu.Unlock()
+	}
+	return count
+}
+
+// loadOrJoin is the singleflight core. Returns the cached value on
+// hit (avoiding singleflight altogether); otherwise either creates
+// a new flight or joins an existing one and waits for it.
+func (c *Cache[K, V]) loadOrJoin(
+	ctx context.Context, key K,
+	fn func(ctx context.Context, key K) (V, time.Duration, error),
+) (V, error) {
+	var zero V
+	s := c.shardFor(key)
+	s.mu.Lock()
+	now := c.cfg.clock.Now().UnixNano()
+
+	// Cache hit on a fresh, non-negative entry.
+	if e, ok := s.entries[key]; ok && !c.entryExpiredLocked(e, now) && !e.flags.has(flagNegative) {
+		v := e.value
+		e.hits.Add(1)
+		if e.touchAccess(now) {
+			s.expiryFix(e)
+		}
+		s.policy.OnAccess(e)
+		s.mu.Unlock()
+		c.recordHit()
+		return v, nil
+	}
+
+	// Negative-cache hit: short-circuit without invoking loader.
+	if e, ok := s.entries[key]; ok && e.flags.has(flagNegative) && !c.entryExpiredLocked(e, now) {
+		s.mu.Unlock()
+		c.recordMiss()
+		return zero, ErrNotFound
+	}
+
+	// Cached error: short-circuit and surface the same error.
+	if c.cfg.errorTTL > 0 {
+		if ce, ok := s.errors[key]; ok {
+			if ce.expireAt > now {
+				err := ce.err
+				s.mu.Unlock()
+				c.recordMiss()
+				return zero, err
+			}
+			delete(s.errors, key)
+		}
+	}
+
+	c.recordMiss()
+
+	// Already-in-flight: join the existing call.
+	if flight, ok := s.inflight[key]; ok {
+		s.mu.Unlock()
+		if c.cfg.statsEnabled {
+			c.counters.loadCoalesced.Add(1)
+		}
+		return waitForFlight(ctx, flight)
+	}
+
+	// Leader path: create a new flight, launch the loader.
+	flight := newFlightCall[V]()
+	s.inflight[key] = flight
+	s.mu.Unlock()
+
+	// runLoader manages its own context (Background +
+	// WithLoaderTimeout). Detaching from the caller's ctx is
+	// intentional: a single canceling caller must not abort the
+	// load while other waiters still want it.
+	go c.runLoader(s, key, flight, fn) //nolint:contextcheck // detached by design
+	return waitForFlight(ctx, flight)
+}
+
+// runLoader executes fn in a fresh goroutine, persists the result
+// (or error tombstone) in the cache, removes the flight from the
+// inflight map, and signals waiters via close(flight.done).
+//
+// Concurrent waiters block on flight.done so they observe the
+// stored val/err under happens-before guarantees from the channel
+// close.
+func (c *Cache[K, V]) runLoader(
+	s *shard[K, V], key K, flight *flightCall[V],
+	fn func(ctx context.Context, key K) (V, time.Duration, error),
+) {
+	defer close(flight.done)
+
+	loaderCtx := context.Background()
+	if c.cfg.loaderTimeout > 0 {
+		var cancel context.CancelFunc
+		loaderCtx, cancel = context.WithTimeout(loaderCtx, c.cfg.loaderTimeout)
+		defer cancel()
+	}
+
+	val, ttl, err := fn(loaderCtx, key)
+	flight.val = val
+	flight.ttl = ttl
+	flight.err = err
+
+	s.mu.Lock()
+	delete(s.inflight, key)
+	if c.cfg.statsEnabled {
+		c.counters.loadsTotal.Add(1)
+	}
+
+	switch {
+	case err == nil:
+		c.storeLoadedLocked(s, key, val, ttl)
+		if c.cfg.statsEnabled {
+			c.counters.loadHits.Add(1)
+		}
+	case errors.Is(err, ErrNotFound) && c.cfg.negativeTTL > 0:
+		c.insertNegativeTombstoneLocked(s, key)
+		if c.cfg.statsEnabled {
+			c.counters.loadErrors.Add(1)
+		}
+	case c.cfg.errorTTL > 0 && !errors.Is(err, ErrNotFound):
+		// WithErrorTTL caches "the loader broke" errors but
+		// explicitly skips ErrNotFound so that
+		// WithNegativeCache remains the only path for
+		// not-found tombstones.
+		s.errors[key] = &cachedError{
+			err:      err,
+			expireAt: c.cfg.clock.Now().UnixNano() + int64(c.cfg.errorTTL),
+		}
+		if c.cfg.statsEnabled {
+			c.counters.loadErrors.Add(1)
+		}
+	default:
+		if c.cfg.statsEnabled {
+			c.counters.loadErrors.Add(1)
+		}
+	}
+	s.mu.Unlock()
+}
+
+// storeLoadedLocked applies the Loader's result to the cache. ttl=0
+// inherits the cache's [WithDefaultTTL]; weight comes from the
+// configured Weigher with the standard [WithMaxValueWeight] guard.
+// Caller must hold s.mu.
+func (c *Cache[K, V]) storeLoadedLocked(s *shard[K, V], key K, val V, ttl time.Duration) {
+	weight, err := c.computeWeight(key, val)
+	if err != nil {
+		// Loader produced a value too big to cache; leave it
+		// uncached but report no error to the caller (the
+		// returned val is still useful).
+		return
+	}
+	if ttl == 0 {
+		ttl = c.cfg.defaultTTL
+	}
+	c.upsertLocked(s, key, val, weight,
+		effectiveTTL(ttl, c.cfg.ttlJitter),
+		c.cfg.slidingTTL, int64(ttl), nil)
+}
+
+// insertNegativeTombstoneLocked records a negative-cache entry for
+// key, reusing the existing entry slot when possible to keep the
+// shard's bookkeeping consistent. Caller must hold s.mu.
+func (c *Cache[K, V]) insertNegativeTombstoneLocked(s *shard[K, V], key K) {
+	now := c.cfg.clock.Now().UnixNano()
+	expireAt := now + int64(c.cfg.negativeTTL)
+	if existing, ok := s.entries[key]; ok {
+		var zero V
+		existing.value = zero
+		existing.weight = 1
+		existing.expireAt.Store(expireAt)
+		existing.lastAccess.Store(now)
+		existing.hits.Store(0)
+		existing.generation.Add(1)
+		existing.flags = (existing.flags &^ flagSliding) | flagNegative
+		existing.slidingTTL = 0
+		s.expiryFix(existing)
+		s.policy.OnUpdate(existing)
+		if c.cfg.statsEnabled {
+			c.counters.updates.Add(1)
+		}
+		c.startJanitorLocked(s)
+		return
+	}
+	e := s.pool.get()
+	e.key = key
+	e.weight = 1
+	e.inserted = now
+	e.lastAccess.Store(now)
+	e.expireAt.Store(expireAt)
+	e.flags |= flagNegative
+	s.entries[key] = e
+	s.expiryAdd(e)
+	s.policy.OnInsert(e)
+	c.counters.entries.Add(1)
+	c.counters.bytes.Add(1)
+	if c.cfg.statsEnabled {
+		c.counters.inserts.Add(1)
+	}
+	c.startJanitorLocked(s)
+	c.evictWhileOverBudgetLocked(s)
+}
+
+// triggerAsyncRefresh kicks off a Loader call for key in the
+// background. Acquires s.mu briefly to register the flight; no-op
+// when one is already in flight or no Loader is configured.
+func (c *Cache[K, V]) triggerAsyncRefresh(s *shard[K, V], key K) {
+	if c.loader == nil {
+		return
+	}
+	s.mu.Lock()
+	c.triggerAsyncRefreshLocked(s, key)
+	s.mu.Unlock()
+}
+
+// triggerAsyncRefreshLocked is the same as [Cache.triggerAsyncRefresh]
+// but assumes the caller already holds s.mu.
+func (c *Cache[K, V]) triggerAsyncRefreshLocked(s *shard[K, V], key K) {
+	if c.loader == nil {
+		return
+	}
+	if _, busy := s.inflight[key]; busy {
+		return
+	}
+	flight := newFlightCall[V]()
+	s.inflight[key] = flight
+	go c.runLoader(s, key, flight, c.loader.Load)
+}
+
+// waitForFlight blocks until the flight resolves or ctx is canceled.
+// On ctx cancel the loader keeps running (other waiters may still
+// want the result); the canceling waiter just returns ctx.Err.
+func waitForFlight[V any](ctx context.Context, flight *flightCall[V]) (V, error) {
+	var zero V
+	select {
+	case <-flight.done:
+		if flight.err != nil {
+			return zero, flight.err
+		}
+		return flight.val, nil
+	case <-ctx.Done():
+		return zero, ctx.Err() //nolint:wrapcheck // pass ctx.Err verbatim
+	}
 }

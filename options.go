@@ -41,6 +41,30 @@ type config struct {
 	// only).
 	janitorInterval time.Duration
 
+	// negativeTTL is the TTL applied to negative-cache tombstones
+	// produced when a Loader returns [ErrNotFound]. Zero (the
+	// default) disables negative caching.
+	negativeTTL time.Duration
+
+	// errorTTL is the TTL applied to cached Loader errors (other
+	// than [ErrNotFound]). Zero disables error caching.
+	errorTTL time.Duration
+
+	// loaderTimeout is the per-call deadline applied to Loader
+	// invocations when the caller does not supply one. Zero leaves
+	// loader contexts deadline-free.
+	loaderTimeout time.Duration
+
+	// refreshAheadAt is the fraction of an entry's TTL after which
+	// a Get triggers an asynchronous Loader call to refresh the
+	// entry. Must be in (0, 1) to be active; zero disables.
+	refreshAheadAt float64
+
+	// swrStaleFor is the stale-while-revalidate window: an entry
+	// whose expireAt was less than swrStaleFor ago is served stale
+	// while a background Loader refreshes it.
+	swrStaleFor time.Duration
+
 	// Eviction and admission.
 	policy Policy
 
@@ -245,6 +269,53 @@ func WithLoader[K comparable, V any](l Loader[K, V]) Option {
 			c.loader = l
 		}
 	}
+}
+
+// WithNegativeCache enables caching of "not found" results. When a
+// Loader returns [ErrNotFound], the cache stores a tombstone with
+// the supplied TTL; subsequent Get/GetOrLoad calls return
+// [ErrNotFound] without re-invoking the Loader.
+//
+// negativeTTL <= 0 disables negative caching entirely; the cache
+// behaves as if the option had not been set.
+func WithNegativeCache(negativeTTL time.Duration) Option {
+	return func(c *config) { c.negativeTTL = negativeTTL }
+}
+
+// WithErrorTTL caches Loader errors (other than [ErrNotFound]) for
+// the given duration. Subsequent [Cache.GetOrLoad] calls within
+// the window return the cached error without re-invoking the
+// Loader. Distinct from [WithNegativeCache]: that option caches
+// "key does not exist"; this one caches "the loader broke".
+func WithErrorTTL(d time.Duration) Option {
+	return func(c *config) { c.errorTTL = d }
+}
+
+// WithLoaderTimeout sets the per-call deadline applied to Loader
+// contexts when the caller does not supply one. Recommended in
+// production to prevent a runaway Loader from monopolizing
+// singleflight slots.
+func WithLoaderTimeout(d time.Duration) Option {
+	return func(c *config) { c.loaderTimeout = d }
+}
+
+// WithRefreshAhead enables refresh-ahead: when an entry's age
+// exceeds refreshAt × its TTL, the next [Cache.Get] triggers an
+// asynchronous Loader call to refresh the entry. The cached value
+// continues to be served until the reload completes. refreshAt
+// must be in (0, 1); values outside the range disable refresh-ahead.
+func WithRefreshAhead(refreshAt float64) Option {
+	return func(c *config) { c.refreshAheadAt = refreshAt }
+}
+
+// WithStaleWhileRevalidate enables stale-while-revalidate: when an
+// entry has expired but its expireAt was less than staleFor ago,
+// the next [Cache.Get] returns the stale value AND triggers a
+// background Loader call to refresh it. Inspired by RFC 5861.
+//
+// staleFor <= 0 disables SWR.
+func WithStaleWhileRevalidate(staleFor time.Duration) Option {
+	return func(c *config) { c.swrStaleFor = staleFor }
 }
 
 // WithExpireFunc registers a per-entry expiry predicate. On each

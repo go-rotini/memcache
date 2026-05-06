@@ -34,3 +34,34 @@ type BulkLoader[K comparable, V any] interface {
 	// LoadResult.Err.
 	LoadMulti(ctx context.Context, keys []K) (map[K]LoadResult[V], error)
 }
+
+// flightCall represents a single in-flight Loader invocation. The
+// first caller for a missing key creates the flight; subsequent
+// callers join by reading flight.done. When the loader goroutine
+// finishes, it stores val/ttl/err and closes done; every waiter
+// then reads its outcome under happens-before guarantees from the
+// channel close.
+type flightCall[V any] struct {
+	// done is closed when val/ttl/err have been finalized and the
+	// shard's inflight entry has been removed.
+	done chan struct{}
+
+	val V
+	ttl time.Duration
+	err error
+}
+
+// newFlightCall returns a flightCall ready for waiters.
+func newFlightCall[V any]() *flightCall[V] {
+	return &flightCall[V]{done: make(chan struct{})}
+}
+
+// cachedError is a per-shard "the loader broke" tombstone enabled
+// by [WithErrorTTL]. Distinct from the negative-cache tombstone
+// (which lives on the entries map with [flagNegative] set) because
+// the cached error needs to carry an actual error value back to
+// callers; the entry struct cannot, since its value field is V.
+type cachedError struct {
+	err      error
+	expireAt int64 // unix nanos
+}

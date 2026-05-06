@@ -25,6 +25,16 @@ type shard[K comparable, V any] struct {
 	// when the cache is closed.
 	janitor janitorState
 
+	// inflight tracks in-progress Loader invocations for
+	// singleflight semantics. Entries are removed by the loader
+	// goroutine after it stores the result.
+	inflight map[K]*flightCall[V]
+
+	// errors caches Loader errors when [WithErrorTTL] is enabled.
+	// Negative-cache (ErrNotFound) tombstones live on the entries
+	// map with flagNegative set, NOT here.
+	errors map[K]*cachedError
+
 	// budget is the per-shard target entry count. The cache divides
 	// the global maxEntries across all shards (with a 10% slop) so
 	// that one shard exceeding budget evicts only its own entries,
@@ -35,9 +45,11 @@ type shard[K comparable, V any] struct {
 // newShard constructs a shard with the given policy and budget.
 func newShard[K comparable, V any](p evictionPolicy[K, V], budget int) *shard[K, V] {
 	return &shard[K, V]{
-		entries: make(map[K]*entry[K, V]),
-		policy:  p,
-		pool:    newEntryPool[K, V](),
-		budget:  budget,
+		entries:  make(map[K]*entry[K, V]),
+		policy:   p,
+		pool:     newEntryPool[K, V](),
+		budget:   budget,
+		inflight: make(map[K]*flightCall[V]),
+		errors:   make(map[K]*cachedError),
 	}
 }
