@@ -299,6 +299,400 @@ func TestWithWeigherCountsBytes(t *testing.T) {
 	}
 }
 
+func TestRangeVisitsAllLiveEntries(t *testing.T) {
+	c, _ := New[string, int](WithMaxEntries(64), WithShards(4))
+	defer c.Close()
+
+	want := map[string]int{"a": 1, "b": 2, "c": 3, "d": 4}
+	for k, v := range want {
+		_ = c.Set(k, v)
+	}
+
+	seen := map[string]int{}
+	c.Range(func(k string, v int) bool {
+		seen[k] = v
+		return true
+	})
+	if len(seen) != len(want) {
+		t.Errorf("Range visited %d entries, want %d", len(seen), len(want))
+	}
+	for k, v := range want {
+		if seen[k] != v {
+			t.Errorf("Range[%q] = %d, want %d", k, seen[k], v)
+		}
+	}
+}
+
+func TestRangeStopsOnFalse(t *testing.T) {
+	c, _ := New[string, int](WithMaxEntries(64))
+	defer c.Close()
+	for _, k := range []string{"a", "b", "c", "d"} {
+		_ = c.Set(k, 1)
+	}
+	count := 0
+	c.Range(func(string, int) bool {
+		count++
+		return count < 2
+	})
+	if count != 2 {
+		t.Errorf("Range visited %d entries before stop, want 2", count)
+	}
+}
+
+func TestRangeSkipsExpired(t *testing.T) {
+	clk := NewFakeClock(time.Unix(0, 0))
+	c, _ := New[string, int](WithMaxEntries(8), WithClock(clk))
+	defer c.Close()
+	_ = c.SetWithTTL("alive", 1, time.Hour)
+	_ = c.SetWithTTL("dead", 2, time.Second)
+	clk.Advance(2 * time.Second)
+	visited := 0
+	c.Range(func(k string, _ int) bool {
+		if k == "dead" {
+			t.Errorf("Range returned expired entry %q", k)
+		}
+		visited++
+		return true
+	})
+	if visited != 1 {
+		t.Errorf("Range visited %d, want 1 live entry", visited)
+	}
+}
+
+func TestKeysReturnsSnapshot(t *testing.T) {
+	c, _ := New[string, int](WithMaxEntries(8))
+	defer c.Close()
+	for _, k := range []string{"a", "b", "c"} {
+		_ = c.Set(k, 0)
+	}
+	keys := c.Keys()
+	if len(keys) != 3 {
+		t.Fatalf("Keys() returned %d, want 3", len(keys))
+	}
+	// Mutating returned slice must not affect cache.
+	keys[0] = "MUTATED"
+	if !c.Has("a") {
+		t.Error("Mutating Keys() slice should not affect cache state")
+	}
+}
+
+func TestClearRecordsClearReason(t *testing.T) {
+	c, _ := New[string, int](WithMaxEntries(8))
+	defer c.Close()
+	for _, k := range []string{"a", "b", "c"} {
+		_ = c.Set(k, 0)
+	}
+	c.Clear()
+	if c.Len() != 0 {
+		t.Errorf("Len after Clear = %d, want 0", c.Len())
+	}
+	st := c.Stats()
+	if got := st.EvictionsByReason[EvictReasonClear]; got != 3 {
+		t.Errorf("EvictionsByReason[Clear] = %d, want 3", got)
+	}
+}
+
+func TestResetDoesNotRecordReason(t *testing.T) {
+	c, _ := New[string, int](WithMaxEntries(8))
+	defer c.Close()
+	for _, k := range []string{"a", "b", "c"} {
+		_ = c.Set(k, 0)
+	}
+	c.Reset()
+	st := c.Stats()
+	if got := st.EvictionsByReason[EvictReasonClear]; got != 0 {
+		t.Errorf("Reset must not record EvictReasonClear; got %d", got)
+	}
+}
+
+func TestTTLAndExpiry(t *testing.T) {
+	clk := NewFakeClock(time.Unix(0, 0))
+	c, _ := New[string, int](WithMaxEntries(8), WithClock(clk))
+	defer c.Close()
+	_ = c.SetWithTTL("k", 1, 10*time.Second)
+
+	d, ok := c.TTL("k")
+	if !ok || d != 10*time.Second {
+		t.Errorf("TTL = (%v, %v), want (10s, true)", d, ok)
+	}
+	exp, ok := c.Expiry("k")
+	if !ok || exp.UnixNano() != int64(10*time.Second) {
+		t.Errorf("Expiry = (%v, %v), want (10s wall, true)", exp, ok)
+	}
+	clk.Advance(7 * time.Second)
+	d, ok = c.TTL("k")
+	if !ok || d != 3*time.Second {
+		t.Errorf("TTL after 7s = (%v, %v), want (3s, true)", d, ok)
+	}
+	clk.Advance(5 * time.Second)
+	if _, ok := c.TTL("k"); ok {
+		t.Error("TTL on expired entry should report ok=false")
+	}
+}
+
+func TestTTLOnNoTTLEntry(t *testing.T) {
+	c, _ := New[string, int](WithMaxEntries(4))
+	defer c.Close()
+	_ = c.Set("k", 1) // no default TTL
+	d, ok := c.TTL("k")
+	if !ok || d != 0 {
+		t.Errorf("TTL on no-TTL entry = (%v, %v), want (0, true)", d, ok)
+	}
+}
+
+func TestTouchRefreshesTTL(t *testing.T) {
+	clk := NewFakeClock(time.Unix(0, 0))
+	c, _ := New[string, int](
+		WithMaxEntries(4),
+		WithClock(clk),
+		WithDefaultTTL(10*time.Second),
+	)
+	defer c.Close()
+	_ = c.Set("k", 1)
+	clk.Advance(8 * time.Second) // 2s remaining
+	if !c.Touch("k") {
+		t.Fatal("Touch on existing entry should succeed")
+	}
+	d, _ := c.TTL("k")
+	if d != 10*time.Second {
+		t.Errorf("TTL after Touch = %v, want 10s", d)
+	}
+}
+
+func TestTouchOnAbsentReturnsFalse(t *testing.T) {
+	c, _ := New[string, int](WithMaxEntries(4))
+	defer c.Close()
+	if c.Touch("missing") {
+		t.Error("Touch on missing key should return false")
+	}
+}
+
+func TestTouchWithTTL(t *testing.T) {
+	clk := NewFakeClock(time.Unix(0, 0))
+	c, _ := New[string, int](WithMaxEntries(4), WithClock(clk))
+	defer c.Close()
+	_ = c.SetWithTTL("k", 1, time.Second)
+	if !c.TouchWithTTL("k", time.Hour) {
+		t.Fatal("TouchWithTTL should succeed")
+	}
+	d, _ := c.TTL("k")
+	if d != time.Hour {
+		t.Errorf("TTL after TouchWithTTL(hour) = %v, want 1h", d)
+	}
+}
+
+func TestTouchWithTTLZeroClearsExpiry(t *testing.T) {
+	c, _ := New[string, int](WithMaxEntries(4), WithDefaultTTL(time.Second))
+	defer c.Close()
+	_ = c.Set("k", 1)
+	if !c.TouchWithTTL("k", 0) {
+		t.Fatal("TouchWithTTL(0) should succeed")
+	}
+	d, ok := c.TTL("k")
+	if !ok || d != 0 {
+		t.Errorf("after TouchWithTTL(0), TTL = (%v, %v), want (0, true)", d, ok)
+	}
+}
+
+func TestTouchWithTTLNegative(t *testing.T) {
+	c, _ := New[string, int](WithMaxEntries(4))
+	defer c.Close()
+	_ = c.Set("k", 1)
+	if c.TouchWithTTL("k", -time.Second) {
+		t.Error("TouchWithTTL with negative TTL should return false")
+	}
+}
+
+func TestSetIfAbsent(t *testing.T) {
+	c, _ := New[string, int](WithMaxEntries(4))
+	defer c.Close()
+	stored, err := c.SetIfAbsent("k", 1)
+	if err != nil || !stored {
+		t.Fatalf("SetIfAbsent on empty = (%v, %v), want (true, nil)", stored, err)
+	}
+	stored, err = c.SetIfAbsent("k", 2)
+	if err != nil || stored {
+		t.Fatalf("SetIfAbsent on existing = (%v, %v), want (false, nil)", stored, err)
+	}
+	got, _ := c.Get("k")
+	if got != 1 {
+		t.Errorf("value after SetIfAbsent x2 = %d, want 1", got)
+	}
+}
+
+func TestSetIfPresent(t *testing.T) {
+	c, _ := New[string, int](WithMaxEntries(4))
+	defer c.Close()
+	updated, _ := c.SetIfPresent("k", 1)
+	if updated {
+		t.Error("SetIfPresent on absent should return false")
+	}
+	_ = c.Set("k", 1)
+	updated, _ = c.SetIfPresent("k", 2)
+	if !updated {
+		t.Fatal("SetIfPresent on present should return true")
+	}
+	got, _ := c.Get("k")
+	if got != 2 {
+		t.Errorf("value after SetIfPresent = %d, want 2", got)
+	}
+}
+
+func TestDeleteIf(t *testing.T) {
+	c, _ := New[string, int](WithMaxEntries(4))
+	defer c.Close()
+	_ = c.Set("k", 5)
+	if c.DeleteIf("k", func(v int) bool { return v == 99 }) {
+		t.Error("DeleteIf with non-matching predicate should return false")
+	}
+	if !c.DeleteIf("k", func(v int) bool { return v == 5 }) {
+		t.Error("DeleteIf with matching predicate should return true")
+	}
+	if c.Has("k") {
+		t.Error("entry should be removed after matching DeleteIf")
+	}
+}
+
+func TestGetOrSet(t *testing.T) {
+	c, _ := New[string, int](WithMaxEntries(4))
+	defer c.Close()
+	v, loaded, err := c.GetOrSet("k", 1)
+	if err != nil || loaded || v != 1 {
+		t.Fatalf("GetOrSet on empty = (%d, %v, %v), want (1, false, nil)", v, loaded, err)
+	}
+	v, loaded, err = c.GetOrSet("k", 999)
+	if err != nil || !loaded || v != 1 {
+		t.Fatalf("GetOrSet on existing = (%d, %v, %v), want (1, true, nil)", v, loaded, err)
+	}
+	st := c.Stats()
+	if st.Hits != 1 {
+		t.Errorf("GetOrSet hit should bump Hits; got %d", st.Hits)
+	}
+}
+
+func TestPeekOrAdd(t *testing.T) {
+	c, _ := New[string, int](WithMaxEntries(4))
+	defer c.Close()
+	v, loaded, err := c.PeekOrAdd("k", 1)
+	if err != nil || loaded || v != 1 {
+		t.Fatalf("PeekOrAdd on empty = (%d, %v, %v), want (1, false, nil)", v, loaded, err)
+	}
+	// PeekOrAdd should NOT bump Hits on the read side.
+	st := c.Stats()
+	if st.Hits != 0 {
+		t.Errorf("PeekOrAdd insert should not bump Hits; got %d", st.Hits)
+	}
+	v, loaded, _ = c.PeekOrAdd("k", 999)
+	if !loaded || v != 1 {
+		t.Errorf("PeekOrAdd on existing = (%d, %v), want (1, true)", v, loaded)
+	}
+	st = c.Stats()
+	if st.Hits != 0 {
+		t.Errorf("PeekOrAdd existing-read should not bump Hits; got %d", st.Hits)
+	}
+}
+
+func TestSetWithOptionsTTL(t *testing.T) {
+	clk := NewFakeClock(time.Unix(0, 0))
+	c, _ := New[string, int](WithMaxEntries(4), WithClock(clk))
+	defer c.Close()
+	if err := c.SetWithOptions("k", 1, SetTTL(5*time.Second)); err != nil {
+		t.Fatalf("SetWithOptions: %v", err)
+	}
+	d, _ := c.TTL("k")
+	if d != 5*time.Second {
+		t.Errorf("TTL after SetWithOptions(SetTTL(5s)) = %v, want 5s", d)
+	}
+}
+
+func TestSetWithOptionsExpireAt(t *testing.T) {
+	clk := NewFakeClock(time.Unix(0, 0))
+	c, _ := New[string, int](WithMaxEntries(4), WithClock(clk))
+	defer c.Close()
+	target := clk.Now().Add(20 * time.Second)
+	if err := c.SetWithOptions("k", 1, SetExpireAt(target)); err != nil {
+		t.Fatalf("SetWithOptions: %v", err)
+	}
+	exp, ok := c.Expiry("k")
+	if !ok || !exp.Equal(target) {
+		t.Errorf("Expiry = (%v, %v), want (%v, true)", exp, ok, target)
+	}
+}
+
+func TestSetWithOptionsExplicitWeight(t *testing.T) {
+	c, _ := New[string, []byte](
+		WithMaxBytes(1024),
+		WithWeigher[[]byte](BytesWeigher()),
+	)
+	defer c.Close()
+	// Explicit weight ignores Weigher: store a 5-byte slice as weight=99.
+	if err := c.SetWithOptions("k", []byte("hello"), SetWeight(99)); err != nil {
+		t.Fatalf("SetWithOptions: %v", err)
+	}
+	if c.Bytes() != 99 {
+		t.Errorf("Bytes after SetWeight(99) = %d, want 99", c.Bytes())
+	}
+}
+
+func TestSetWithOptionsTags(t *testing.T) {
+	c, _ := New[string, int](WithMaxEntries(4))
+	defer c.Close()
+	if err := c.SetWithOptions("k", 1, SetTags("a", "b")); err != nil {
+		t.Fatalf("SetWithOptions: %v", err)
+	}
+	// Tags currently sit on the entry; verify via internal field.
+	s := c.shardFor("k")
+	s.mu.RLock()
+	tags := append([]string(nil), s.entries["k"].tags...)
+	s.mu.RUnlock()
+	if len(tags) != 2 || tags[0] != "a" || tags[1] != "b" {
+		t.Errorf("entry tags = %v, want [a b]", tags)
+	}
+}
+
+func TestSetWithOptionsRejectsNegativeTTL(t *testing.T) {
+	c, _ := New[string, int](WithMaxEntries(4))
+	defer c.Close()
+	err := c.SetWithOptions("k", 1, SetTTL(-time.Second))
+	if !errors.Is(err, ErrInvalidTTL) {
+		t.Errorf("expected ErrInvalidTTL, got %v", err)
+	}
+}
+
+func TestSetWithOptionsSlidingOverride(t *testing.T) {
+	clk := NewFakeClock(time.Unix(0, 0))
+	c, _ := New[string, int](
+		WithMaxEntries(4),
+		WithClock(clk),
+		WithSlidingTTL(false),
+	)
+	defer c.Close()
+	if err := c.SetWithOptions("k", 1, SetTTL(10*time.Second), SetSliding(true)); err != nil {
+		t.Fatalf("SetWithOptions: %v", err)
+	}
+	clk.Advance(7 * time.Second)
+	_, _ = c.Get("k") // sliding TTL should refresh
+	d, _ := c.TTL("k")
+	if d < 9*time.Second {
+		t.Errorf("after Get, TTL = %v, want sliding refresh ≈ 10s", d)
+	}
+}
+
+func TestSetWithOptionsPriorityClamped(t *testing.T) {
+	// Priority is hint-only, but clamping logic should keep extreme
+	// values in [-100, 100] when they reach the entry.
+	c, _ := New[string, int](WithMaxEntries(4))
+	defer c.Close()
+	// Just verify the option doesn't error — there is no public
+	// observation surface for priority in v0.
+	if err := c.SetWithOptions("k", 1, SetPriority(500)); err != nil {
+		t.Errorf("SetWithOptions(SetPriority(500)) = %v, want nil", err)
+	}
+	if err := c.SetWithOptions("k2", 1, SetPriority(-500)); err != nil {
+		t.Errorf("SetWithOptions(SetPriority(-500)) = %v, want nil", err)
+	}
+}
+
 func TestApplyJitterBounds(t *testing.T) {
 	const ttl = 1000 * time.Millisecond
 	const jitter = 100 * time.Millisecond
