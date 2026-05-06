@@ -49,12 +49,39 @@ func TestEntryTouchAccessSliding(t *testing.T) {
 		slidingTTL: int64(time.Minute),
 	}
 	now := time.Now().UnixNano()
-	e.touchAccess(now)
+	if shifted := e.touchAccess(now); !shifted {
+		t.Error("first sliding touch should shift expireAt")
+	}
 	if got := e.lastAccess.Load(); got != now {
 		t.Errorf("lastAccess = %d, want %d", got, now)
 	}
 	if got := e.expireAt.Load(); got != now+int64(time.Minute) {
 		t.Errorf("expireAt = %d, want %d", got, now+int64(time.Minute))
+	}
+}
+
+func TestEntryTouchAccessSlidingCoalesces(t *testing.T) {
+	// Per spec §19.1.1: writes are skipped when the access is less
+	// than slidingTTL/4 newer than the recorded lastAccess.
+	const slide = int64(time.Minute)
+	e := &entry[string, int]{
+		flags:      flagSliding,
+		slidingTTL: slide,
+	}
+	t0 := time.Now().UnixNano()
+	e.touchAccess(t0) // first touch — always shifts
+
+	// Within slide/4 (15s): no shift.
+	if shifted := e.touchAccess(t0 + slide/8); shifted {
+		t.Error("touch within slide/4 should be coalesced (no shift)")
+	}
+	if got := e.lastAccess.Load(); got != t0 {
+		t.Errorf("coalesced touch should not move lastAccess; got %d", got)
+	}
+
+	// Past slide/4 + 1ns: shift again.
+	if shifted := e.touchAccess(t0 + slide/4 + int64(time.Nanosecond)); !shifted {
+		t.Error("touch past slide/4 should shift expireAt")
 	}
 }
 
@@ -64,7 +91,9 @@ func TestEntryTouchAccessNonSliding(t *testing.T) {
 	}
 	e.expireAt.Store(999) // pre-existing absolute expiry
 	now := time.Now().UnixNano()
-	e.touchAccess(now)
+	if shifted := e.touchAccess(now); shifted {
+		t.Error("non-sliding touchAccess must report shifted=false")
+	}
 	// Non-sliding: lastAccess updates but expireAt does not.
 	if e.expireAt.Load() != 999 {
 		t.Error("non-sliding entry expireAt should not change on touchAccess")

@@ -56,9 +56,10 @@ type config struct {
 
 	// Type-erased fields. Each is type-asserted into its typed shape by
 	// the cache constructor.
-	weigher any
-	hasher  any
-	loader  any
+	weigher    any
+	hasher     any
+	loader     any
+	expireFunc any
 }
 
 // defaultConfig returns the package's baseline configuration. It is
@@ -242,6 +243,30 @@ func WithLoader[K comparable, V any](l Loader[K, V]) Option {
 	return func(c *config) {
 		if l != nil {
 			c.loader = l
+		}
+	}
+}
+
+// WithExpireFunc registers a per-entry expiry predicate. On each
+// Get and during each janitor sweep, fn is called with the entry's
+// metadata; returning true causes the cache to treat the entry as
+// expired regardless of its TTL.
+//
+// Use cases include "expire when an external resource changes" —
+// e.g., file mtime checks, schema-version comparison, etag mismatch.
+// fn must be fast and side-effect-free; it is called under the
+// shard's read lock on the Get path and the write lock during
+// sweeps. A panicking fn is recovered: the entry is treated as
+// fresh (defensive default — better to keep stale data than lose it)
+// and a warning is logged through the configured slog.Logger.
+//
+// fn is type-asserted at cache construction time; passing a
+// predicate whose type parameters do not match the cache's K/V
+// types results in a [*ConfigError].
+func WithExpireFunc[K comparable, V any](fn func(key K, value V, meta Metadata) bool) Option {
+	return func(c *config) {
+		if fn != nil {
+			c.expireFunc = fn
 		}
 	}
 }

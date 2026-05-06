@@ -59,7 +59,7 @@ func (c *Cache[K, V]) Compute(
 
 	var current V
 	var present bool
-	if e, ok := s.entries[key]; ok && !e.expired(now) && !e.flags.has(flagNegative) {
+	if e, ok := s.entries[key]; ok && !c.entryExpiredLocked(e, now) && !e.flags.has(flagNegative) {
 		current = e.value
 		present = true
 	}
@@ -119,7 +119,7 @@ func (c *Cache[K, V]) ComputeIfAbsent(
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if e, ok := s.entries[key]; ok && !e.expired(now) && !e.flags.has(flagNegative) {
+	if e, ok := s.entries[key]; ok && !c.entryExpiredLocked(e, now) && !e.flags.has(flagNegative) {
 		return e.value, false, nil
 	}
 
@@ -168,7 +168,7 @@ func (c *Cache[K, V]) ComputeIfPresent(
 	defer s.mu.Unlock()
 
 	e, ok := s.entries[key]
-	if !ok || e.expired(now) || e.flags.has(flagNegative) {
+	if !ok || c.entryExpiredLocked(e, now) || e.flags.has(flagNegative) {
 		return zero, nil
 	}
 	current := e.value
@@ -214,7 +214,7 @@ func (c *Cache[K, V]) Update(key K, fn func(cur V) V) (V, error) {
 	defer s.mu.Unlock()
 
 	e, ok := s.entries[key]
-	if !ok || e.expired(now) || e.flags.has(flagNegative) {
+	if !ok || c.entryExpiredLocked(e, now) || e.flags.has(flagNegative) {
 		return zero, ErrNotFound
 	}
 	newValue := fn(e.value)
@@ -245,7 +245,7 @@ func (c *Cache[K, V]) CompareAndSwap(key K, old, newValue V) bool {
 	defer s.mu.Unlock()
 
 	e, ok := s.entries[key]
-	if !ok || e.expired(now) || e.flags.has(flagNegative) {
+	if !ok || c.entryExpiredLocked(e, now) || e.flags.has(flagNegative) {
 		return false
 	}
 	if !reflect.DeepEqual(e.value, old) {

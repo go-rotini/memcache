@@ -15,6 +15,16 @@ type shard[K comparable, V any] struct {
 	policy  evictionPolicy[K, V]
 	pool    *entryPool[K, V]
 
+	// expHeap is a min-heap of *entry by expireAt. Entries without
+	// a TTL (expireAt == 0) are NOT in the heap; their heapIndex
+	// stays -1.
+	expHeap expiryHeap[K, V]
+
+	// janitor coordinates the per-shard expiry sweep goroutine.
+	// Started lazily when the first TTL'd entry is inserted; stopped
+	// when the cache is closed.
+	janitor janitorState
+
 	// budget is the per-shard target entry count. The cache divides
 	// the global maxEntries across all shards (with a 10% slop) so
 	// that one shard exceeding budget evicts only its own entries,

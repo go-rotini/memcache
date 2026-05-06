@@ -107,6 +107,7 @@ func (c *FakeClock) AfterFunc(d time.Duration, fn func()) Timer {
 		deadline: c.now.Add(d),
 		fn:       fn,
 		active:   true,
+		inList:   true,
 	}
 	c.timers = append(c.timers, ft)
 	return ft
@@ -126,10 +127,12 @@ func (c *FakeClock) collectDueLocked(t time.Time) []*fakeTimer {
 	keep := c.timers[:0]
 	for _, ft := range c.timers {
 		if !ft.active {
+			ft.inList = false
 			continue
 		}
 		if !ft.deadline.After(t) {
 			ft.active = false
+			ft.inList = false
 			due = append(due, ft)
 			continue
 		}
@@ -149,6 +152,12 @@ type fakeTimer struct {
 	deadline time.Time
 	fn       func()
 	active   bool
+	// inList tracks whether this timer is currently in the
+	// FakeClock.timers slice. Cleared when the timer fires (or is
+	// stopped via collectDue), set when AfterFunc/Reset re-inserts
+	// it. Reset on a fired timer must re-add it to the list so
+	// repeating callers (the cache janitor) work correctly.
+	inList bool
 }
 
 func (ft *fakeTimer) fire() {
@@ -168,11 +177,21 @@ func (ft *fakeTimer) Stop() bool {
 
 // Reset sets a new deadline for the timer. Returns true if the timer was
 // active before the reset.
+//
+// Reset on a timer that has already fired (and been removed from the
+// FakeClock's pending list) re-inserts it so the next [FakeClock.Advance]
+// or [FakeClock.Set] will fire it again. This matches the semantics of
+// time.Timer.Reset on the real clock and is essential for periodic
+// callers (e.g., the cache's janitor) that re-arm in their own callback.
 func (ft *fakeTimer) Reset(d time.Duration) bool {
 	ft.clock.mu.Lock()
 	defer ft.clock.mu.Unlock()
 	wasActive := ft.active
 	ft.deadline = ft.clock.now.Add(d)
 	ft.active = true
+	if !ft.inList {
+		ft.clock.timers = append(ft.clock.timers, ft)
+		ft.inList = true
+	}
 	return wasActive
 }

@@ -43,6 +43,11 @@ type entry[K comparable, V any] struct {
 	// without consulting the cache config.
 	slidingTTL int64
 
+	// heapIndex is the entry's position in its shard's expiry heap,
+	// or -1 when the entry has no TTL (and therefore is not tracked
+	// by the heap). Maintained by the heap's Swap/Push/Pop methods.
+	heapIndex int
+
 	// Tags (nil if untagged).
 	tags []string
 
@@ -75,18 +80,37 @@ func (e *entry[K, V]) expired(now int64) bool {
 	return exp != 0 && now >= exp
 }
 
-// touchAccess updates lastAccess for sliding-TTL entries. The shard's
-// read lock is sufficient — multiple concurrent readers race here, but
-// the result is benign (they all write approximately the same value).
+// touchAccess updates lastAccess. For sliding-TTL entries it also
+// pushes the expireAt forward to `now + slidingTTL`. To avoid a
+// write-storm on hot keys, the sliding refresh is COALESCED: it
+// only fires when the access is more than `slidingTTL/4` newer than
+// the previously recorded lastAccess. Non-sliding entries always
+// update lastAccess (the cost is one atomic store per Get).
 //
-// To avoid a write-storm on hot keys, the caller is expected to coalesce
-// updates (only call when the access is more than slidingTTL/4 newer
-// than the recorded lastAccess).
-func (e *entry[K, V]) touchAccess(nowNanos int64) {
-	e.lastAccess.Store(nowNanos)
-	if e.flags.has(flagSliding) && e.slidingTTL > 0 {
-		e.expireAt.Store(nowNanos + e.slidingTTL)
+// Returns true when the entry's expireAt was actually moved — the
+// caller can use this signal to drive [Cache.expiryFix].
+//
+// Multiple concurrent readers may race here under the shard read
+// lock; the race is benign because all racers write approximately
+// the same value.
+func (e *entry[K, V]) touchAccess(nowNanos int64) (expiryShifted bool) {
+	if !e.flags.has(flagSliding) || e.slidingTTL <= 0 {
+		e.lastAccess.Store(nowNanos)
+		return false
 	}
+	prev := e.lastAccess.Load()
+	if nowNanos-prev < e.slidingTTL/4 {
+		// Access too close to the previous one — skip the
+		// expireAt write entirely. Sliding semantics are
+		// preserved because the recorded expireAt already
+		// covers `now`. (If prev == 0 this is the post-insert
+		// read, which is by definition close to insertion and
+		// safe to coalesce.)
+		return false
+	}
+	e.lastAccess.Store(nowNanos)
+	e.expireAt.Store(nowNanos + e.slidingTTL)
+	return true
 }
 
 // metadata returns a snapshot of the entry's metadata for read-only
@@ -136,6 +160,7 @@ func (e *entry[K, V]) reset() {
 	e.tags = nil
 	e.flags = 0
 	e.slidingTTL = 0
+	e.heapIndex = -1
 	e.policyData = nil
 }
 
@@ -151,17 +176,19 @@ type entryPool[K comparable, V any] struct {
 func newEntryPool[K comparable, V any]() *entryPool[K, V] {
 	return &entryPool[K, V]{
 		pool: sync.Pool{
-			New: func() any { return &entry[K, V]{} },
+			New: func() any { return &entry[K, V]{heapIndex: -1} },
 		},
 	}
 }
 
-// get returns a fresh or recycled entry.
+// get returns a fresh or recycled entry. heapIndex is reset to -1
+// so the entry begins life "not in the expiry heap".
 func (p *entryPool[K, V]) get() *entry[K, V] {
 	e, _ := p.pool.Get().(*entry[K, V])
 	if e == nil {
-		return &entry[K, V]{}
+		return &entry[K, V]{heapIndex: -1}
 	}
+	e.heapIndex = -1
 	return e
 }
 

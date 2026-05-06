@@ -32,6 +32,10 @@ type Cache[K comparable, V any] struct {
 	// loader is the typed loader resolved from cfg.loader, or nil.
 	loader Loader[K, V]
 
+	// expireFunc is the typed per-entry expiry predicate resolved
+	// from cfg.expireFunc, or nil when none is configured.
+	expireFunc func(key K, value V, meta Metadata) bool
+
 	shards    []*shard[K, V]
 	shardMask uint64
 
@@ -116,6 +120,10 @@ func build[K comparable, V any](cfg *config, allowUnbounded bool) (*Cache[K, V],
 	if err != nil {
 		return nil, err
 	}
+	expireFunc, err := resolveExpireFunc[K, V](cfg.expireFunc)
+	if err != nil {
+		return nil, err
+	}
 
 	if cfg.maxBytes > 0 && weigher == nil {
 		return nil, &ConfigError{
@@ -127,13 +135,14 @@ func build[K comparable, V any](cfg *config, allowUnbounded bool) (*Cache[K, V],
 	shardCount := nextPowerOfTwo(max(cfg.shards, 1))
 
 	c := &Cache[K, V]{
-		cfg:       cfg,
-		hasher:    hasher,
-		weigher:   weigher,
-		loader:    loader,
-		shards:    make([]*shard[K, V], shardCount),
-		shardMask: uint64(shardCount - 1),
-		counters:  &statsCounters{},
+		cfg:        cfg,
+		hasher:     hasher,
+		weigher:    weigher,
+		loader:     loader,
+		expireFunc: expireFunc,
+		shards:     make([]*shard[K, V], shardCount),
+		shardMask:  uint64(shardCount - 1),
+		counters:   &statsCounters{},
 	}
 
 	perShard := perShardBudget(cfg.maxEntries, shardCount)
@@ -195,6 +204,24 @@ func resolveWeigher[V any](raw any) (Weigher[V], error) {
 		}
 	}
 	return w, nil
+}
+
+// resolveExpireFunc returns the typed per-entry expiry predicate
+// from a type-erased any, or nil when none is configured.
+//
+//nolint:nilnil // (nil, nil) signals "no expire func configured".
+func resolveExpireFunc[K comparable, V any](raw any) (func(K, V, Metadata) bool, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	fn, ok := raw.(func(K, V, Metadata) bool)
+	if !ok {
+		return nil, &ConfigError{
+			Field:   "ExpireFunc",
+			Message: fmt.Sprintf("type mismatch: expire-func does not match cache type parameters (%T)", raw),
+		}
+	}
+	return fn, nil
 }
 
 // resolveLoader returns the typed Loader[K, V] from a type-erased
@@ -306,7 +333,7 @@ func (c *Cache[K, V]) Has(key K) bool {
 	if !ok {
 		return false
 	}
-	if e.expired(now) {
+	if c.entryExpiredLocked(e, now) {
 		return false
 	}
 	if e.flags.has(flagNegative) {
@@ -327,7 +354,7 @@ func (c *Cache[K, V]) Peek(key K) (V, bool) {
 	s.mu.RLock()
 	e, ok := s.entries[key]
 	s.mu.RUnlock()
-	if !ok || e.expired(now) || e.flags.has(flagNegative) {
+	if !ok || c.entryExpiredLocked(e, now) || e.flags.has(flagNegative) {
 		return zero, false
 	}
 	return e.value, true
@@ -352,7 +379,7 @@ func (c *Cache[K, V]) Get(key K) (V, bool) {
 		c.recordMiss()
 		return zero, false
 	}
-	if e.expired(now) {
+	if c.entryExpiredLocked(e, now) {
 		c.removeLocked(s, e, EvictReasonExpired)
 		c.counters.expirations.Add(1)
 		c.recordMiss()
@@ -363,7 +390,9 @@ func (c *Cache[K, V]) Get(key K) (V, bool) {
 		return zero, false
 	}
 	e.hits.Add(1)
-	e.touchAccess(now)
+	if e.touchAccess(now) {
+		s.expiryFix(e)
+	}
 	s.policy.OnAccess(e)
 	c.recordHit()
 	return e.value, true
@@ -387,7 +416,7 @@ func (c *Cache[K, V]) GetWithExpiry(key K) (V, time.Time, bool) {
 		c.recordMiss()
 		return zero, time.Time{}, false
 	}
-	if e.expired(now) {
+	if c.entryExpiredLocked(e, now) {
 		c.removeLocked(s, e, EvictReasonExpired)
 		c.counters.expirations.Add(1)
 		c.recordMiss()
@@ -398,7 +427,9 @@ func (c *Cache[K, V]) GetWithExpiry(key K) (V, time.Time, bool) {
 		return zero, time.Time{}, false
 	}
 	e.hits.Add(1)
-	e.touchAccess(now)
+	if e.touchAccess(now) {
+		s.expiryFix(e)
+	}
 	s.policy.OnAccess(e)
 	c.recordHit()
 	expNanos := e.expireAt.Load()
@@ -500,9 +531,13 @@ func (c *Cache[K, V]) upsertWithAbsoluteExpiryLocked(
 		// SetExpireAt always implies absolute, never sliding.
 		existing.flags &^= flagSliding
 		existing.slidingTTL = 0
+		s.expiryFix(existing)
 		s.policy.OnUpdate(existing)
 		if c.cfg.statsEnabled {
 			c.counters.updates.Add(1)
+		}
+		if expireAt > 0 {
+			c.startJanitorLocked(s)
 		}
 		return
 	}
@@ -517,11 +552,15 @@ func (c *Cache[K, V]) upsertWithAbsoluteExpiryLocked(
 		e.tags = append(e.tags[:0], sc.tags...)
 	}
 	s.entries[key] = e
+	s.expiryAdd(e)
 	s.policy.OnInsert(e)
 	c.counters.entries.Add(1)
 	c.counters.bytes.Add(weight)
 	if c.cfg.statsEnabled {
 		c.counters.inserts.Add(1)
+	}
+	if expireAt > 0 {
+		c.startJanitorLocked(s)
 	}
 	c.evictWhileOverBudgetLocked(s)
 }
@@ -556,17 +595,26 @@ func (c *Cache[K, V]) Reset() {
 		}
 		clear(s.entries)
 		s.policy.Reset()
+		// Drop heap state: every entry was returned to the pool so
+		// the slice's pointers must not be reused.
+		for i := range s.expHeap {
+			s.expHeap[i] = nil
+		}
+		s.expHeap = s.expHeap[:0]
 		s.mu.Unlock()
 	}
 }
 
-// Close releases all resources and disables further operations.
-// Subsequent calls return [ErrClosed]. Calling Close more than once
-// returns nil on subsequent calls (it is idempotent).
+// Close releases all resources, stops every shard's janitor goroutine,
+// and disables further operations. Subsequent calls return nil — Close
+// is idempotent. Reads and writes after Close return their zero/error
+// path ([ErrClosed] for writes; the zero value with ok=false for
+// reads).
 func (c *Cache[K, V]) Close() error {
 	if !c.closed.CompareAndSwap(false, true) {
 		return nil
 	}
+	c.stopAllJanitors()
 	c.Reset()
 	return nil
 }
@@ -662,9 +710,13 @@ func (c *Cache[K, V]) upsertLocked(
 		} else {
 			existing.tags = existing.tags[:0]
 		}
+		s.expiryFix(existing)
 		s.policy.OnUpdate(existing)
 		if c.cfg.statsEnabled {
 			c.counters.updates.Add(1)
+		}
+		if expireAt > 0 {
+			c.startJanitorLocked(s)
 		}
 		return
 	}
@@ -683,11 +735,15 @@ func (c *Cache[K, V]) upsertLocked(
 		e.tags = append(e.tags[:0], tags...)
 	}
 	s.entries[key] = e
+	s.expiryAdd(e)
 	s.policy.OnInsert(e)
 	c.counters.entries.Add(1)
 	c.counters.bytes.Add(weight)
 	if c.cfg.statsEnabled {
 		c.counters.inserts.Add(1)
+	}
+	if expireAt > 0 {
+		c.startJanitorLocked(s)
 	}
 	c.evictWhileOverBudgetLocked(s)
 }
@@ -718,10 +774,47 @@ func (c *Cache[K, V]) evictWhileOverBudgetLocked(s *shard[K, V]) {
 	}
 }
 
+// entryExpiredLocked reports whether e should be treated as expired
+// at `now`. Combines the entry's TTL check with the cache's
+// optional [WithExpireFunc] predicate; the predicate is recovered
+// on panic and the entry is treated as fresh in that case (a
+// deliberately defensive default — preserve data over loss).
+//
+// Caller must hold the entry's shard lock (read or write) so the
+// metadata snapshot it builds reflects a consistent point in time.
+func (c *Cache[K, V]) entryExpiredLocked(e *entry[K, V], now int64) bool {
+	if e.expired(now) {
+		return true
+	}
+	if c.expireFunc == nil {
+		return false
+	}
+	expired, panicked := c.callExpireFunc(e)
+	if panicked && c.cfg.logger != nil {
+		c.cfg.logger.Warn("memcache: WithExpireFunc panicked; entry treated as fresh",
+			"name", c.cfg.name)
+	}
+	return expired
+}
+
+// callExpireFunc invokes the configured expire predicate with panic
+// recovery. Returns (expired, panicked). On panic returns (false,
+// true) so callers can keep the entry alive AND log the issue.
+func (c *Cache[K, V]) callExpireFunc(e *entry[K, V]) (expired, panicked bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			expired = false
+			panicked = true
+		}
+	}()
+	return c.expireFunc(e.key, e.value, e.metadata()), false
+}
+
 // removeLocked deletes e from the shard and notifies the policy. The
 // caller must hold s.mu.
 func (c *Cache[K, V]) removeLocked(s *shard[K, V], e *entry[K, V], reason EvictionReason) {
 	delete(s.entries, e.key)
+	s.expiryRemove(e)
 	s.policy.OnRemove(e)
 	c.counters.entries.Add(-1)
 	c.counters.bytes.Add(-e.weight)
@@ -759,7 +852,7 @@ func (c *Cache[K, V]) rangeShard(s *shard[K, V], now int64, fn func(K, V) bool) 
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	for _, e := range s.entries {
-		if e.expired(now) || e.flags.has(flagNegative) {
+		if c.entryExpiredLocked(e, now) || e.flags.has(flagNegative) {
 			continue
 		}
 		if !fn(e.key, e.value) {
@@ -806,6 +899,10 @@ func (c *Cache[K, V]) Clear() {
 		}
 		clear(s.entries)
 		s.policy.Reset()
+		for i := range s.expHeap {
+			s.expHeap[i] = nil
+		}
+		s.expHeap = s.expHeap[:0]
 		s.mu.Unlock()
 	}
 }
@@ -823,7 +920,7 @@ func (c *Cache[K, V]) TTL(key K) (time.Duration, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	e, ok := s.entries[key]
-	if !ok || e.expired(now) || e.flags.has(flagNegative) {
+	if !ok || c.entryExpiredLocked(e, now) || e.flags.has(flagNegative) {
 		return 0, false
 	}
 	exp := e.expireAt.Load()
@@ -849,7 +946,7 @@ func (c *Cache[K, V]) Expiry(key K) (time.Time, bool) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	e, ok := s.entries[key]
-	if !ok || e.expired(now) || e.flags.has(flagNegative) {
+	if !ok || c.entryExpiredLocked(e, now) || e.flags.has(flagNegative) {
 		return time.Time{}, false
 	}
 	exp := e.expireAt.Load()
@@ -872,14 +969,14 @@ func (c *Cache[K, V]) Touch(key K) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	e, ok := s.entries[key]
-	if !ok || e.expired(now) || e.flags.has(flagNegative) {
+	if !ok || c.entryExpiredLocked(e, now) || e.flags.has(flagNegative) {
 		return false
 	}
 	ttl := c.cfg.defaultTTL
 	if e.flags.has(flagSliding) && e.slidingTTL > 0 {
 		ttl = time.Duration(e.slidingTTL)
 	}
-	c.refreshExpiryLocked(e, now, ttl)
+	c.refreshExpiryLocked(s, e, now, ttl)
 	return true
 }
 
@@ -896,23 +993,28 @@ func (c *Cache[K, V]) TouchWithTTL(key K, ttl time.Duration) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	e, ok := s.entries[key]
-	if !ok || e.expired(now) || e.flags.has(flagNegative) {
+	if !ok || c.entryExpiredLocked(e, now) || e.flags.has(flagNegative) {
 		return false
 	}
-	c.refreshExpiryLocked(e, now, ttl)
+	c.refreshExpiryLocked(s, e, now, ttl)
 	return true
 }
 
 // refreshExpiryLocked updates the entry's expireAt based on the
 // supplied TTL (with cache-level jitter applied when ttl > 0). The
-// caller must hold the entry's shard write lock.
-func (c *Cache[K, V]) refreshExpiryLocked(e *entry[K, V], now int64, ttl time.Duration) {
+// caller must hold the entry's shard write lock. Adjusts the heap
+// position and starts the shard's janitor if a TTL was applied.
+func (c *Cache[K, V]) refreshExpiryLocked(s *shard[K, V], e *entry[K, V], now int64, ttl time.Duration) {
 	var expireAt int64
 	if ttl > 0 {
 		expireAt = now + int64(applyJitter(ttl, c.cfg.ttlJitter))
 	}
 	e.expireAt.Store(expireAt)
 	e.lastAccess.Store(now)
+	s.expiryFix(e)
+	if expireAt > 0 {
+		c.startJanitorLocked(s)
+	}
 }
 
 // SetIfAbsent stores value under key only when the key is absent (or
@@ -954,7 +1056,7 @@ func (c *Cache[K, V]) SetIfPresent(key K, value V) (bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	existing, ok := s.entries[key]
-	if !ok || existing.expired(now) || existing.flags.has(flagNegative) {
+	if !ok || c.entryExpiredLocked(existing, now) || existing.flags.has(flagNegative) {
 		return false, nil
 	}
 	c.upsertLocked(s, key, value, weight,
@@ -976,7 +1078,7 @@ func (c *Cache[K, V]) DeleteIf(key K, pred func(V) bool) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	e, ok := s.entries[key]
-	if !ok || e.expired(now) || e.flags.has(flagNegative) {
+	if !ok || c.entryExpiredLocked(e, now) || e.flags.has(flagNegative) {
 		return false
 	}
 	if !pred(e.value) {
@@ -1007,9 +1109,11 @@ func (c *Cache[K, V]) GetOrSet(key K, value V) (V, bool, error) {
 	now := c.cfg.clock.Now().UnixNano()
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if existing, ok := s.entries[key]; ok && !existing.expired(now) && !existing.flags.has(flagNegative) {
+	if existing, ok := s.entries[key]; ok && !c.entryExpiredLocked(existing, now) && !existing.flags.has(flagNegative) {
 		existing.hits.Add(1)
-		existing.touchAccess(now)
+		if existing.touchAccess(now) {
+			s.expiryFix(existing)
+		}
 		s.policy.OnAccess(existing)
 		c.recordHit()
 		return existing.value, true, nil
@@ -1218,7 +1322,7 @@ func (c *Cache[K, V]) DeleteWhere(pred func(key K, value V) bool) int {
 		var pairs []candidate
 		s.mu.RLock()
 		for _, e := range s.entries {
-			if e.expired(now) || e.flags.has(flagNegative) {
+			if c.entryExpiredLocked(e, now) || e.flags.has(flagNegative) {
 				continue
 			}
 			pairs = append(pairs, candidate{key: e.key, value: e.value})
