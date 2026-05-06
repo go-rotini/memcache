@@ -84,11 +84,12 @@ const (
 	EvictReasonClear                               // Clear()
 	EvictReasonClose                               // Close()
 	EvictReasonLoadError                           // Loader failed during refresh
+	EvictReasonStoreRollback                       // Store write-through failed; in-memory rolled back
 )
 
 // numEvictionReasons is the count of distinct reasons. Update if reasons
 // are added.
-const numEvictionReasons = 14
+const numEvictionReasons = 15
 
 // String returns a human-readable name for the reason.
 func (r EvictionReason) String() string {
@@ -121,6 +122,8 @@ func (r EvictionReason) String() string {
 		return "close"
 	case EvictReasonLoadError:
 		return "load-error"
+	case EvictReasonStoreRollback:
+		return "store-rollback"
 	default:
 		return unknownString
 	}

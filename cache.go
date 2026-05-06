@@ -52,6 +52,13 @@ type Cache[K comparable, V any] struct {
 	// from cfg.expireFunc, or nil when none is configured.
 	expireFunc func(key K, value V, meta Metadata) bool
 
+	// store is the optional source-of-truth backend supplied by
+	// [WithStore]. When non-nil, [Cache.Get]/[Cache.Set]/
+	// [Cache.Delete] (and their Ctx variants) read-through, write-
+	// through, and delete-through respectively. The in-memory
+	// shards behave as a write-through cache of this backend.
+	store Store[K, V]
+
 	// tags is the cache-level inverted index used by SetWithTags
 	// and InvalidateTag. Always non-nil; an empty index has zero
 	// memory cost beyond the struct itself.
@@ -227,6 +234,10 @@ func build[K comparable, V any](cfg *config, allowUnbounded bool) (*Cache[K, V],
 	if err != nil {
 		return nil, err
 	}
+	store, err := resolveStore[K, V](cfg.store)
+	if err != nil {
+		return nil, err
+	}
 	hooks, err := resolveHooks[K, V](cfg)
 	if err != nil {
 		return nil, err
@@ -276,6 +287,7 @@ func build[K comparable, V any](cfg *config, allowUnbounded bool) (*Cache[K, V],
 		loaderLimiter:              newRateLimiter(cfg.loaderRatePerSecond, cfg.clock),
 		loadSlots:                  loadSlots,
 		expireFunc:                 expireFunc,
+		store:                      store,
 		tags:                       newTagIndex[K](),
 		events:                     newEventBus[K, V](),
 		onHit:                      hooks.onHit,
@@ -715,18 +727,31 @@ func (c *Cache[K, V]) Has(key K) bool {
 	s := c.shardFor(key)
 	now := c.cfg.clock.Now().UnixNano()
 	s.mu.RLock()
-	defer s.mu.RUnlock()
 	e, ok := s.storage.get(key)
-	if !ok {
-		return false
+	if ok {
+		expired := c.entryExpiredLocked(e, now)
+		negative := e.flags.has(flagNegative)
+		s.mu.RUnlock()
+		if expired || negative {
+			// Fall through to the store check (if any) — an
+			// expired in-memory copy doesn't reflect a fresh
+			// store-side write, and a negative tombstone is an
+			// in-memory artifact.
+		} else {
+			return true
+		}
+	} else {
+		s.mu.RUnlock()
 	}
-	if c.entryExpiredLocked(e, now) {
-		return false
+	// Store fall-through. Use a background context — Has has no
+	// caller-supplied ctx; users who need cancellation should call
+	// the store directly.
+	if c.store != nil {
+		v, found, err := c.readThroughStore(context.Background(), key)
+		_ = v
+		return err == nil && found
 	}
-	if e.flags.has(flagNegative) {
-		return false
-	}
-	return true
+	return false
 }
 
 // Peek returns the value without affecting eviction policy state. A
@@ -765,10 +790,29 @@ func (c *Cache[K, V]) Peek(key K) (V, bool) {
 // no refresh-ahead window applies. The slow path takes the shard
 // write lock so policy promotion and side-effects can proceed
 // safely.
+//
+// When [WithStore] is configured, an in-memory miss falls through
+// to the Store; a Store hit is promoted into the in-memory cache
+// and returned.
 func (c *Cache[K, V]) Get(key K) (V, bool) {
+	v, ok, err := c.getCtx(context.Background(), key)
+	if err != nil && c.cfg.logger != nil {
+		c.cfg.logger.Debug("memcache: store Get failed during read-through",
+			"err", err)
+	}
+	return v, ok
+}
+
+// getCtx is the shared backend for [Cache.Get] and [Cache.GetCtx].
+// The returned error is always nil when no Store is configured;
+// otherwise it carries any [Store.Get] failure. Callers without a
+// way to surface the error (Get) silently swallow it.
+//
+//nolint:contextcheck // refresh-ahead spawns its own ctx by design (see triggerAsyncRefreshLocked)
+func (c *Cache[K, V]) getCtx(ctx context.Context, key K) (V, bool, error) {
 	var zero V
 	if c.closed.Load() {
-		return zero, false
+		return zero, false, nil
 	}
 	s := c.shardFor(key)
 	now := c.cfg.clock.Now().UnixNano()
@@ -789,7 +833,7 @@ func (c *Cache[K, V]) Get(key K) (V, bool) {
 		s.mu.RUnlock()
 		c.recordHitObserve(key)
 		c.fireHit(key, val)
-		return c.returnValue(val), true
+		return c.returnValue(val), true, nil
 	}
 	s.mu.RUnlock()
 
@@ -797,13 +841,22 @@ func (c *Cache[K, V]) Get(key K) (V, bool) {
 	// every condition because the entry may have been evicted or
 	// mutated between RUnlock and Lock.
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	e, ok := s.storage.get(key)
 	if !ok {
+		s.mu.Unlock()
+		// In-memory miss — fall through to the configured Store if
+		// any. Doing this after the unlock keeps the (potentially
+		// slow) Store call off the shard's hot path.
+		if v, found, err := c.readThroughStore(ctx, key); err != nil || found {
+			if found {
+				c.recordHitObserve(key)
+				c.fireHit(key, v)
+			}
+			return v, found, err
+		}
 		c.recordMiss()
 		c.fireMiss(key)
-		return zero, false
+		return zero, false, nil
 	}
 	if c.entryExpiredLocked(e, now) {
 		// Stale-while-revalidate: serve stale + trigger refresh.
@@ -812,22 +865,37 @@ func (c *Cache[K, V]) Get(key K) (V, bool) {
 			c.counters.staleWhileRevalidate.Add(1)
 			e.hits.Add(1)
 			s.policy.OnAccess(e)
+			val := e.value
+			s.mu.Unlock()
 			c.recordHitObserve(key)
-			c.fireHit(key, e.value)
-			return c.returnValue(e.value), true
+			c.fireHit(key, val)
+			return c.returnValue(val), true, nil
 		}
 		c.removeLocked(s, e, EvictReasonExpired)
 		c.counters.expirations.Add(1)
+		s.mu.Unlock()
+		// Expired in-memory — try the Store; the user may have
+		// re-written the key on the durable side without touching
+		// the cache.
+		if v, found, err := c.readThroughStore(ctx, key); err != nil || found {
+			if found {
+				c.recordHitObserve(key)
+				c.fireHit(key, v)
+			}
+			return v, found, err
+		}
 		c.recordMiss()
 		c.fireMiss(key)
-		return zero, false
+		return zero, false, nil
 	}
 	if e.flags.has(flagNegative) {
 		c.counters.negativeHits.Add(1)
+		s.mu.Unlock()
 		c.recordMiss()
 		c.fireMiss(key)
-		return zero, false
+		return zero, false, nil
 	}
+	defer s.mu.Unlock()
 	e.hits.Add(1)
 	if e.touchAccess(now) {
 		s.expiryFix(e)
@@ -839,7 +907,7 @@ func (c *Cache[K, V]) Get(key K) (V, bool) {
 	}
 	c.recordHitObserve(key)
 	c.fireHit(key, e.value)
-	return c.returnValue(e.value), true
+	return c.returnValue(e.value), true, nil
 }
 
 // fireHit invokes the configured OnHit hook (if any) and publishes
@@ -994,12 +1062,23 @@ func (c *Cache[K, V]) GetWithExpiry(key K) (V, time.Time, bool) {
 // the entry's tags is shrunk back to its configured capacity by
 // evicting the oldest member if necessary.
 func (c *Cache[K, V]) Set(key K, value V) error {
+	return c.setCtx(context.Background(), key, value)
+}
+
+// setCtx is the shared backend for [Cache.Set] and [Cache.SetCtx].
+// The ctx is threaded through to the configured [Store] write-
+// through; without [WithStore] the context never reaches a
+// blocking call.
+func (c *Cache[K, V]) setCtx(ctx context.Context, key K, value V) error {
 	ttl := extractCacheableTTL(value, c.cfg.defaultTTL)
 	tags := extractCacheableTags(value)
 	if tpl := extractTemplateTags(value); len(tpl) > 0 {
 		tags = append(tags, tpl...)
 	}
 	if err := c.setLocked(key, value, ttl, c.cfg.slidingTTL, tags); err != nil {
+		return err
+	}
+	if err := c.propagateSetToStore(ctx, key, value, ttl); err != nil {
 		return err
 	}
 	c.enforceGroupBudgets(tags)
@@ -1012,7 +1091,10 @@ func (c *Cache[K, V]) SetWithTTL(key K, value V, ttl time.Duration) error {
 	if ttl < 0 {
 		return ErrInvalidTTL
 	}
-	return c.setLocked(key, value, ttl, c.cfg.slidingTTL, nil)
+	if err := c.setLocked(key, value, ttl, c.cfg.slidingTTL, nil); err != nil {
+		return err
+	}
+	return c.propagateSetToStore(context.Background(), key, value, ttl)
 }
 
 // SetWithOptions stores value under key with per-call overrides
@@ -1069,6 +1151,20 @@ func (c *Cache[K, V]) SetWithOptions(key K, value V, opts ...SetOption) error {
 			sc.sliding, int64(sc.ttl), sc.tags)
 	}
 	s.mu.Unlock()
+	// Mirror the write to the configured Store. For absolute-
+	// expiry calls the TTL the Store sees is `expireAt - now`
+	// (clamped to non-negative); for relative TTL calls it's the
+	// per-call duration. Sliding TTLs surface as their initial
+	// value — the Store has no Get-side hook.
+	if c.store != nil {
+		ttl := sc.ttl
+		if sc.hasExpiry && !sc.expireAt.IsZero() {
+			ttl = max(time.Until(sc.expireAt), 0)
+		}
+		if err := c.propagateSetToStore(context.Background(), key, value, ttl); err != nil {
+			return err
+		}
+	}
 	// Group enforcement runs OUTSIDE the shard lock so it can
 	// take other shards' locks freely without inverting the
 	// standard "shard then index" lock order.
@@ -1145,9 +1241,28 @@ func (c *Cache[K, V]) upsertWithAbsoluteExpiryLocked(
 }
 
 // Delete removes key from the cache. Returns true when an entry was
-// removed.
+// removed. When [WithStore] is configured the delete is mirrored
+// to the Store; Store errors are logged but do not affect the
+// returned bool — callers that want the error should use
+// [Cache.DeleteCtx].
 func (c *Cache[K, V]) Delete(key K) bool {
-	return c.deleteWithReason(key, EvictReasonDeleted)
+	return c.deleteCtx(context.Background(), key, EvictReasonDeleted)
+}
+
+// deleteCtx is the shared backend for [Cache.Delete],
+// [Cache.DeleteCtx], and the [WithInvalidationSubscriber] consumer
+// goroutine. The returned bool is true when an entry was removed
+// from the in-memory cache; the Store delete (if configured) is
+// best-effort. The caller path that surfaces errors is DeleteCtx.
+func (c *Cache[K, V]) deleteCtx(ctx context.Context, key K, reason EvictionReason) bool {
+	removed := c.deleteWithReason(key, reason)
+	if c.store != nil {
+		// Errors are logged inside deleteThroughStore; this caller
+		// has no way to surface them — DeleteCtx does, by re-
+		// entering deleteThroughStore directly.
+		_ = c.deleteThroughStore(ctx, key) //nolint:errcheck // see comment above
+	}
+	return removed
 }
 
 // deleteWithReason is the shared backend for [Cache.Delete] and the
@@ -2709,9 +2824,16 @@ func (c *Cache[K, V]) GetMultiOrLoad(ctx context.Context, keys []K) (map[K]V, er
 	out := make(map[K]V, len(keys))
 	var missing []K
 	for _, k := range keys {
-		// Get does not need ctx for cache hits; cancellation is
-		// honored before the bulk-load path.
-		if v, ok := c.Get(k); ok { //nolint:contextcheck // cache lookup needs no context
+		// GetCtx threads the caller's ctx through to any
+		// configured Store read-through; without WithStore the ctx
+		// is checked once and never blocks. A Store error during
+		// the per-key read produces a miss for that key and lets
+		// the bulk-load fallback take over.
+		v, ok, err := c.GetCtx(ctx, k)
+		if err != nil {
+			ok = false
+		}
+		if ok {
 			out[k] = v
 		} else {
 			missing = append(missing, k)

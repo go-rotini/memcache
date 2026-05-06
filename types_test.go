@@ -56,7 +56,7 @@ func TestNumEvictionReasonsMatchesEnum(t *testing.T) {
 	// numEvictionReasons should equal the count of reason constants.
 	// If a new reason is added without updating numEvictionReasons, the
 	// per-reason counters in Stats will under-allocate.
-	last := EvictReasonLoadError
+	last := EvictReasonStoreRollback
 	if int(last)+1 != numEvictionReasons {
 		t.Errorf("numEvictionReasons=%d but last reason index is %d (want %d)",
 			numEvictionReasons, last, int(last)+1)

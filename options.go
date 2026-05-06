@@ -223,6 +223,13 @@ type config struct {
 	// compactions — instead of the default `map[K]*entry[K, V]`.
 	// Toggled by [WithFlatStorage].
 	flatStorage bool
+
+	// store is a type-erased [Store] supplied by [WithStore]. When
+	// non-nil the cache treats it as the source of truth: in-memory
+	// state is a write-through cache of the Store, hot-bounded by
+	// the configured eviction policy. Resolved to its typed form
+	// in [build].
+	store any
 }
 
 // defaultConfig returns the package's baseline configuration. It is
@@ -416,6 +423,33 @@ func WithTTLBuckets(slots, tickPerBucket int) Option {
 		c.ttlBuckets = slots
 		c.ttlBucketsTickPerBucket = tickPerBucket
 	}
+}
+
+// WithStore wires a user-supplied [Store] in behind the cache as the
+// source of truth. The cache's in-memory state becomes a write-
+// through hot subset bounded by the configured eviction policy:
+//
+//   - Reads check the in-memory shard first; on miss they fall
+//     through to the Store. A Store hit is promoted into the
+//     in-memory cache so subsequent reads stay fast.
+//   - Writes go to both — the in-memory entry is created/updated
+//     and the Store sees a Set with the same TTL. A Store error
+//     surfaces back to the caller; the in-memory entry is rolled
+//     back to keep the two sides consistent.
+//   - Deletes go to both. A Store error is logged and the in-
+//     memory delete still completes.
+//
+// The cache does NOT close the Store on [Cache.Close] — the Store's
+// lifecycle is the caller's responsibility. Iteration helpers
+// ([Cache.Range], [Cache.Keys], [Cache.Items]) operate only on the
+// in-memory portion; use [Store.Iterate] directly to walk the full
+// dataset.
+//
+// The Store interface is generic — passing a [Store] whose K/V
+// don't match the cache's parameters is a [ConfigError] at New
+// time.
+func WithStore[K comparable, V any](store Store[K, V]) Option {
+	return func(c *config) { c.store = store }
 }
 
 // WithFlatStorage opts each shard into a flat hash-probed storage
