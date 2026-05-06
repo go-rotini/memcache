@@ -169,6 +169,34 @@ type config struct {
 	// func(V) V at cache construction. Applied to every Get /
 	// Peek return value before handoff to the caller.
 	copyOnGet any
+
+	// admissionPolicy is type-erased; resolveAdmissionPolicy
+	// asserts it into AdmissionPolicy[K] at construction.
+	admissionPolicy any
+
+	// doorkeeperEnabled requests a default-sized Doorkeeper when
+	// no explicit AdmissionPolicy is supplied.
+	doorkeeperEnabled bool
+
+	// invalidationPublisher is a type-erased callback invoked on
+	// every eviction; resolveInvalidationPublisher asserts it
+	// into func(K, EvictionReason) at construction.
+	invalidationPublisher any
+
+	// invalidationSubscriber is a type-erased <-chan K;
+	// resolveInvalidationSubscriber asserts it at construction.
+	invalidationSubscriber any
+
+	// shardedStats requests per-CPU sharded counters for the
+	// hot-path Hits/Misses fields. Reduces contention on >32-core
+	// machines at the cost of slightly more memory and a fan-in
+	// cost on Stats(). Default off.
+	shardedStats bool
+
+	// codecCtorErr is set by options that construct codecs (e.g.
+	// WithEncryptedCodec) when their input is invalid. New
+	// surfaces it as a *ConfigError before any further validation.
+	codecCtorErr error
 }
 
 // defaultConfig returns the package's baseline configuration. It is
@@ -320,6 +348,17 @@ func WithLogger(l *slog.Logger) Option {
 // path.
 func WithStatsEnabled(b bool) Option {
 	return func(c *config) { c.statsEnabled = b }
+}
+
+// WithShardedStats requests per-CPU sharded counters for the
+// hot-path Hits/Misses fields. Reduces cache-line contention on
+// >32-core machines at the cost of slightly more memory and a
+// fan-in cost on every [Cache.Stats] read. The remaining stats
+// counters stay as plain atomics — they update on insert/evict
+// rather than every Get and so don't pay the same penalty.
+// Default: off.
+func WithShardedStats(b bool) Option {
+	return func(c *config) { c.shardedStats = b }
 }
 
 // WithWeigher attaches a function that returns the "weight" of a

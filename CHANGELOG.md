@@ -86,6 +86,27 @@ invalidation, snapshot persistence, and tiered composition.
   configured slog.Logger when any synchronous hook (OnHit/OnMiss/
   OnEvict/OnExpire/OnLoad/PurgeVisitor) exceeds d. Best-effort —
   Go cannot preempt callbacks.
+- **Admission policy**: pluggable `AdmissionPolicy[K]` interface
+  consulted before insert. `AdmitAlways[K]` is the default;
+  `Doorkeeper[K]` (bloom-filter backed, "admit on second
+  observation") is wired in via `WithDoorkeeper(true)` or
+  constructed manually with `NewDoorkeeper`. Rejected admissions
+  surface in `Stats.AdmissionRejects`.
+- **Distributed invalidation hooks**: `WithInvalidationPublisher`
+  fires synchronously on every removal; `WithInvalidationSubscriber`
+  attaches a `<-chan K` whose receives become `EvictReasonRemote`
+  Deletes. The package provides no transport — pair with Redis
+  pub/sub, NATS, fsnotify, etc.
+- **Sharded stats**: `WithShardedStats(true)` redirects the
+  hot-path Hits/Misses counters to per-CPU sharded shadows
+  (slot count = GOMAXPROCS×4, capped at 256). Reduces cache-line
+  contention on >32-core machines; Stats() pays a fan-in cost on
+  read.
+- **Snapshot encryption**: `EncryptedCodec` + `WithEncryptedCodec(base, key)`
+  wrap any base codec with AES-256-GCM authenticated encryption.
+  Wire format is `<12-byte nonce><sealed ciphertext>`. Bad keys
+  surface as `*ConfigError` from New rather than as runtime decode
+  errors.
 - **Concurrency limits**: `WithMaxConcurrentLoads(n)` semaphore;
   `WithLoadRateLimit(rps, burst)` token bucket.
 - **Determinism for tests**: `WithClock(Clock)` + `NewFakeClock(...)`

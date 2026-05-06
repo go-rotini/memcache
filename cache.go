@@ -72,6 +72,22 @@ type Cache[K comparable, V any] struct {
 	purgeVisitor func(K, V) error
 	copyOnGet    func(V) V
 
+	// admission is the resolved [AdmissionPolicy]. Always
+	// non-nil — defaults to [AdmitAlways] when no
+	// [WithAdmissionPolicy] / [WithDoorkeeper] is configured.
+	admission AdmissionPolicy[K]
+
+	// invalidationPublisher fires on every removal; nil when
+	// not configured.
+	invalidationPublisher func(K, EvictionReason)
+
+	// invalidationSubscriber drives the consumer goroutine that
+	// turns remote-channel sends into local Deletes. nil when
+	// not configured. invalidationSubscriberDone is closed by
+	// Close to stop the goroutine.
+	invalidationSubscriber     <-chan K
+	invalidationSubscriberDone chan struct{}
+
 	// tracer is always non-nil. Resolves from cfg.tracer or
 	// falls back to [noopTracer].
 	tracer Tracer
@@ -139,6 +155,13 @@ const configFieldMaxBytes = "MaxBytes"
 // permits a cache with no entry/byte limit; otherwise an unbounded
 // configuration is rejected with [ErrUnbounded].
 func build[K comparable, V any](cfg *config, allowUnbounded bool) (*Cache[K, V], error) {
+	// Surface deferred constructor errors (e.g., bad AES key
+	// length passed to WithEncryptedCodec) before doing any other
+	// validation work — the rest of build assumes cfg.codec is
+	// usable.
+	if cfg.codecCtorErr != nil {
+		return nil, &ConfigError{Field: "Codec", Message: cfg.codecCtorErr.Error()}
+	}
 	// Validate non-negativity before the unbounded check so callers
 	// who supply a negative value get a precise ConfigError rather
 	// than a generic ErrUnbounded.
@@ -178,6 +201,18 @@ func build[K comparable, V any](cfg *config, allowUnbounded bool) (*Cache[K, V],
 	if err != nil {
 		return nil, err
 	}
+	admission, err := resolveAdmissionPolicy[K](cfg, hasher)
+	if err != nil {
+		return nil, err
+	}
+	publisher, err := resolveInvalidationPublisher[K](cfg.invalidationPublisher)
+	if err != nil {
+		return nil, err
+	}
+	subscriber, err := resolveInvalidationSubscriber[K](cfg.invalidationSubscriber)
+	if err != nil {
+		return nil, err
+	}
 	safeKeysCheck[K](cfg)
 
 	if cfg.maxBytes > 0 && weigher == nil {
@@ -198,27 +233,31 @@ func build[K comparable, V any](cfg *config, allowUnbounded bool) (*Cache[K, V],
 		tracer = noopTracer{}
 	}
 	c := &Cache[K, V]{
-		cfg:           cfg,
-		hasher:        hasher,
-		weigher:       weigher,
-		loader:        loader,
-		bulkLoader:    bulkLoader,
-		loaderLimiter: newRateLimiter(cfg.loaderRatePerSecond, cfg.clock),
-		loadSlots:     loadSlots,
-		expireFunc:    expireFunc,
-		tags:          newTagIndex[K](),
-		events:        newEventBus[K, V](),
-		onHit:         hooks.onHit,
-		onMiss:        hooks.onMiss,
-		onEvict:       hooks.onEvict,
-		onExpire:      hooks.onExpire,
-		onLoad:        hooks.onLoad,
-		purgeVisitor:  hooks.purgeVisitor,
-		copyOnGet:     hooks.copyOnGet,
-		tracer:        tracer,
-		shards:        make([]*shard[K, V], shardCount),
-		shardMask:     uint64(shardCount - 1),
-		counters:      &statsCounters{},
+		cfg:                        cfg,
+		hasher:                     hasher,
+		weigher:                    weigher,
+		loader:                     loader,
+		bulkLoader:                 bulkLoader,
+		loaderLimiter:              newRateLimiter(cfg.loaderRatePerSecond, cfg.clock),
+		loadSlots:                  loadSlots,
+		expireFunc:                 expireFunc,
+		tags:                       newTagIndex[K](),
+		events:                     newEventBus[K, V](),
+		onHit:                      hooks.onHit,
+		onMiss:                     hooks.onMiss,
+		onEvict:                    hooks.onEvict,
+		onExpire:                   hooks.onExpire,
+		onLoad:                     hooks.onLoad,
+		purgeVisitor:               hooks.purgeVisitor,
+		copyOnGet:                  hooks.copyOnGet,
+		admission:                  admission,
+		invalidationPublisher:      publisher,
+		invalidationSubscriber:     subscriber,
+		invalidationSubscriberDone: make(chan struct{}),
+		tracer:                     tracer,
+		shards:                     make([]*shard[K, V], shardCount),
+		shardMask:                  uint64(shardCount - 1),
+		counters:                   newStatsCounters(cfg.shardedStats),
 	}
 
 	perShard := perShardBudget(cfg.maxEntries, shardCount)
@@ -231,6 +270,7 @@ func build[K comparable, V any](cfg *config, allowUnbounded bool) (*Cache[K, V],
 		return nil, err
 	}
 	c.startAutoSave()
+	c.startInvalidationSubscriber()
 	publishExpvar(c)
 
 	return c, nil
@@ -606,6 +646,11 @@ func (c *Cache[K, V]) ResetStats() {
 // Has reports whether the cache contains a fresh entry for key. It
 // does NOT promote the entry in the eviction policy and never
 // invokes the configured Loader.
+//
+// The RLock is held through every field read on the resolved entry
+// — releasing it earlier would race with concurrent evictions that
+// recycle the entry through the pool (see TestInvalidationSubscriber
+// for the regression that surfaced the bug).
 func (c *Cache[K, V]) Has(key K) bool {
 	if c.closed.Load() {
 		return false
@@ -613,8 +658,8 @@ func (c *Cache[K, V]) Has(key K) bool {
 	s := c.shardFor(key)
 	now := c.cfg.clock.Now().UnixNano()
 	s.mu.RLock()
+	defer s.mu.RUnlock()
 	e, ok := s.entries[key]
-	s.mu.RUnlock()
 	if !ok {
 		return false
 	}
@@ -679,7 +724,7 @@ func (c *Cache[K, V]) Get(key K) (V, bool) {
 			c.triggerAsyncRefreshLocked(s, key)
 			e.hits.Add(1)
 			s.policy.OnAccess(e)
-			c.recordHit()
+			c.recordHitObserve(key)
 			c.fireHit(key, e.value)
 			return c.returnValue(e.value), true
 		}
@@ -702,7 +747,7 @@ func (c *Cache[K, V]) Get(key K) (V, bool) {
 	if c.shouldRefreshAhead(e, now) {
 		c.triggerAsyncRefreshLocked(s, key)
 	}
-	c.recordHit()
+	c.recordHitObserve(key)
 	c.fireHit(key, e.value)
 	return c.returnValue(e.value), true
 }
@@ -1012,6 +1057,14 @@ func (c *Cache[K, V]) upsertWithAbsoluteExpiryLocked(
 // Delete removes key from the cache. Returns true when an entry was
 // removed.
 func (c *Cache[K, V]) Delete(key K) bool {
+	return c.deleteWithReason(key, EvictReasonDeleted)
+}
+
+// deleteWithReason is the shared backend for [Cache.Delete] and the
+// [WithInvalidationSubscriber] consumer goroutine, parameterized
+// over the eviction reason so subscribers can be reported under
+// [EvictReasonRemote] without duplicating the lookup logic.
+func (c *Cache[K, V]) deleteWithReason(key K, reason EvictionReason) bool {
 	if c.closed.Load() {
 		return false
 	}
@@ -1022,13 +1075,16 @@ func (c *Cache[K, V]) Delete(key K) bool {
 	if !ok {
 		return false
 	}
-	c.removeLocked(s, e, EvictReasonDeleted)
+	c.removeLocked(s, e, reason)
 	c.counters.deletes.Add(1)
 	return true
 }
 
 // Reset removes all entries without firing eviction callbacks.
 func (c *Cache[K, V]) Reset() {
+	if c.admission != nil {
+		c.admission.Reset()
+	}
 	for _, s := range c.shards {
 		s.mu.Lock()
 		for _, e := range s.entries {
@@ -1080,6 +1136,9 @@ func (c *Cache[K, V]) Close() error {
 		<-c.autoSaveDone
 	}
 	c.stopAllJanitors()
+	if c.invalidationSubscriberDone != nil {
+		close(c.invalidationSubscriberDone)
+	}
 	c.runPurgeVisitor()
 	c.Reset()
 	if c.events != nil {
@@ -1123,14 +1182,25 @@ func (c *Cache[K, V]) runPurgeVisitor() {
 // recordHit increments the hit counter when stats are enabled.
 func (c *Cache[K, V]) recordHit() {
 	if c.cfg.statsEnabled {
-		c.counters.hits.Add(1)
+		c.counters.addHit()
+	}
+}
+
+// recordHitObserve is recordHit + AdmissionPolicy.Observe. Used on
+// Get hits so that frequency-tracking admission policies can build
+// their picture of the workload from real read traffic rather than
+// just the writes routed through upsertLocked.
+func (c *Cache[K, V]) recordHitObserve(key K) {
+	c.recordHit()
+	if c.admission != nil {
+		c.admission.Observe(key)
 	}
 }
 
 // recordMiss increments the miss counter when stats are enabled.
 func (c *Cache[K, V]) recordMiss() {
 	if c.cfg.statsEnabled {
-		c.counters.misses.Add(1)
+		c.counters.addMiss()
 	}
 }
 
@@ -1207,7 +1277,23 @@ func (c *Cache[K, V]) upsertLocked(
 	if effectiveTTL > 0 {
 		expireAt = now + int64(effectiveTTL)
 	}
-	if existing, ok := s.entries[key]; ok {
+	existing, ok := s.entries[key]
+	if !ok {
+		// Pure insert — consult the admission policy. Updates
+		// (existing != nil) bypass the gate so callers can
+		// always overwrite values they previously stored.
+		if c.admission != nil {
+			admit := c.admission.Admit(key)
+			c.admission.Observe(key)
+			if !admit {
+				if c.cfg.statsEnabled {
+					c.counters.admissionRejects.Add(1)
+				}
+				return
+			}
+		}
+	}
+	if ok {
 		// Capture the prior tag set before we overwrite the
 		// slice; retagLocked needs the full old set to untag.
 		var oldTags []string
@@ -1415,6 +1501,7 @@ func (c *Cache[K, V]) removeLocked(s *shard[K, V], e *entry[K, V], reason Evicti
 			Tags:   tagsCopy,
 		})
 	}
+	c.publishInvalidation(key, reason)
 }
 
 // Range calls fn for every entry in the cache. Iteration is shard by
