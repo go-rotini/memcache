@@ -68,7 +68,7 @@ func TestViewPeekAndHas(t *testing.T) {
 
 func TestViewTTLAndExpiry(t *testing.T) {
 	clk := NewFakeClock(time.Unix(0, 0))
-	c, _ := New[string, int](WithMaxEntries(4), WithClock(clk))
+	c, _ := New[string, int](WithMaxEntries(4), WithClock(clk), WithTTLJitter(0))
 	defer c.Close()
 	_ = c.SetWithTTL("k", 1, 5*time.Second)
 	v := c.View()
@@ -142,8 +142,11 @@ func TestClonePreservesTTL(t *testing.T) {
 	// shallow), so TTLs evaluate identically.
 	defer cl.Close()
 	d, ok := cl.TTL("k")
-	if !ok || d != 30*time.Second {
-		t.Errorf("clone TTL = (%v, %v), want (30s, true)", d, ok)
+	// 5% default jitter on a 30s TTL means the actual remaining
+	// duration falls in [28.5s, 31.5s]; assert the band rather than
+	// exact equality.
+	if !ok || d < 28*time.Second || d > 32*time.Second {
+		t.Errorf("clone TTL = (%v, %v), want ~30s ± 5%%", d, ok)
 	}
 }
 

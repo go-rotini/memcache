@@ -98,6 +98,14 @@ func (idx *tagIndex[K]) reset() {
 	idx.keysByTag = make(map[string]map[K]struct{})
 }
 
+// distinctTagCount returns the number of distinct tags currently
+// tracked. Used by [Stats.TagsTracked].
+func (idx *tagIndex[K]) distinctTagCount() int {
+	idx.mu.RLock()
+	defer idx.mu.RUnlock()
+	return len(idx.keysByTag)
+}
+
 // SetWithTags stores value under key and indexes the entry under
 // each supplied tag. The cache-level default TTL applies. Tags can
 // later be used to remove this and similarly-tagged entries in one
@@ -121,6 +129,7 @@ func (c *Cache[K, V]) InvalidateTag(tag string) int {
 	if c.closed.Load() || c.tags == nil {
 		return 0
 	}
+	c.counters.tagInvalidations.Add(1)
 	keys := c.tags.snapshot(tag)
 	count := 0
 	for _, k := range keys {
@@ -149,6 +158,7 @@ func (c *Cache[K, V]) InvalidateTags(tags ...string) int {
 	if c.closed.Load() || c.tags == nil || len(tags) == 0 {
 		return 0
 	}
+	c.counters.tagInvalidations.Add(1)
 	doomed := make(map[K]struct{})
 	for _, tag := range tags {
 		for _, k := range c.tags.snapshot(tag) {

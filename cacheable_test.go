@@ -24,6 +24,7 @@ func TestCacheTTLerPointerReceiverOverridesDefault(t *testing.T) {
 		WithMaxEntries(4),
 		WithClock(clk),
 		WithDefaultTTL(time.Hour), // would be ignored
+		WithTTLJitter(0),
 	)
 	defer c.Close()
 
@@ -43,6 +44,7 @@ func TestCacheTTLerValueReceiverOverridesDefault(t *testing.T) {
 		WithMaxEntries(4),
 		WithClock(clk),
 		WithDefaultTTL(time.Hour),
+		WithTTLJitter(0),
 	)
 	defer c.Close()
 	_ = c.Set("k", ttlValue{ttl: 5 * time.Second})
@@ -58,6 +60,7 @@ func TestCacheTTLerNegativeFallsBackToDefault(t *testing.T) {
 		WithMaxEntries(4),
 		WithClock(clk),
 		WithDefaultTTL(7*time.Second),
+		WithTTLJitter(0),
 	)
 	defer c.Close()
 	_ = c.Set("k", ttlValue{ttl: -1}) // sentinel: "use cache default"
@@ -83,7 +86,7 @@ func TestCacheTTLerZeroMeansNoExpiry(t *testing.T) {
 func TestSetWithTTLBypassesCacheTTLer(t *testing.T) {
 	// Explicit per-call TTL must beat the value's CacheTTL.
 	clk := NewFakeClock(time.Unix(0, 0))
-	c, _ := New[string, ttlValue](WithMaxEntries(4), WithClock(clk))
+	c, _ := New[string, ttlValue](WithMaxEntries(4), WithClock(clk), WithTTLJitter(0))
 	defer c.Close()
 	_ = c.SetWithTTL("k", ttlValue{ttl: time.Hour}, 5*time.Second)
 	d, _ := c.TTL("k")
@@ -324,7 +327,7 @@ func (f *fullyCacheable) SnapshotUnmarshal(b []byte) error {
 
 func TestCacheableUmbrellaIntegration(t *testing.T) {
 	clk := NewFakeClock(time.Unix(0, 0))
-	c, _ := New[string, fullyCacheable](WithMaxEntries(4), WithClock(clk))
+	c, _ := New[string, fullyCacheable](WithMaxEntries(4), WithClock(clk), WithTTLJitter(0))
 	defer c.Close()
 	_ = c.Set("k", fullyCacheable{N: 7})
 

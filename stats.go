@@ -2,6 +2,7 @@ package memcache
 
 import (
 	"runtime"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -46,6 +47,12 @@ type Stats struct {
 	// LoadsTotal is the number of Loader invocations.
 	LoadsTotal uint64
 
+	// LoadCalls is a spec-§12.1 alias for [Stats.LoadsTotal]. Both
+	// fields carry the same value; new code should prefer LoadsTotal.
+	// Tracked here so callers reading the spec's field names compile
+	// against the implementation.
+	LoadCalls uint64
+
 	// LoadHits is the count of loader calls that resolved successfully.
 	LoadHits uint64
 
@@ -55,6 +62,11 @@ type Stats struct {
 	// LoadCoalesced is the count of waiters that joined an in-flight
 	// load (singleflight savings).
 	LoadCoalesced uint64
+
+	// Singleflights is a spec-§12.1 alias for [Stats.LoadCoalesced].
+	// Both fields carry the same value; new code should prefer
+	// LoadCoalesced.
+	Singleflights uint64
 
 	// EventsDropped is the count of subscriber events dropped because
 	// a subscriber's channel was full.
@@ -69,6 +81,57 @@ type Stats struct {
 	// rejection means a [Cache.Set] call returned without storing
 	// the value because the policy refused the candidate.
 	AdmissionRejects uint64
+
+	// LoadTimeouts counts loader invocations that exceeded
+	// [WithLoaderTimeout]. Each is also a [LoadErrors] increment.
+	LoadTimeouts uint64
+
+	// LoadRateLimited counts GetOrLoad calls rejected by
+	// [WithLoaderRateLimit] before the loader fired.
+	LoadRateLimited uint64
+
+	// LoadCachedError counts GetOrLoad calls that short-circuited
+	// against a tombstone produced by [WithErrorTTL].
+	LoadCachedError uint64
+
+	// RefreshAhead counts asynchronous loader calls triggered by
+	// [WithRefreshAhead].
+	RefreshAhead uint64
+
+	// StaleWhileRevalidate counts asynchronous loader calls
+	// triggered by [WithStaleWhileRevalidate].
+	StaleWhileRevalidate uint64
+
+	// NegativeHits counts Get-style calls that short-circuited
+	// against a [WithNegativeCache] tombstone.
+	NegativeHits uint64
+
+	// Resizes counts [Cache.Resize] invocations.
+	Resizes uint64
+
+	// TagInvalidations counts [Cache.InvalidateTag] /
+	// [Cache.InvalidateTags] calls (one per call, not per dropped
+	// entry — those land in EvictionsByReason[EvictReasonTag]).
+	TagInvalidations uint64
+
+	// TagsTracked is the live tag-index size (distinct tag count).
+	TagsTracked int
+
+	// Uptime is the wall-clock duration since [New] returned.
+	Uptime time.Duration
+
+	// LastSnapshotAt is the wall-clock time of the most recent
+	// successful Save / Load. Zero when no snapshot has run.
+	LastSnapshotAt time.Time
+
+	// LastResetAt is the wall-clock time of the most recent
+	// [Cache.ResetStats]. Zero when never reset.
+	LastResetAt time.Time
+
+	// PolicyName is the canonical name of the configured eviction
+	// policy (e.g. "S3FIFO", "LRU"). Filled from
+	// [Policy.String].
+	PolicyName string
 
 	// Entries is the current number of entries in the cache (live
 	// Len at snapshot time).
@@ -109,23 +172,40 @@ func (s Stats) HitRate() float64 {
 // hitsShard / missesShard are nil when sharded stats are off; in
 // that case hits / misses are the live counters.
 type statsCounters struct {
-	hits              atomic.Uint64
-	misses            atomic.Uint64
-	hitsShard         *shardedCounter
-	missesShard       *shardedCounter
-	inserts           atomic.Uint64
-	updates           atomic.Uint64
-	deletes           atomic.Uint64
-	evictions         atomic.Uint64
-	expirations       atomic.Uint64
-	evictionsByReason [numEvictionReasons]atomic.Uint64
-	loadsTotal        atomic.Uint64
-	loadHits          atomic.Uint64
-	loadErrors        atomic.Uint64
-	loadCoalesced     atomic.Uint64
-	eventsDropped     atomic.Uint64
-	hashCollisions    atomic.Uint64
-	admissionRejects  atomic.Uint64
+	hits                 atomic.Uint64
+	misses               atomic.Uint64
+	hitsShard            *shardedCounter
+	missesShard          *shardedCounter
+	inserts              atomic.Uint64
+	updates              atomic.Uint64
+	deletes              atomic.Uint64
+	evictions            atomic.Uint64
+	expirations          atomic.Uint64
+	evictionsByReason    [numEvictionReasons]atomic.Uint64
+	loadsTotal           atomic.Uint64
+	loadHits             atomic.Uint64
+	loadErrors           atomic.Uint64
+	loadCoalesced        atomic.Uint64
+	eventsDropped        atomic.Uint64
+	hashCollisions       atomic.Uint64
+	admissionRejects     atomic.Uint64
+	loadTimeouts         atomic.Uint64
+	loadRateLimited      atomic.Uint64
+	loadCachedError      atomic.Uint64
+	refreshAhead         atomic.Uint64
+	staleWhileRevalidate atomic.Uint64
+	negativeHits         atomic.Uint64
+	resizes              atomic.Uint64
+	tagInvalidations     atomic.Uint64
+
+	// Wall-clock timestamps. createdAt is set once by New and never
+	// reset; lastSnapshotAt and lastResetAt are stamped on the
+	// corresponding events. All three are protected by tsMu so the
+	// snapshot reads stay consistent under concurrent updates.
+	tsMu           sync.Mutex
+	createdAt      time.Time
+	lastSnapshotAt time.Time
+	lastResetAt    time.Time
 
 	// Live entry/byte counts. The cache updates these directly on
 	// insert/evict.
@@ -135,14 +215,31 @@ type statsCounters struct {
 
 // newStatsCounters constructs a counter set; sharded ⇒ allocates
 // per-CPU shadow counters for the hot-path Hits/Misses fields.
-func newStatsCounters(sharded bool) *statsCounters {
-	c := &statsCounters{}
+// now stamps createdAt so [Stats.Uptime] is computable from the
+// first Stats call onward.
+func newStatsCounters(sharded bool, now time.Time) *statsCounters {
+	c := &statsCounters{createdAt: now}
 	if sharded {
 		slots := shardedStatsSize(runtime.GOMAXPROCS(0))
 		c.hitsShard = newShardedCounter(slots)
 		c.missesShard = newShardedCounter(slots)
 	}
 	return c
+}
+
+// stampSnapshot records `at` as the most recent snapshot Save/Load
+// time.
+func (s *statsCounters) stampSnapshot(at time.Time) {
+	s.tsMu.Lock()
+	s.lastSnapshotAt = at
+	s.tsMu.Unlock()
+}
+
+// stampReset records `at` as the most recent ResetStats time.
+func (s *statsCounters) stampReset(at time.Time) {
+	s.tsMu.Lock()
+	s.lastResetAt = at
+	s.tsMu.Unlock()
 }
 
 // addHit increments the hit counter, routing through the sharded
@@ -186,24 +283,41 @@ func (s *statsCounters) readMisses() uint64 {
 // the cache's bound configuration.
 func (s *statsCounters) snapshot(now time.Time) Stats {
 	out := Stats{
-		Hits:             s.readHits(),
-		Misses:           s.readMisses(),
-		Inserts:          s.inserts.Load(),
-		Updates:          s.updates.Load(),
-		Deletes:          s.deletes.Load(),
-		Evictions:        s.evictions.Load(),
-		Expirations:      s.expirations.Load(),
-		LoadsTotal:       s.loadsTotal.Load(),
-		LoadHits:         s.loadHits.Load(),
-		LoadErrors:       s.loadErrors.Load(),
-		LoadCoalesced:    s.loadCoalesced.Load(),
-		EventsDropped:    s.eventsDropped.Load(),
-		HashCollisions:   s.hashCollisions.Load(),
-		AdmissionRejects: s.admissionRejects.Load(),
-		Entries:          s.entries.Load(),
-		Bytes:            s.bytes.Load(),
-		At:               now,
+		Hits:                 s.readHits(),
+		Misses:               s.readMisses(),
+		Inserts:              s.inserts.Load(),
+		Updates:              s.updates.Load(),
+		Deletes:              s.deletes.Load(),
+		Evictions:            s.evictions.Load(),
+		Expirations:          s.expirations.Load(),
+		LoadsTotal:           s.loadsTotal.Load(),
+		LoadCalls:            s.loadsTotal.Load(),
+		LoadHits:             s.loadHits.Load(),
+		LoadErrors:           s.loadErrors.Load(),
+		LoadCoalesced:        s.loadCoalesced.Load(),
+		Singleflights:        s.loadCoalesced.Load(),
+		EventsDropped:        s.eventsDropped.Load(),
+		HashCollisions:       s.hashCollisions.Load(),
+		AdmissionRejects:     s.admissionRejects.Load(),
+		LoadTimeouts:         s.loadTimeouts.Load(),
+		LoadRateLimited:      s.loadRateLimited.Load(),
+		LoadCachedError:      s.loadCachedError.Load(),
+		RefreshAhead:         s.refreshAhead.Load(),
+		StaleWhileRevalidate: s.staleWhileRevalidate.Load(),
+		NegativeHits:         s.negativeHits.Load(),
+		Resizes:              s.resizes.Load(),
+		TagInvalidations:     s.tagInvalidations.Load(),
+		Entries:              s.entries.Load(),
+		Bytes:                s.bytes.Load(),
+		At:                   now,
 	}
+	s.tsMu.Lock()
+	if !s.createdAt.IsZero() {
+		out.Uptime = now.Sub(s.createdAt)
+	}
+	out.LastSnapshotAt = s.lastSnapshotAt
+	out.LastResetAt = s.lastResetAt
+	s.tsMu.Unlock()
 	for i := range out.EvictionsByReason {
 		out.EvictionsByReason[i] = s.evictionsByReason[i].Load()
 	}
@@ -233,6 +347,14 @@ func (s *statsCounters) reset() {
 	s.eventsDropped.Store(0)
 	s.hashCollisions.Store(0)
 	s.admissionRejects.Store(0)
+	s.loadTimeouts.Store(0)
+	s.loadRateLimited.Store(0)
+	s.loadCachedError.Store(0)
+	s.refreshAhead.Store(0)
+	s.staleWhileRevalidate.Store(0)
+	s.negativeHits.Store(0)
+	s.resizes.Store(0)
+	s.tagInvalidations.Store(0)
 	for i := range s.evictionsByReason {
 		s.evictionsByReason[i].Store(0)
 	}

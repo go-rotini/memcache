@@ -104,7 +104,7 @@ func TestShardKeepsEntriesIsolated(t *testing.T) {
 
 func TestNewShardConstructor(t *testing.T) {
 	pol := newLRU[string, int]()
-	s := newShard(pol, 16)
+	s := newShard(pol, 16, false)
 	if s.policy == nil {
 		t.Error("newShard returned shard with nil policy")
 	}

@@ -104,6 +104,7 @@ func (c *Cache[K, V]) saveTo(w io.Writer) error {
 	if err := binary.Write(w, binary.LittleEndian, crc.Sum32()); err != nil {
 		return wrapSaveErr("crc", err)
 	}
+	c.counters.stampSnapshot(c.cfg.clock.Now())
 	c.publishEvent(Event[K, V]{Kind: EventSnapshot, At: c.cfg.clock.Now()})
 	return nil
 }
@@ -248,6 +249,7 @@ func (c *Cache[K, V]) loadInto(r io.Reader, reset bool) (int, error) {
 	if stored != crc.Sum32() {
 		return loaded, &SnapshotError{Op: "load", Message: "CRC mismatch", Err: ErrSnapshotCorrupt}
 	}
+	c.counters.stampSnapshot(c.cfg.clock.Now())
 	c.publishEvent(Event[K, V]{Kind: EventSnapshot, At: c.cfg.clock.Now()})
 	return loaded, nil
 }

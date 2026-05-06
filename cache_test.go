@@ -412,7 +412,7 @@ func TestResetDoesNotRecordReason(t *testing.T) {
 
 func TestTTLAndExpiry(t *testing.T) {
 	clk := NewFakeClock(time.Unix(0, 0))
-	c, _ := New[string, int](WithMaxEntries(8), WithClock(clk))
+	c, _ := New[string, int](WithMaxEntries(8), WithClock(clk), WithTTLJitter(0))
 	defer c.Close()
 	_ = c.SetWithTTL("k", 1, 10*time.Second)
 
@@ -599,7 +599,7 @@ func TestPeekOrAdd(t *testing.T) {
 
 func TestSetWithOptionsTTL(t *testing.T) {
 	clk := NewFakeClock(time.Unix(0, 0))
-	c, _ := New[string, int](WithMaxEntries(4), WithClock(clk))
+	c, _ := New[string, int](WithMaxEntries(4), WithClock(clk), WithTTLJitter(0))
 	defer c.Close()
 	if err := c.SetWithOptions("k", 1, SetTTL(5*time.Second)); err != nil {
 		t.Fatalf("SetWithOptions: %v", err)

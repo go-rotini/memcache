@@ -138,7 +138,7 @@ func (c *Cache[K, V]) Compute(
 			return zero, werr
 		}
 		c.upsertLocked(s, key, newValue, weight,
-			effectiveTTL(c.cfg.defaultTTL, c.cfg.ttlJitter),
+			c.effectiveTTL(c.cfg.defaultTTL),
 			c.cfg.slidingTTL, int64(c.cfg.defaultTTL), nil)
 		return newValue, nil
 	case ComputeDelete:
@@ -201,7 +201,7 @@ func (c *Cache[K, V]) ComputeIfAbsent(
 		ttl = c.cfg.defaultTTL
 	}
 	c.upsertLocked(s, key, v, weight,
-		effectiveTTL(ttl, c.cfg.ttlJitter),
+		c.effectiveTTL(ttl),
 		c.cfg.slidingTTL, int64(ttl), nil)
 	return v, true, nil
 }
@@ -248,7 +248,7 @@ func (c *Cache[K, V]) ComputeIfPresent(
 			return zero, werr
 		}
 		c.upsertLocked(s, key, newValue, weight,
-			effectiveTTL(c.cfg.defaultTTL, c.cfg.ttlJitter),
+			c.effectiveTTL(c.cfg.defaultTTL),
 			c.cfg.slidingTTL, int64(c.cfg.defaultTTL), nil)
 		return newValue, nil
 	case ComputeDelete:
@@ -288,7 +288,7 @@ func (c *Cache[K, V]) Update(key K, fn func(cur V) V) (V, error) {
 		return zero, werr
 	}
 	c.upsertLocked(s, key, newValue, weight,
-		effectiveTTL(c.cfg.defaultTTL, c.cfg.ttlJitter),
+		c.effectiveTTL(c.cfg.defaultTTL),
 		c.cfg.slidingTTL, int64(c.cfg.defaultTTL), nil)
 	return newValue, nil
 }
@@ -321,7 +321,7 @@ func (c *Cache[K, V]) CompareAndSwap(key K, old, newValue V) bool {
 		return false
 	}
 	c.upsertLocked(s, key, newValue, weight,
-		effectiveTTL(c.cfg.defaultTTL, c.cfg.ttlJitter),
+		c.effectiveTTL(c.cfg.defaultTTL),
 		c.cfg.slidingTTL, int64(c.cfg.defaultTTL), nil)
 	return true
 }

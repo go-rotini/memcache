@@ -125,7 +125,7 @@ func TestComputeIfAbsent(t *testing.T) {
 
 func TestComputeIfAbsentRespectsTTL(t *testing.T) {
 	clk := NewFakeClock(time.Unix(0, 0))
-	c, _ := New[string, int](WithMaxEntries(4), WithClock(clk))
+	c, _ := New[string, int](WithMaxEntries(4), WithClock(clk), WithTTLJitter(0))
 	defer c.Close()
 
 	if _, _, err := c.ComputeIfAbsent("k", func() (int, time.Duration, error) {

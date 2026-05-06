@@ -35,8 +35,14 @@ type config struct {
 
 	// TTL jitter range, in nanoseconds. The actual expiry of a TTL'd
 	// entry is `ttl + uniform(-jitter, +jitter)`. Default 5% of the
-	// applied TTL.
+	// applied TTL when ttlJitterExplicit is false; otherwise the
+	// caller-supplied absolute window.
 	ttlJitter time.Duration
+
+	// ttlJitterExplicit is set by [WithTTLJitter] so the cache can
+	// distinguish "user opted out" (explicit 0) from "user didn't
+	// configure" (use the 5%-of-TTL default).
+	ttlJitterExplicit bool
 
 	// Janitor sweep interval. Zero disables the janitor (lazy expiry
 	// only).
@@ -193,6 +199,11 @@ type config struct {
 	// cost on Stats(). Default off.
 	shardedStats bool
 
+	// collisionTracking, when true, asks each shard to maintain a
+	// hash→last-key map and bump Stats.HashCollisions on conflicts.
+	// Diagnostics-only; not the hot path under normal load.
+	collisionTracking bool
+
 	// codecCtorErr is set by options that construct codecs (e.g.
 	// WithEncryptedCodec) when their input is invalid. New
 	// surfaces it as a *ConfigError before any further validation.
@@ -210,6 +221,7 @@ func defaultConfig() *config {
 		logger:          slog.Default(),
 		statsEnabled:    true,
 		ttlJitter:       0,
+		callbackTimeout: 100 * time.Millisecond,
 		janitorInterval: 30 * time.Second,
 	}
 }
@@ -266,8 +278,16 @@ func WithSlidingTTL(b bool) Option {
 // WithTTLJitter sets the jitter window applied to TTL expirations.
 // The actual expiry of a TTL'd entry is `ttl + uniform(-j, +j)`. Use
 // to break up cohort expirations and avoid stampedes.
+//
+// When this option is not configured, the cache applies a default
+// jitter equal to 5% of the resolved TTL on each insert. Pass a
+// non-positive duration to disable jitter entirely (the explicit
+// zero overrides the 5% default).
 func WithTTLJitter(j time.Duration) Option {
-	return func(c *config) { c.ttlJitter = j }
+	return func(c *config) {
+		c.ttlJitter = j
+		c.ttlJitterExplicit = true
+	}
 }
 
 // WithJanitorInterval sets how often each shard's background expiry
@@ -348,6 +368,20 @@ func WithLogger(l *slog.Logger) Option {
 // path.
 func WithStatsEnabled(b bool) Option {
 	return func(c *config) { c.statsEnabled = b }
+}
+
+// WithCollisionTracking enables hash-collision counting in
+// [Stats.HashCollisions]. When two distinct keys produce the same
+// hasher output (shard-routing hash), the second one's insert
+// increments the counter. Off by default — useful when diagnosing
+// hot keys, weak custom hashers passed via [WithHasher], or
+// pathological key distributions.
+//
+// The check is per-shard and adds one map lookup + one map write
+// per insert; turn off in production unless you're actively
+// investigating a distribution problem.
+func WithCollisionTracking(b bool) Option {
+	return func(c *config) { c.collisionTracking = b }
 }
 
 // WithShardedStats requests per-CPU sharded counters for the

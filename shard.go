@@ -40,11 +40,19 @@ type shard[K comparable, V any] struct {
 	// that one shard exceeding budget evicts only its own entries,
 	// not from other shards.
 	budget int
+
+	// hashIndex is populated only when [WithCollisionTracking] is
+	// enabled. It maps the cache's hasher output to the most recent
+	// key seen at that hash; on insert, a different key at the same
+	// hash bumps Stats.HashCollisions. Accessed under shard.mu.
+	hashIndex map[uint64]any
 }
 
 // newShard constructs a shard with the given policy and budget.
-func newShard[K comparable, V any](p evictionPolicy[K, V], budget int) *shard[K, V] {
-	return &shard[K, V]{
+// trackCollisions opts the shard into the per-insert
+// [WithCollisionTracking] check.
+func newShard[K comparable, V any](p evictionPolicy[K, V], budget int, trackCollisions bool) *shard[K, V] {
+	s := &shard[K, V]{
 		entries:  make(map[K]*entry[K, V]),
 		policy:   p,
 		pool:     newEntryPool[K, V](),
@@ -52,4 +60,8 @@ func newShard[K comparable, V any](p evictionPolicy[K, V], budget int) *shard[K,
 		inflight: make(map[K]*flightCall[V]),
 		errors:   make(map[K]*cachedError),
 	}
+	if trackCollisions {
+		s.hashIndex = make(map[uint64]any)
+	}
+	return s
 }

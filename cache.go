@@ -257,13 +257,13 @@ func build[K comparable, V any](cfg *config, allowUnbounded bool) (*Cache[K, V],
 		tracer:                     tracer,
 		shards:                     make([]*shard[K, V], shardCount),
 		shardMask:                  uint64(shardCount - 1),
-		counters:                   newStatsCounters(cfg.shardedStats),
+		counters:                   newStatsCounters(cfg.shardedStats, cfg.clock.Now()),
 	}
 
 	perShard := perShardBudget(cfg.maxEntries, shardCount)
 	pcfg := policyConfig[K]{budget: perShard, hasher: hasher}
 	for i := range c.shards {
-		c.shards[i] = newShard(newPolicy[K, V](cfg.policy, pcfg), perShard)
+		c.shards[i] = newShard(newPolicy[K, V](cfg.policy, pcfg), perShard, cfg.collisionTracking)
 	}
 
 	if err := c.applyAutoLoad(); err != nil {
@@ -635,12 +635,19 @@ func (c *Cache[K, V]) Capacity() int64 {
 func (c *Cache[K, V]) Stats() Stats {
 	s := c.counters.snapshot(c.cfg.clock.Now())
 	s.Capacity = c.Capacity()
+	s.PolicyName = c.cfg.policy.String()
+	if c.tags != nil {
+		s.TagsTracked = c.tags.distinctTagCount()
+	}
 	return s
 }
 
 // ResetStats zeros counters. Live entry/byte counts are preserved.
+// Stamps Stats.LastResetAt with the cache's clock so callers can
+// see when the measurement window opened.
 func (c *Cache[K, V]) ResetStats() {
 	c.counters.reset()
+	c.counters.stampReset(c.cfg.clock.Now())
 }
 
 // Has reports whether the cache contains a fresh entry for key. It
@@ -722,6 +729,7 @@ func (c *Cache[K, V]) Get(key K) (V, bool) {
 		// Stale-while-revalidate: serve stale + trigger refresh.
 		if !e.flags.has(flagNegative) && c.shouldServeStale(e, now) {
 			c.triggerAsyncRefreshLocked(s, key)
+			c.counters.staleWhileRevalidate.Add(1)
 			e.hits.Add(1)
 			s.policy.OnAccess(e)
 			c.recordHitObserve(key)
@@ -735,6 +743,7 @@ func (c *Cache[K, V]) Get(key K) (V, bool) {
 		return zero, false
 	}
 	if e.flags.has(flagNegative) {
+		c.counters.negativeHits.Add(1)
 		c.recordMiss()
 		c.fireMiss(key)
 		return zero, false
@@ -745,6 +754,7 @@ func (c *Cache[K, V]) Get(key K) (V, bool) {
 	}
 	s.policy.OnAccess(e)
 	if c.shouldRefreshAhead(e, now) {
+		c.counters.refreshAhead.Add(1)
 		c.triggerAsyncRefreshLocked(s, key)
 	}
 	c.recordHitObserve(key)
@@ -975,7 +985,7 @@ func (c *Cache[K, V]) SetWithOptions(key K, value V, opts ...SetOption) error {
 		c.upsertWithAbsoluteExpiryLocked(s, key, value, weight, sc)
 	} else {
 		c.upsertLocked(s, key, value, weight,
-			effectiveTTL(sc.ttl, c.cfg.ttlJitter),
+			c.effectiveTTL(sc.ttl),
 			sc.sliding, int64(sc.ttl), sc.tags)
 	}
 	s.mu.Unlock()
@@ -1186,6 +1196,39 @@ func (c *Cache[K, V]) recordHit() {
 	}
 }
 
+// recordHashCollisionLocked checks whether key collides with a
+// previously-inserted distinct key on the same shard, and if so
+// bumps [Stats.HashCollisions]. No-op when [WithCollisionTracking]
+// is off (s.hashIndex == nil). Caller holds s.mu (write).
+func (c *Cache[K, V]) recordHashCollisionLocked(s *shard[K, V], key K) {
+	if s.hashIndex == nil {
+		return
+	}
+	h := c.hasher(key)
+	if prev, exists := s.hashIndex[h]; exists {
+		if pk, ok := prev.(K); ok && pk != key {
+			if c.cfg.statsEnabled {
+				c.counters.hashCollisions.Add(1)
+			}
+		}
+	}
+	s.hashIndex[h] = key
+}
+
+// forgetHashLocked drops key's hashIndex entry. Caller holds s.mu
+// (write). No-op when collision tracking is off.
+func (c *Cache[K, V]) forgetHashLocked(s *shard[K, V], key K) {
+	if s.hashIndex == nil {
+		return
+	}
+	h := c.hasher(key)
+	if prev, exists := s.hashIndex[h]; exists {
+		if pk, ok := prev.(K); ok && pk == key {
+			delete(s.hashIndex, h)
+		}
+	}
+}
+
 // recordHitObserve is recordHit + AdmissionPolicy.Observe. Used on
 // Get hits so that frequency-tracking admission policies can build
 // their picture of the workload from real read traffic rather than
@@ -1219,7 +1262,7 @@ func (c *Cache[K, V]) setLocked(key K, value V, ttl time.Duration, sliding bool,
 	s := c.shardFor(key)
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	c.upsertLocked(s, key, value, weight, effectiveTTL(ttl, c.cfg.ttlJitter), sliding, int64(ttl), tags)
+	c.upsertLocked(s, key, value, weight, c.effectiveTTL(ttl), sliding, int64(ttl), tags)
 	return nil
 }
 
@@ -1256,11 +1299,22 @@ func (c *Cache[K, V]) computeWeight(key K, value V) (int64, error) {
 // effectiveTTL returns ttl with cache-level jitter applied. A non-
 // positive ttl is returned unchanged; the caller interprets 0 as "no
 // expiry".
-func effectiveTTL(ttl, jitter time.Duration) time.Duration {
+func (c *Cache[K, V]) effectiveTTL(ttl time.Duration) time.Duration {
 	if ttl <= 0 {
 		return ttl
 	}
-	return applyJitter(ttl, jitter)
+	return applyJitter(ttl, c.resolveJitter(ttl))
+}
+
+// resolveJitter picks the jitter window for a given ttl. When the
+// caller didn't configure WithTTLJitter, the spec-default 5% of ttl
+// applies; otherwise the configured absolute duration wins (a
+// caller-supplied zero is honored as "no jitter").
+func (c *Cache[K, V]) resolveJitter(ttl time.Duration) time.Duration {
+	if c.cfg.ttlJitterExplicit {
+		return c.cfg.ttlJitter
+	}
+	return ttl / 20
 }
 
 // upsertLocked is the shared insert-or-update routine. The caller
@@ -1292,6 +1346,11 @@ func (c *Cache[K, V]) upsertLocked(
 				return
 			}
 		}
+		// Collision tracking: when WithCollisionTracking is on, a
+		// new key whose hasher output collides with the most
+		// recently-inserted distinct key on this shard bumps
+		// Stats.HashCollisions.
+		c.recordHashCollisionLocked(s, key)
 	}
 	if ok {
 		// Capture the prior tag set before we overwrite the
@@ -1456,6 +1515,7 @@ func (c *Cache[K, V]) removeLocked(s *shard[K, V], e *entry[K, V], reason Evicti
 	negative := e.flags.has(flagNegative)
 
 	delete(s.entries, e.key)
+	c.forgetHashLocked(s, e.key)
 	s.expiryRemove(e)
 	s.policy.OnRemove(e)
 	if c.tags != nil && len(e.tags) > 0 {
@@ -1719,7 +1779,7 @@ func (c *Cache[K, V]) SetIfAbsent(key K, value V) (bool, error) {
 		return false, nil
 	}
 	c.upsertLocked(s, key, value, weight,
-		effectiveTTL(c.cfg.defaultTTL, c.cfg.ttlJitter),
+		c.effectiveTTL(c.cfg.defaultTTL),
 		c.cfg.slidingTTL, int64(c.cfg.defaultTTL), nil)
 	return true, nil
 }
@@ -1744,7 +1804,7 @@ func (c *Cache[K, V]) SetIfPresent(key K, value V) (bool, error) {
 		return false, nil
 	}
 	c.upsertLocked(s, key, value, weight,
-		effectiveTTL(c.cfg.defaultTTL, c.cfg.ttlJitter),
+		c.effectiveTTL(c.cfg.defaultTTL),
 		c.cfg.slidingTTL, int64(c.cfg.defaultTTL), nil)
 	return true, nil
 }
@@ -1803,7 +1863,7 @@ func (c *Cache[K, V]) GetOrSet(key K, value V) (V, bool, error) {
 		return c.returnValue(existing.value), true, nil
 	}
 	c.upsertLocked(s, key, value, weight,
-		effectiveTTL(c.cfg.defaultTTL, c.cfg.ttlJitter),
+		c.effectiveTTL(c.cfg.defaultTTL),
 		c.cfg.slidingTTL, int64(c.cfg.defaultTTL), nil)
 	return value, false, nil
 }
@@ -1829,7 +1889,7 @@ func (c *Cache[K, V]) PeekOrAdd(key K, value V) (V, bool, error) {
 		return c.returnValue(existing.value), true, nil
 	}
 	c.upsertLocked(s, key, value, weight,
-		effectiveTTL(c.cfg.defaultTTL, c.cfg.ttlJitter),
+		c.effectiveTTL(c.cfg.defaultTTL),
 		c.cfg.slidingTTL, int64(c.cfg.defaultTTL), nil)
 	return value, false, nil
 }
@@ -1850,6 +1910,7 @@ func (c *Cache[K, V]) Resize(newSize int64) int {
 	if newSize < 0 {
 		return 0
 	}
+	c.counters.resizes.Add(1)
 
 	if c.cfg.maxEntries > 0 || c.cfg.maxBytes <= 0 {
 		c.cfg.maxEntries = int(newSize)
@@ -2178,6 +2239,7 @@ func (c *Cache[K, V]) loadOrJoin(
 			if ce.expireAt > now {
 				err := ce.err
 				s.mu.Unlock()
+				c.counters.loadCachedError.Add(1)
 				c.recordMiss()
 				return zero, err
 			}
@@ -2205,6 +2267,7 @@ func (c *Cache[K, V]) loadOrJoin(
 		s.mu.Unlock()
 		if c.cfg.statsEnabled {
 			c.counters.loadErrors.Add(1)
+			c.counters.loadRateLimited.Add(1)
 		}
 		c.publishEvent(Event[K, V]{Kind: EventLoadRateLimited, Key: key, At: c.cfg.clock.Now()})
 		return zero, ErrLoaderRateLimited
@@ -2332,6 +2395,9 @@ func (c *Cache[K, V]) runLoader(
 		kind := EventLoadError
 		if errors.Is(err, context.DeadlineExceeded) {
 			kind = EventLoadTimeout
+			if c.cfg.statsEnabled {
+				c.counters.loadTimeouts.Add(1)
+			}
 		}
 		c.publishEvent(Event[K, V]{
 			Kind: kind,
@@ -2358,7 +2424,7 @@ func (c *Cache[K, V]) storeLoadedLocked(s *shard[K, V], key K, val V, ttl time.D
 		ttl = c.cfg.defaultTTL
 	}
 	c.upsertLocked(s, key, val, weight,
-		effectiveTTL(ttl, c.cfg.ttlJitter),
+		c.effectiveTTL(ttl),
 		c.cfg.slidingTTL, int64(ttl), nil)
 }
 

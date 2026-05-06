@@ -37,7 +37,13 @@ func ExampleNew_unboundedRejected() {
 
 // ExampleCache_SetWithTTL stores a value with a per-call TTL.
 func ExampleCache_SetWithTTL() {
-	c, _ := memcache.New[string, int](memcache.WithMaxEntries(8))
+	// WithTTLJitter(0) keeps the TTL exact for the example; the
+	// default 5%-of-TTL jitter would produce a non-deterministic
+	// godoc output.
+	c, _ := memcache.New[string, int](
+		memcache.WithMaxEntries(8),
+		memcache.WithTTLJitter(0),
+	)
 	defer c.Close()
 	_ = c.SetWithTTL("session-token", 1234, 30*time.Minute)
 	d, _ := c.TTL("session-token")
