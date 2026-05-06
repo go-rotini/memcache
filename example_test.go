@@ -199,3 +199,24 @@ func ExampleCache_Hottest() {
 	fmt.Println(top[0].Key)
 	// Output: hot
 }
+
+// ExampleSetCacheable demonstrates the CacheKeyer pattern: define a
+// type whose values know their own cache key, then store them
+// without restating the derivation at every call site.
+type exampleProfile struct {
+	UserID int
+	Email  string
+}
+
+func (p exampleProfile) CacheKey() string { return fmt.Sprintf("user:%d", p.UserID) }
+
+func ExampleSetCacheable() {
+	c, _ := memcache.New[string, exampleProfile](memcache.WithMaxEntries(64))
+	defer c.Close()
+	_ = memcache.SetCacheable(c, exampleProfile{UserID: 42, Email: "a@b.c"})
+
+	// Look up by passing only the ID-bearing prototype.
+	got, _ := memcache.GetCacheable(c, exampleProfile{UserID: 42})
+	fmt.Println(got.Email)
+	// Output: a@b.c
+}
