@@ -1,6 +1,7 @@
 package memcache
 
 import (
+	"context"
 	"errors"
 	"slices"
 	"sort"
@@ -285,6 +286,7 @@ func TestWithGroupCapsMembers(t *testing.T) {
 		}
 	}
 	// "session" should now have at most 3 members.
+	_ = c.Sync(context.Background())
 	members := c.tags.snapshot("session")
 	if len(members) != 3 {
 		t.Errorf("session group members = %d, want 3", len(members))
@@ -315,6 +317,7 @@ func TestWithGroupOnlyAffectsMatchingTags(t *testing.T) {
 	for _, k := range []string{"x", "y", "z"} {
 		_ = c.SetWithTags(k, 1, "unbounded")
 	}
+	_ = c.Sync(context.Background())
 	if got := len(c.tags.snapshot("bounded")); got != 2 {
 		t.Errorf("bounded group size = %d, want 2", got)
 	}

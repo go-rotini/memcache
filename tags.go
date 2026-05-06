@@ -233,10 +233,18 @@ func (c *Cache[K, V]) enforceGroupBudgets(tags []string) {
 
 // shrinkGroup evicts oldest-first members of group `tag` until at
 // most `capacity` members remain.
+//
+// Async tag cleanup ([Cache.enqueueUntag]) means the tag index can
+// lag the actual entry state by the queue depth, so the loop's
+// terminating count comes from a live-walk of the snapshot rather
+// than the snapshot's raw length: every member is checked against
+// its owning shard, and only entries still in `s.entries` count
+// against the budget.
 func (c *Cache[K, V]) shrinkGroup(tag string, capacity int) {
 	for {
 		members := c.tags.snapshot(tag)
-		if len(members) <= capacity {
+		live := c.countLiveMembers(members)
+		if live <= capacity {
 			return
 		}
 		oldestKey, ok := c.findOldestMember(members)
@@ -250,6 +258,23 @@ func (c *Cache[K, V]) shrinkGroup(tag string, capacity int) {
 		}
 		s.mu.Unlock()
 	}
+}
+
+// countLiveMembers returns the number of `members` that still have
+// an entry in their owning shard. Stale tag-index entries (whose
+// owning entry has been evicted but the async untag hasn't drained
+// yet) are not counted.
+func (c *Cache[K, V]) countLiveMembers(members []K) int {
+	live := 0
+	for _, k := range members {
+		s := c.shardFor(k)
+		s.mu.RLock()
+		if _, ok := s.entries[k]; ok {
+			live++
+		}
+		s.mu.RUnlock()
+	}
+	return live
 }
 
 // findOldestMember returns the key with the oldest `inserted`

@@ -119,6 +119,13 @@ type Stats struct {
 	// TagsTracked is the live tag-index size (distinct tag count).
 	TagsTracked int
 
+	// TagCleanupBacklog is the depth of the per-cache async untag
+	// queue. A persistently-positive value indicates the eviction
+	// rate is outpacing the index drainer; consider raising the
+	// queue capacity (compile-time `tagCleanupBuffer` constant) or
+	// reducing tag churn.
+	TagCleanupBacklog int
+
 	// Uptime is the wall-clock duration since [New] returned.
 	Uptime time.Duration
 

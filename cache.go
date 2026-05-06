@@ -88,6 +88,17 @@ type Cache[K comparable, V any] struct {
 	invalidationSubscriber     <-chan K
 	invalidationSubscriberDone chan struct{}
 
+	// tagCleanupQueue receives untag ops from removeLocked; the
+	// drainer goroutine batches them and applies under a single
+	// tagIndex.mu acquisition. nil when c.tags is nil.
+	// tagCleanupDone signals shutdown; tagCleanupExited closes
+	// when the drainer has fully drained and returned.
+	tagCleanupQueue     chan untagOp[K]
+	tagCleanupDone      chan struct{}
+	tagCleanupExited    chan struct{}
+	tagCleanupOverflows atomic.Uint64
+	tagCleanupInflight  atomic.Int64 // ops pulled off queue but not yet applied
+
 	// tracer is always non-nil. Resolves from cfg.tracer or
 	// falls back to [noopTracer].
 	tracer Tracer
@@ -276,6 +287,7 @@ func build[K comparable, V any](cfg *config, allowUnbounded bool) (*Cache[K, V],
 	}
 	c.startAutoSave()
 	c.startInvalidationSubscriber()
+	c.startTagCleanup()
 	publishExpvar(c)
 
 	return c, nil
@@ -644,6 +656,7 @@ func (c *Cache[K, V]) Stats() Stats {
 	if c.tags != nil {
 		s.TagsTracked = c.tags.distinctTagCount()
 	}
+	s.TagCleanupBacklog = c.tagCleanupBacklog()
 	// PolicyDetail samples shard 0's policy. All shards share the
 	// concrete policy type, so the shape is stable; the values
 	// describe a single shard's state and should be read as
@@ -1196,6 +1209,7 @@ func (c *Cache[K, V]) Close() error {
 	}
 	c.runPurgeVisitor()
 	c.Reset()
+	c.stopTagCleanup()
 	if c.events != nil {
 		c.events.close()
 	}
@@ -1564,7 +1578,7 @@ func (c *Cache[K, V]) removeLocked(s *shard[K, V], e *entry[K, V], reason Evicti
 	s.expiryRemove(e)
 	s.policy.OnRemove(e)
 	if c.tags != nil && len(e.tags) > 0 {
-		c.tags.untag(e.key, e.tags)
+		c.enqueueUntag(e.key, e.tags)
 	}
 	c.counters.entries.Add(-1)
 	c.counters.bytes.Add(-e.weight)
@@ -1999,13 +2013,15 @@ func (c *Cache[K, V]) shrinkShardLocked(s *shard[K, V]) int {
 	return count
 }
 
-// Sync drains pending background work — async refreshes, async tag
-// cleanup, async tier-2 writes — and returns when the cache is in a
-// quiescent state. Returns the context's error if it cancels first.
+// Sync drains pending background work — async tag cleanup, async
+// loader refreshes — and returns when the cache is in a quiescent
+// state. Returns the context's error if it cancels first. Useful
+// in tests and immediately before [Cache.Save] so the snapshot
+// reflects every Set/Delete that's already returned.
 //
-// In v0 there is no background work to drain (refresh-ahead, async
-// writes, etc. are not yet implemented), so Sync just respects the
-// context. The signature is stable so callers can integrate today.
+// Today Sync waits for the tag-cleanup backlog to reach zero. Future
+// items (async writes, in-flight loader refresh-aheads) will join
+// here without changing the surface.
 func (c *Cache[K, V]) Sync(ctx context.Context) error {
 	if c.closed.Load() {
 		return ErrClosed
@@ -2013,7 +2029,17 @@ func (c *Cache[K, V]) Sync(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err //nolint:wrapcheck // pass through ctx.Err verbatim
 	}
-	return nil
+	const pollInterval = 100 * time.Microsecond
+	for {
+		if c.tagCleanupBacklog() == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err() //nolint:wrapcheck // pass through ctx.Err verbatim
+		case <-time.After(pollInterval):
+		}
+	}
 }
 
 // DeleteExpired performs an immediate sweep over every shard,
@@ -2484,7 +2510,7 @@ func (c *Cache[K, V]) insertNegativeTombstoneLocked(s *shard[K, V], key K) {
 	if existing, ok := s.entries[key]; ok {
 		// Negative tombstones carry no tags; untag the prior set.
 		if c.tags != nil && len(existing.tags) > 0 {
-			c.tags.untag(key, existing.tags)
+			c.enqueueUntag(key, existing.tags)
 			existing.tags = existing.tags[:0]
 		}
 		var zero V
