@@ -358,3 +358,104 @@ func TestCacheableUmbrellaIntegration(t *testing.T) {
 		t.Errorf("after round-trip, N = %d, want 7", v.N)
 	}
 }
+
+// --- omitempty / versioned / tag=template -----------------------
+
+type omitemptyUser struct {
+	ID    int    `cache:"id"`
+	Name  string `cache:"name"`
+	Cache string `cache:"cache,omitempty"`
+}
+
+func TestCacheTagOmitempty_ZeroFieldRoundTrip(t *testing.T) {
+	c, _ := New[string, omitemptyUser](WithMaxEntries(8))
+	defer c.Close()
+	_ = c.Set("u", omitemptyUser{ID: 1, Name: "a"})
+
+	var buf bytes.Buffer
+	if err := c.Save(&buf); err != nil {
+		t.Fatal(err)
+	}
+	dst, _ := New[string, omitemptyUser](WithMaxEntries(8))
+	defer dst.Close()
+	if _, err := dst.Load(&buf); err != nil {
+		t.Fatal(err)
+	}
+	got, ok := dst.Get("u")
+	if !ok || got.ID != 1 || got.Name != "a" || got.Cache != "" {
+		t.Errorf("after omitempty round-trip: got %+v", got)
+	}
+}
+
+type versionedSchemaV1 struct {
+	ID   int    `cache:",versioned"`
+	Name string `cache:",versioned"`
+}
+
+type versionedSchemaV2 struct {
+	ID    int    `cache:",versioned"`
+	Name  string `cache:",versioned"`
+	Email string `cache:",versioned"`
+}
+
+func TestCacheTagVersioned_RejectsSchemaDrift(t *testing.T) {
+	src, _ := New[string, versionedSchemaV1](WithMaxEntries(8))
+	defer src.Close()
+	_ = src.Set("u", versionedSchemaV1{ID: 1, Name: "alice"})
+
+	var buf bytes.Buffer
+	if err := src.Save(&buf); err != nil {
+		t.Fatal(err)
+	}
+
+	// Load into a cache parameterized on the v2 schema — version
+	// fingerprint should disagree.
+	dst, _ := New[string, versionedSchemaV2](WithMaxEntries(8))
+	defer dst.Close()
+	_, err := dst.Load(&buf)
+	if err == nil {
+		t.Fatal("expected schema-version mismatch, got nil error")
+	}
+}
+
+func TestCacheTagVersioned_AcceptsSameSchema(t *testing.T) {
+	src, _ := New[string, versionedSchemaV1](WithMaxEntries(8))
+	defer src.Close()
+	_ = src.Set("u", versionedSchemaV1{ID: 1, Name: "alice"})
+
+	var buf bytes.Buffer
+	if err := src.Save(&buf); err != nil {
+		t.Fatal(err)
+	}
+
+	dst, _ := New[string, versionedSchemaV1](WithMaxEntries(8))
+	defer dst.Close()
+	if _, err := dst.Load(&buf); err != nil {
+		t.Fatalf("load same-schema snapshot: %v", err)
+	}
+	if got, _ := dst.Get("u"); got.Name != "alice" {
+		t.Errorf("after versioned round-trip: %+v", got)
+	}
+}
+
+type templatedUser struct {
+	ID   int    `cache:"id,tag=user-{ID}"`
+	Team string `cache:"team,tag=team-{Team}"`
+}
+
+func TestCacheTagTemplate_AutoTagsOnSet(t *testing.T) {
+	c, _ := New[string, templatedUser](WithMaxEntries(8))
+	defer c.Close()
+	_ = c.Set("k", templatedUser{ID: 42, Team: "eng"})
+
+	tags := c.Tags("k")
+	sort.Strings(tags)
+	want := []string{"team-eng", "user-42"}
+	if !slices.Equal(tags, want) {
+		t.Errorf("template tags = %v, want %v", tags, want)
+	}
+	// Tag invalidation should drop the entry.
+	if dropped := c.InvalidateTag("user-42"); dropped != 1 {
+		t.Errorf("InvalidateTag(user-42) = %d, want 1", dropped)
+	}
+}

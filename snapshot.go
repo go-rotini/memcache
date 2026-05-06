@@ -8,6 +8,7 @@ import (
 	"hash"
 	"hash/crc32"
 	"io"
+	"maps"
 	"os"
 	"path/filepath"
 	"time"
@@ -45,6 +46,12 @@ var errFieldTooBig = errors.New("memcache: snapshot field exceeds 2 GiB")
 // errTooManyTags fires when an entry carries more than 255 tags;
 // the on-disk format reserves a single byte for the count.
 var errTooManyTags = errors.New("memcache: more than 255 tags per entry")
+
+// snapshotSchemaVersionKey is the reserved metadata key under which
+// versioned-struct fingerprints are stamped. Loads compare the
+// snapshot's value against the current schema and refuse mismatches
+// with [ErrSnapshotIncompatible].
+const snapshotSchemaVersionKey = "__memcache_schema_version"
 
 // entrySnapshot is the per-entry record extracted from a live cache
 // at Save time and reconstructed during Load.
@@ -202,6 +209,16 @@ func (c *Cache[K, V]) loadInto(r io.Reader, reset bool) (int, error) {
 			Err:     ErrSnapshotIncompatible,
 		}
 	}
+	if want := c.schemaVersion(); want != "" {
+		got := info.Metadata[snapshotSchemaVersionKey]
+		if got != "" && got != want {
+			return 0, &SnapshotError{
+				Op:      "load",
+				Message: fmt.Sprintf("schema version mismatch: snapshot=%s cache=%s", got, want),
+				Err:     ErrSnapshotIncompatible,
+			}
+		}
+	}
 
 	if reset {
 		c.Reset()
@@ -355,7 +372,7 @@ func (c *Cache[K, V]) writeHeader(w io.Writer, count int64) error {
 	if err := writeString(w, c.cfg.name); err != nil {
 		return wrapSaveErr("name", err)
 	}
-	if err := writeMetadata(w, c.cfg.snapshotMetadata); err != nil {
+	if err := writeMetadata(w, c.effectiveSnapshotMetadata()); err != nil {
 		return wrapSaveErr("metadata", err)
 	}
 	if err := binary.Write(w, binary.LittleEndian, c.cfg.clock.Now().UnixNano()); err != nil {
@@ -365,6 +382,31 @@ func (c *Cache[K, V]) writeHeader(w io.Writer, count int64) error {
 		return wrapSaveErr("count", err)
 	}
 	return nil
+}
+
+// effectiveSnapshotMetadata returns the user-supplied metadata
+// merged with package-reserved entries (currently the schema
+// version when V opts into versioning via the `versioned` cache
+// tag). The user's map is never mutated; reserved keys overwrite
+// any user value.
+func (c *Cache[K, V]) effectiveSnapshotMetadata() map[string]string {
+	version := c.schemaVersion()
+	user := c.cfg.snapshotMetadata
+	if version == "" {
+		return user
+	}
+	out := make(map[string]string, len(user)+1)
+	maps.Copy(out, user)
+	out[snapshotSchemaVersionKey] = version
+	return out
+}
+
+// schemaVersion returns the fingerprint produced by [schemaVersion]
+// (the package-level helper) for V's zero value, or "" when V is
+// not a versioned struct type.
+func (c *Cache[K, V]) schemaVersion() string {
+	var zero V
+	return schemaVersion(zero)
 }
 
 // writeMetadata emits a length-prefixed map. uint16 count then

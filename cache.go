@@ -64,11 +64,13 @@ type Cache[K comparable, V any] struct {
 
 	// Resolved hook callbacks. Any of these may be nil when the
 	// corresponding [WithOnXxx] option was not supplied.
-	onHit    func(K, V)
-	onMiss   func(K)
-	onEvict  func(K, V, EvictionReason)
-	onExpire func(K, V)
-	onLoad   func(K, V, time.Duration, error)
+	onHit        func(K, V)
+	onMiss       func(K)
+	onEvict      func(K, V, EvictionReason)
+	onExpire     func(K, V)
+	onLoad       func(K, V, time.Duration, error)
+	purgeVisitor func(K, V) error
+	copyOnGet    func(V) V
 
 	// tracer is always non-nil. Resolves from cfg.tracer or
 	// falls back to [noopTracer].
@@ -176,6 +178,7 @@ func build[K comparable, V any](cfg *config, allowUnbounded bool) (*Cache[K, V],
 	if err != nil {
 		return nil, err
 	}
+	safeKeysCheck[K](cfg)
 
 	if cfg.maxBytes > 0 && weigher == nil {
 		return nil, &ConfigError{
@@ -210,6 +213,8 @@ func build[K comparable, V any](cfg *config, allowUnbounded bool) (*Cache[K, V],
 		onEvict:       hooks.onEvict,
 		onExpire:      hooks.onExpire,
 		onLoad:        hooks.onLoad,
+		purgeVisitor:  hooks.purgeVisitor,
+		copyOnGet:     hooks.copyOnGet,
 		tracer:        tracer,
 		shards:        make([]*shard[K, V], shardCount),
 		shardMask:     uint64(shardCount - 1),
@@ -370,11 +375,13 @@ func resolveExpireFunc[K comparable, V any](raw any) (func(K, V, Metadata) bool,
 // type-erased fields on config. Each field may be nil when the
 // corresponding [WithOnXxx] option was not supplied.
 type resolvedHooks[K comparable, V any] struct {
-	onHit    func(K, V)
-	onMiss   func(K)
-	onEvict  func(K, V, EvictionReason)
-	onExpire func(K, V)
-	onLoad   func(K, V, time.Duration, error)
+	onHit        func(K, V)
+	onMiss       func(K)
+	onEvict      func(K, V, EvictionReason)
+	onExpire     func(K, V)
+	onLoad       func(K, V, time.Duration, error)
+	purgeVisitor func(K, V) error
+	copyOnGet    func(V) V
 }
 
 // resolveHooks type-asserts every WithOn* option from cfg into its
@@ -431,6 +438,26 @@ func resolveHooks[K comparable, V any](cfg *config) (resolvedHooks[K, V], error)
 			}
 		}
 		out.onLoad = fn
+	}
+	if cfg.purgeVisitor != nil {
+		fn, ok := cfg.purgeVisitor.(func(K, V) error)
+		if !ok {
+			return out, &ConfigError{
+				Field:   "PurgeVisitor",
+				Message: fmt.Sprintf("type mismatch: visitor does not match cache type parameters (%T)", cfg.purgeVisitor),
+			}
+		}
+		out.purgeVisitor = fn
+	}
+	if cfg.copyOnGet != nil {
+		fn, ok := cfg.copyOnGet.(func(V) V)
+		if !ok {
+			return out, &ConfigError{
+				Field:   "CopyOnGet",
+				Message: fmt.Sprintf("type mismatch: copy func does not match cache value type (%T)", cfg.copyOnGet),
+			}
+		}
+		out.copyOnGet = fn
 	}
 	return out, nil
 }
@@ -615,7 +642,7 @@ func (c *Cache[K, V]) Peek(key K) (V, bool) {
 	if !ok || c.entryExpiredLocked(e, now) || e.flags.has(flagNegative) {
 		return zero, false
 	}
-	return e.value, true
+	return c.returnValue(e.value), true
 }
 
 // Get returns the value stored for key, or the zero value of V and
@@ -654,7 +681,7 @@ func (c *Cache[K, V]) Get(key K) (V, bool) {
 			s.policy.OnAccess(e)
 			c.recordHit()
 			c.fireHit(key, e.value)
-			return e.value, true
+			return c.returnValue(e.value), true
 		}
 		c.removeLocked(s, e, EvictReasonExpired)
 		c.counters.expirations.Add(1)
@@ -677,7 +704,7 @@ func (c *Cache[K, V]) Get(key K) (V, bool) {
 	}
 	c.recordHit()
 	c.fireHit(key, e.value)
-	return e.value, true
+	return c.returnValue(e.value), true
 }
 
 // fireHit invokes the configured OnHit hook (if any) and publishes
@@ -686,15 +713,53 @@ func (c *Cache[K, V]) Get(key K) (V, bool) {
 // since it gives callers raw observability.
 func (c *Cache[K, V]) fireHit(key K, value V) {
 	if c.onHit != nil {
-		c.onHit(key, value)
+		c.runHook("OnHit", func() { c.onHit(key, value) })
 	}
+}
+
+// returnValue applies any [WithCopyOnGet] transform to value before
+// returning it. Centralizes the hot-path branch so individual
+// callsites stay legible.
+func (c *Cache[K, V]) returnValue(value V) V {
+	if c.copyOnGet != nil {
+		return c.copyOnGet(value)
+	}
+	return value
 }
 
 // fireMiss invokes the configured OnMiss hook.
 func (c *Cache[K, V]) fireMiss(key K) {
 	if c.onMiss != nil {
-		c.onMiss(key)
+		c.runHook("OnMiss", func() { c.onMiss(key) })
 	}
+}
+
+// runHook executes fn under the optional [WithCallbackTimeout]
+// watchdog. When the timeout is zero or negative, fn runs
+// inline. When set, a goroutine measures fn's duration and logs
+// a warning if it exceeds the budget; the warning is best-effort
+// (Go cannot preempt the callback).
+func (c *Cache[K, V]) runHook(name string, fn func()) {
+	deadline := c.cfg.callbackTimeout
+	if deadline <= 0 {
+		fn()
+		return
+	}
+	done := make(chan struct{})
+	start := c.cfg.clock.Now()
+	go func() {
+		select {
+		case <-done:
+		case <-time.After(deadline):
+			if c.cfg.logger != nil {
+				c.cfg.logger.Warn("memcache: callback exceeded WithCallbackTimeout",
+					"hook", name, "deadline", deadline)
+			}
+		}
+	}()
+	fn()
+	close(done)
+	_ = start
 }
 
 // shouldRefreshAhead reports whether the entry has aged past the
@@ -796,6 +861,9 @@ func (c *Cache[K, V]) GetWithExpiry(key K) (V, time.Time, bool) {
 func (c *Cache[K, V]) Set(key K, value V) error {
 	ttl := extractCacheableTTL(value, c.cfg.defaultTTL)
 	tags := extractCacheableTags(value)
+	if tpl := extractTemplateTags(value); len(tpl) > 0 {
+		tags = append(tags, tpl...)
+	}
 	if err := c.setLocked(key, value, ttl, c.cfg.slidingTTL, tags); err != nil {
 		return err
 	}
@@ -1012,11 +1080,44 @@ func (c *Cache[K, V]) Close() error {
 		<-c.autoSaveDone
 	}
 	c.stopAllJanitors()
+	c.runPurgeVisitor()
 	c.Reset()
 	if c.events != nil {
 		c.events.close()
 	}
 	return nil
+}
+
+// runPurgeVisitor invokes the configured [WithPurgeVisitor] for
+// every live (non-tombstone) entry, outside any shard lock. No-op
+// when no visitor is configured. Caller is responsible for
+// subsequent Reset/Clear.
+func (c *Cache[K, V]) runPurgeVisitor() {
+	if c.purgeVisitor == nil {
+		return
+	}
+	type kv struct {
+		k K
+		v V
+	}
+	var staged []kv
+	for _, s := range c.shards {
+		s.mu.RLock()
+		for _, e := range s.entries {
+			if !e.flags.has(flagNegative) {
+				staged = append(staged, kv{k: e.key, v: e.value})
+			}
+		}
+		s.mu.RUnlock()
+	}
+	for _, p := range staged {
+		c.runHook("PurgeVisitor", func() {
+			if err := c.purgeVisitor(p.k, p.v); err != nil && c.cfg.logger != nil {
+				c.cfg.logger.Warn("memcache: PurgeVisitor returned error",
+					"err", err)
+			}
+		})
+	}
 }
 
 // recordHit increments the hit counter when stats are enabled.
@@ -1291,7 +1392,7 @@ func (c *Cache[K, V]) removeLocked(s *shard[K, V], e *entry[K, V], reason Evicti
 	switch reason {
 	case EvictReasonExpired, EvictReasonExpireFunc:
 		if c.onExpire != nil {
-			c.onExpire(key, value)
+			c.runHook("OnExpire", func() { c.onExpire(key, value) })
 		}
 		c.publishEvent(Event[K, V]{
 			Kind:   EventExpire,
@@ -1303,7 +1404,7 @@ func (c *Cache[K, V]) removeLocked(s *shard[K, V], e *entry[K, V], reason Evicti
 		})
 	default:
 		if c.onEvict != nil {
-			c.onEvict(key, value, reason)
+			c.runHook("OnEvict", func() { c.onEvict(key, value, reason) })
 		}
 		c.publishEvent(Event[K, V]{
 			Kind:   EventEvict,
@@ -1371,13 +1472,14 @@ func (c *Cache[K, V]) Keys() []K {
 }
 
 // Clear removes every entry, recording each removal under
-// [EvictReasonClear] in stats. Hooks (Phase 8) will fire here once
-// they are wired up; today Clear behaves like [Cache.Reset] but
-// updates per-reason eviction counters.
+// [EvictReasonClear] in stats. When [WithPurgeVisitor] is
+// configured, every entry is handed to the visitor (outside the
+// shard lock) before its slot is recycled.
 func (c *Cache[K, V]) Clear() {
 	if c.closed.Load() {
 		return
 	}
+	c.runPurgeVisitor()
 	for _, s := range c.shards {
 		s.mu.Lock()
 		for _, e := range s.entries {
@@ -1611,7 +1713,7 @@ func (c *Cache[K, V]) GetOrSet(key K, value V) (V, bool, error) {
 		}
 		s.policy.OnAccess(existing)
 		c.recordHit()
-		return existing.value, true, nil
+		return c.returnValue(existing.value), true, nil
 	}
 	c.upsertLocked(s, key, value, weight,
 		effectiveTTL(c.cfg.defaultTTL, c.cfg.ttlJitter),
@@ -1637,7 +1739,7 @@ func (c *Cache[K, V]) PeekOrAdd(key K, value V) (V, bool, error) {
 	defer s.mu.Unlock()
 	if existing, ok := s.entries[key]; ok && !existing.expired(now) && !existing.flags.has(flagNegative) {
 		// Peek semantics: do NOT call OnAccess and do not bump hits.
-		return existing.value, true, nil
+		return c.returnValue(existing.value), true, nil
 	}
 	c.upsertLocked(s, key, value, weight,
 		effectiveTTL(c.cfg.defaultTTL, c.cfg.ttlJitter),
@@ -2130,7 +2232,7 @@ func (c *Cache[K, V]) runLoader(
 	// the callback can call back into the cache without
 	// re-entering the same shard's mutex.
 	if c.onLoad != nil {
-		c.onLoad(key, val, ttl, err)
+		c.runHook("OnLoad", func() { c.onLoad(key, val, ttl, err) })
 	}
 	if err == nil {
 		c.publishEvent(Event[K, V]{

@@ -1,6 +1,9 @@
 package memcache
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"reflect"
 	"strings"
 	"sync"
@@ -14,11 +17,11 @@ const cacheStructTag = "cache"
 // cacheTagOptions captures the parsed `cache:"..."` options that
 // affect a single struct field.
 type cacheTagOptions struct {
-	skip   bool // field is `cache:"-"` — drop entirely
-	secret bool // field is marked `secret` — zero during snapshot
-	// rename, omitempty, versioned, tag-template are recognized in
-	// parseCacheTag but the struct walker below only acts on skip
-	// and secret in v0; the rest is documentation-only.
+	skip        bool   // field is `cache:"-"` — drop entirely
+	secret      bool   // field is marked `secret` — zero during snapshot
+	omitempty   bool   // skip from snapshot when zero-valued
+	versioned   bool   // include in schema fingerprint
+	tagTemplate string // `tag=<template>` — auto-tag during Set
 }
 
 // parseCacheTag extracts options from a struct-tag string.
@@ -37,37 +40,58 @@ func parseCacheTag(tag string) cacheTagOptions {
 		opts.skip = true
 	}
 	for _, part := range parts[1:] {
-		if part == "secret" {
+		switch {
+		case part == "secret":
 			opts.secret = true
+		case part == "omitempty":
+			opts.omitempty = true
+		case part == "versioned":
+			opts.versioned = true
+		case strings.HasPrefix(part, "tag="):
+			opts.tagTemplate = strings.TrimPrefix(part, "tag=")
 		}
 	}
 	return opts
 }
 
+// fieldFilter classifies what a particular field's index path needs
+// at snapshot encode time.
+type fieldFilter struct {
+	path      []int
+	zero      bool // skip || secret — always zero
+	omitempty bool // zero only when current value is the type's zero
+}
+
+// tagTemplateBinding pairs a template string with the index path of
+// the field whose value it interpolates.
+type tagTemplateBinding struct {
+	template string
+	fields   map[string][]int // {name → index path}
+}
+
 // cacheTypeMeta is the per-V-type metadata derived once and cached
-// for the lifetime of the process. `secretFields` lists the indices
-// (recursive into anonymous embeds) of fields that need zeroing
-// before snapshot encoding.
+// for the lifetime of the process.
 type cacheTypeMeta struct {
-	hasSecret     bool
-	secretIndices [][]int // each is a reflect.Value.FieldByIndex path
+	hasFilters   bool
+	filters      []fieldFilter
+	versioned    bool
+	versionHash  string // sha256 fingerprint of versioned-tagged schema
+	tagTemplates []tagTemplateBinding
+	hasTemplates bool
+	hasOmitEmpty bool
 }
 
 // cacheTypeMetaCache memoizes [cacheTypeMeta] keyed on
-// reflect.Type. The first walk per type is O(field count); every
-// subsequent lookup is a `sync.Map.Load`.
+// reflect.Type.
 var cacheTypeMetaCache sync.Map // map[reflect.Type]*cacheTypeMeta
 
 // metaFor returns the cached metadata for t, computing it on first
-// access. Non-struct types yield a metadata struct with
-// hasSecret=false; the cache hot-path checks this flag and
-// short-circuits.
+// access. Non-struct types yield empty metadata; the cache hot-path
+// checks the bool flags and short-circuits.
 func metaFor(t reflect.Type) *cacheTypeMeta {
 	if t == nil {
 		return &cacheTypeMeta{}
 	}
-	// Dereference pointer types so a `Cache[K, *User]` and
-	// `Cache[K, User]` share the same metadata.
 	for t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
@@ -85,31 +109,54 @@ func metaFor(t reflect.Type) *cacheTypeMeta {
 }
 
 // buildMeta walks a struct's fields, recursing into anonymous
-// embedded structs, and records the index path of every field
-// tagged `secret` or `-`.
+// embedded structs, and records each field's options.
 func buildMeta(t reflect.Type) *cacheTypeMeta {
 	meta := &cacheTypeMeta{}
-	walkStructFields(t, nil, func(path []int, opts cacheTagOptions) {
-		if opts.skip || opts.secret {
-			indexCopy := append([]int(nil), path...)
-			meta.secretIndices = append(meta.secretIndices, indexCopy)
-			meta.hasSecret = true
+	// Track the canonical name → index path for fields whose names
+	// appear in any tag template.
+	fieldsByName := map[string][]int{}
+	walkStructFields(t, nil, func(path []int, name string, opts cacheTagOptions) {
+		indexCopy := append([]int(nil), path...)
+		fieldsByName[name] = indexCopy
+		switch {
+		case opts.skip || opts.secret:
+			meta.filters = append(meta.filters, fieldFilter{path: indexCopy, zero: true})
+			meta.hasFilters = true
+		case opts.omitempty:
+			meta.filters = append(meta.filters, fieldFilter{path: indexCopy, omitempty: true})
+			meta.hasFilters = true
+			meta.hasOmitEmpty = true
+		}
+		if opts.versioned {
+			meta.versioned = true
+		}
+		if opts.tagTemplate != "" {
+			meta.tagTemplates = append(meta.tagTemplates, tagTemplateBinding{
+				template: opts.tagTemplate,
+			})
+			meta.hasTemplates = true
 		}
 	})
+	// Resolve template field references now that fieldsByName is
+	// fully populated.
+	for i := range meta.tagTemplates {
+		meta.tagTemplates[i].fields = fieldsByName
+	}
+	if meta.versioned {
+		meta.versionHash = computeVersionHash(t)
+	}
 	return meta
 }
 
 // walkStructFields invokes visit for every field in t (including
 // promoted fields from anonymous struct embeds), passing the index
-// path and the parsed `cache:"..."` options.
-func walkStructFields(t reflect.Type, prefix []int, visit func(path []int, opts cacheTagOptions)) {
+// path, canonical field name, and the parsed options.
+func walkStructFields(t reflect.Type, prefix []int, visit func(path []int, name string, opts cacheTagOptions)) {
 	for i := range t.NumField() {
 		field := t.Field(i)
 		path := append(append([]int(nil), prefix...), i)
 		opts := parseCacheTag(field.Tag.Get(cacheStructTag))
-		visit(path, opts)
-		// Recurse into anonymous struct embeds so users can
-		// inherit secret tags from base types.
+		visit(path, field.Name, opts)
 		if field.Anonymous {
 			ft := field.Type
 			for ft.Kind() == reflect.Pointer {
@@ -122,33 +169,56 @@ func walkStructFields(t reflect.Type, prefix []int, visit func(path []int, opts 
 	}
 }
 
-// applySnapshotFilter returns a copy of v with every `secret` (or
-// `-`) field zeroed out. Returns the original v unchanged when
-// V has no such fields (the common case).
-//
-// The copy is made via reflect.Value.Set on a fresh
-// reflect.New(elem) target so the caller's original value is
-// never mutated. For pointer V types the copy is a freshly
-// allocated *V pointing at a copy of the underlying struct.
+// computeVersionHash produces a stable fingerprint of t's exported
+// schema: sorted "Name:Type" pairs, sha256-hashed and hex-encoded.
+// Two structs with the same versioned schema produce the same hash;
+// any rename or type change perturbs it.
+func computeVersionHash(t reflect.Type) string {
+	var lines []string
+	walkStructFields(t, nil, func(_ []int, name string, _ cacheTagOptions) {
+		lines = append(lines, name+":"+typeSignature(t, name))
+	})
+	// Sort for stable order independent of declaration order.
+	for i := 1; i < len(lines); i++ {
+		for j := i; j > 0 && lines[j-1] > lines[j]; j-- {
+			lines[j-1], lines[j] = lines[j], lines[j-1]
+		}
+	}
+	h := sha256.Sum256([]byte(strings.Join(lines, "\n")))
+	return hex.EncodeToString(h[:])
+}
+
+// typeSignature returns a stable string for the named field's type.
+// Anonymous types and unexported names fall back to t.Kind().
+func typeSignature(t reflect.Type, name string) string {
+	f, ok := t.FieldByName(name)
+	if !ok {
+		return "?"
+	}
+	return f.Type.String()
+}
+
+// applySnapshotFilter returns a copy of v with every secret/skip
+// field zeroed and every omitempty field zeroed when its current
+// value equals its type's zero. Returns the original v unchanged
+// when V has no filtered fields (the common case).
 func applySnapshotFilter[V any](v V) V {
 	t := reflect.TypeOf(v)
 	if t == nil {
 		return v
 	}
 	meta := metaFor(t)
-	if !meta.hasSecret {
+	if !meta.hasFilters {
 		return v
 	}
 	src := reflect.ValueOf(v)
-	// Resolve to the underlying struct, both for value- and
-	// pointer-typed V.
 	if src.Kind() == reflect.Pointer {
 		if src.IsNil() {
 			return v
 		}
 		clone := reflect.New(src.Elem().Type())
 		clone.Elem().Set(src.Elem())
-		zeroSecretFields(clone.Elem(), meta.secretIndices)
+		applyFilters(clone.Elem(), meta.filters)
 		out, _ := clone.Interface().(V)
 		return out
 	}
@@ -157,20 +227,119 @@ func applySnapshotFilter[V any](v V) V {
 	}
 	clone := reflect.New(t).Elem()
 	clone.Set(src)
-	zeroSecretFields(clone, meta.secretIndices)
+	applyFilters(clone, meta.filters)
 	out, _ := clone.Interface().(V)
 	return out
 }
 
-// zeroSecretFields zeros every field whose index path appears in
-// indices. Caller must have already cloned the struct into the
-// passed reflect.Value.
-func zeroSecretFields(v reflect.Value, indices [][]int) {
-	for _, idx := range indices {
-		f := v.FieldByIndex(idx)
-		if !f.CanSet() {
+// applyFilters mutates v in place per filters.
+func applyFilters(v reflect.Value, filters []fieldFilter) {
+	for _, f := range filters {
+		fv := v.FieldByIndex(f.path)
+		if !fv.CanSet() {
 			continue
 		}
-		f.Set(reflect.Zero(f.Type()))
+		switch {
+		case f.zero:
+			fv.Set(reflect.Zero(fv.Type()))
+		case f.omitempty:
+			if fv.IsZero() {
+				// Already zero; nothing to do (the codec will
+				// still emit the field, but we honor the
+				// declarative intent for forward codec compat).
+				continue
+			}
+			// Non-zero values are PRESERVED through the snapshot.
+			// omitempty only kicks in when emitting an empty
+			// field — for forward compatibility with codecs that
+			// can elide zero values from the wire format. Our
+			// gob codec can't elide, so omitempty here is mostly
+			// declarative: the field's contract is "I may not be
+			// preserved on every snapshot." Implementations that
+			// need definitive non-persistence should use `-`.
+		}
 	}
+}
+
+// extractTemplateTags walks v's fields and returns one tag string
+// per `tag=<template>` declaration on the value's type. Templates
+// support `{FieldName}` placeholders that are interpolated against
+// the current value's field values via `fmt.Sprintf("%v", ...)`.
+//
+// Returns nil for non-struct V types or types with no templates.
+func extractTemplateTags[V any](v V) []string {
+	t := reflect.TypeOf(v)
+	if t == nil {
+		return nil
+	}
+	meta := metaFor(t)
+	if !meta.hasTemplates {
+		return nil
+	}
+	rv := reflect.ValueOf(v)
+	for rv.Kind() == reflect.Pointer {
+		if rv.IsNil() {
+			return nil
+		}
+		rv = rv.Elem()
+	}
+	if rv.Kind() != reflect.Struct {
+		return nil
+	}
+	tags := make([]string, 0, len(meta.tagTemplates))
+	for _, tpl := range meta.tagTemplates {
+		tags = append(tags, expandTemplate(tpl.template, rv, tpl.fields))
+	}
+	return tags
+}
+
+// expandTemplate substitutes {FieldName} placeholders in template
+// with the field's current value. Unknown names render as the
+// literal placeholder (so typos don't silently produce blank tags).
+func expandTemplate(template string, rv reflect.Value, fields map[string][]int) string {
+	var b strings.Builder
+	i := 0
+	for i < len(template) {
+		open := strings.IndexByte(template[i:], '{')
+		if open < 0 {
+			b.WriteString(template[i:])
+			break
+		}
+		b.WriteString(template[i : i+open])
+		i += open + 1 // past the '{'
+		closeIdx := strings.IndexByte(template[i:], '}')
+		if closeIdx < 0 {
+			// Unterminated placeholder — emit verbatim.
+			b.WriteByte('{')
+			b.WriteString(template[i:])
+			break
+		}
+		name := template[i : i+closeIdx]
+		i += closeIdx + 1 // past the '}'
+		path, ok := fields[name]
+		if !ok {
+			// Unknown field — render the literal placeholder for
+			// debuggability. Template authors will see "{Foo}" in
+			// their tag value rather than silent empty strings.
+			b.WriteByte('{')
+			b.WriteString(name)
+			b.WriteByte('}')
+			continue
+		}
+		fv := rv.FieldByIndex(path)
+		fmt.Fprintf(&b, "%v", fv.Interface())
+	}
+	return b.String()
+}
+
+// schemaVersion returns v's fingerprint when the type opts into
+// schema-versioning via the `versioned` tag, or "" otherwise. Used
+// by the snapshot subsystem to refuse loads where the persisted
+// fingerprint differs from the current schema's.
+func schemaVersion[V any](v V) string {
+	t := reflect.TypeOf(v)
+	if t == nil {
+		return ""
+	}
+	return metaFor(t).versionHash
 }

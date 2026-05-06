@@ -150,6 +150,25 @@ type config struct {
 	// enforces `member count <= capacity` for that group by
 	// evicting the oldest member (by inserted time).
 	groups map[string]int
+
+	// safeKeys, when true, runs a construction-time check that
+	// logs a warning if K is a pointer-y type that compares by
+	// identity rather than contents.
+	safeKeys bool
+
+	// callbackTimeout bounds synchronous hook duration before a
+	// warning is logged. Zero disables the watchdog.
+	callbackTimeout time.Duration
+
+	// purgeVisitor is type-erased into the config and asserted
+	// into func(K, V) error at cache construction. Called for
+	// every entry during Clear and Close.
+	purgeVisitor any
+
+	// copyOnGet is type-erased into the config and asserted into
+	// func(V) V at cache construction. Applied to every Get /
+	// Peek return value before handoff to the caller.
+	copyOnGet any
 }
 
 // defaultConfig returns the package's baseline configuration. It is

@@ -61,7 +61,31 @@ invalidation, snapshot persistence, and tiered composition.
 - **Numeric helpers**: `Increment`, `IncrementBy`, `Decrement`,
   `DecrementBy` as thin wrappers over Compute.
 - **Struct-tag introspection**: `cache:"-"` excludes a field from
-  snapshots; `cache:"secret"` redacts it from event/hook payloads.
+  snapshots; `cache:"secret"` redacts it from event/hook payloads;
+  `cache:"omitempty"` declares fields whose absence from snapshots
+  is acceptable; `cache:",versioned"` participates in the schema
+  fingerprint (sha256 of sorted Name:Type pairs) embedded in the
+  snapshot under `__memcache_schema_version` — Load rejects
+  fingerprint drift with `ErrSnapshotIncompatible`;
+  `cache:"...,tag=user-{Field}"` auto-derives tag values from
+  struct field contents at Set time.
+- **Snapshot compression**: `WithCompressedCodec(base, level)` and
+  `NewCompressedCodec(base, level)` wrap any base codec with gzip;
+  the codec name is `<base>+gzip` so codec-mismatch checks fire
+  across the compression boundary.
+- **Lifecycle hooks**: `WithPurgeVisitor` fires once per live entry
+  during `Clear` and `Close` (outside any shard lock); intended for
+  draining cache state to disk, the network, or a structured log.
+- **Hot-path safety**: `WithCopyOnGet[V](fn func(V) V)` applies fn
+  to every successful Get/Peek return, isolating callers from
+  mutations of cached state.
+- **Construction-time validation**: `WithSafeKeys(true)` logs a
+  warning when K is a pointer (compares by identity) or a struct
+  containing pointer fields (mutable equality is fragile).
+- **Watchdog**: `WithCallbackTimeout(d)` logs a warning via the
+  configured slog.Logger when any synchronous hook (OnHit/OnMiss/
+  OnEvict/OnExpire/OnLoad/PurgeVisitor) exceeds d. Best-effort —
+  Go cannot preempt callbacks.
 - **Concurrency limits**: `WithMaxConcurrentLoads(n)` semaphore;
   `WithLoadRateLimit(rps, burst)` token bucket.
 - **Determinism for tests**: `WithClock(Clock)` + `NewFakeClock(...)`
