@@ -125,6 +125,11 @@ type Cache[K comparable, V any] struct {
 	autoSaveStop chan struct{}
 	autoSaveDone chan struct{}
 
+	// async holds the [WithAsyncWrites] state — pending-op signal
+	// channel and apply-goroutine lifecycle. nil when async writes
+	// are off.
+	async *asyncWrites
+
 	closed atomic.Bool
 }
 
@@ -308,6 +313,7 @@ func build[K comparable, V any](cfg *config, allowUnbounded bool) (*Cache[K, V],
 	}
 
 	initShards(c, cfg, hasher)
+	c.maybeStartAsync(cfg)
 
 	if err := c.applyAutoLoad(); err != nil {
 		return nil, err
@@ -318,6 +324,17 @@ func build[K comparable, V any](cfg *config, allowUnbounded bool) (*Cache[K, V],
 	publishExpvar(c)
 
 	return c, nil
+}
+
+// maybeStartAsync wires the [WithAsyncWrites] state and apply
+// goroutine when the option is set. Factored out of [build] to
+// keep that function under the project's funlen budget.
+func (c *Cache[K, V]) maybeStartAsync(cfg *config) {
+	if !cfg.asyncWrites {
+		return
+	}
+	c.async = newAsyncWrites[K, V](c.shards)
+	c.startAsyncApply()
 }
 
 // applyAutoLoad attempts a one-shot LoadFile when [WithAutoLoad]
@@ -726,6 +743,14 @@ func (c *Cache[K, V]) Has(key K) bool {
 	}
 	s := c.shardFor(key)
 	now := c.cfg.clock.Now().UnixNano()
+	if s.pending != nil {
+		s.mu.RLock()
+		_, kind, hit := c.asyncReadHit(s, key, now)
+		s.mu.RUnlock()
+		if hit {
+			return kind == pendingOpSet
+		}
+	}
 	s.mu.RLock()
 	e, ok := s.storage.get(key)
 	if ok {
@@ -763,6 +788,17 @@ func (c *Cache[K, V]) Peek(key K) (V, bool) {
 	}
 	s := c.shardFor(key)
 	now := c.cfg.clock.Now().UnixNano()
+	if s.pending != nil {
+		s.mu.RLock()
+		val, kind, hit := c.asyncReadHit(s, key, now)
+		s.mu.RUnlock()
+		if hit {
+			if kind == pendingOpDelete {
+				return zero, false
+			}
+			return c.returnValue(val), true
+		}
+	}
 	s.mu.RLock()
 	e, ok := s.storage.get(key)
 	s.mu.RUnlock()
@@ -816,6 +852,25 @@ func (c *Cache[K, V]) getCtx(ctx context.Context, key K) (V, bool, error) {
 	}
 	s := c.shardFor(key)
 	now := c.cfg.clock.Now().UnixNano()
+
+	// Async-writes pending check: a queued Set/Delete on this key
+	// must be visible before storage is consulted, so that a Set
+	// followed by a Get returns the new value.
+	if s.pending != nil {
+		s.mu.RLock()
+		val, kind, hit := c.asyncReadHit(s, key, now)
+		s.mu.RUnlock()
+		if hit {
+			if kind == pendingOpDelete {
+				c.recordMiss()
+				c.fireMiss(key)
+				return zero, false, nil
+			}
+			c.recordHitObserve(key)
+			c.fireHit(key, val)
+			return c.returnValue(val), true, nil
+		}
+	}
 
 	// Fast path: try to serve under the shard read lock.
 	s.mu.RLock()
@@ -1075,6 +1130,9 @@ func (c *Cache[K, V]) setCtx(ctx context.Context, key K, value V) error {
 	if tpl := extractTemplateTags(value); len(tpl) > 0 {
 		tags = append(tags, tpl...)
 	}
+	if c.async != nil {
+		return c.asyncSet(key, value, ttl, c.cfg.slidingTTL, tags)
+	}
 	if err := c.setLocked(key, value, ttl, c.cfg.slidingTTL, tags); err != nil {
 		return err
 	}
@@ -1090,6 +1148,9 @@ func (c *Cache[K, V]) setCtx(ctx context.Context, key K, value V) error {
 func (c *Cache[K, V]) SetWithTTL(key K, value V, ttl time.Duration) error {
 	if ttl < 0 {
 		return ErrInvalidTTL
+	}
+	if c.async != nil {
+		return c.asyncSet(key, value, ttl, c.cfg.slidingTTL, nil)
 	}
 	if err := c.setLocked(key, value, ttl, c.cfg.slidingTTL, nil); err != nil {
 		return err
@@ -1139,6 +1200,13 @@ func (c *Cache[K, V]) SetWithOptions(key K, value V, opts ...SetOption) error {
 			return err
 		}
 		weight = w
+	}
+
+	if c.async != nil {
+		if sc.hasExpiry {
+			return c.asyncSetWithExpiry(key, value, weight, sc)
+		}
+		return c.asyncSet(key, value, sc.ttl, sc.sliding, sc.tags)
 	}
 
 	s := c.shardFor(key)
@@ -1244,8 +1312,14 @@ func (c *Cache[K, V]) upsertWithAbsoluteExpiryLocked(
 // removed. When [WithStore] is configured the delete is mirrored
 // to the Store; Store errors are logged but do not affect the
 // returned bool — callers that want the error should use
-// [Cache.DeleteCtx].
+// [Cache.DeleteCtx]. When [WithAsyncWrites] is configured the
+// delete is queued and the returned bool is "always true" except
+// for closed caches; callers that need the post-delete state
+// should call [Cache.Sync] first.
 func (c *Cache[K, V]) Delete(key K) bool {
+	if c.async != nil {
+		return c.asyncDelete(key)
+	}
 	return c.deleteCtx(context.Background(), key, EvictReasonDeleted)
 }
 
@@ -1323,6 +1397,11 @@ func (c *Cache[K, V]) Close() error {
 	if !c.closed.CompareAndSwap(false, true) {
 		return nil
 	}
+	// Drain any pending async writes BEFORE the snapshot so the
+	// final on-disk state reflects every Set/Delete the caller
+	// returned from. The apply goroutine drains-and-exits when its
+	// stop channel is closed.
+	c.stopAsyncApply()
 	// Final snapshot BEFORE stopping janitors / clearing entries.
 	// saveFileTo bypasses the closed check (closed is already true
 	// here) so the final auto-save can persist live cache state.
@@ -2154,9 +2233,10 @@ func (c *Cache[K, V]) shrinkShardLocked(s *shard[K, V]) int {
 // in tests and immediately before [Cache.Save] so the snapshot
 // reflects every Set/Delete that's already returned.
 //
-// Today Sync waits for the tag-cleanup backlog to reach zero. Future
-// items (async writes, in-flight loader refresh-aheads) will join
-// here without changing the surface.
+// Sync waits for the tag-cleanup backlog AND the [WithAsyncWrites]
+// pending queue (when enabled) to reach zero. Future items
+// (in-flight loader refresh-aheads) will join here without
+// changing the surface.
 func (c *Cache[K, V]) Sync(ctx context.Context) error {
 	if c.closed.Load() {
 		return ErrClosed
@@ -2166,8 +2246,13 @@ func (c *Cache[K, V]) Sync(ctx context.Context) error {
 	}
 	const pollInterval = 100 * time.Microsecond
 	for {
-		if c.tagCleanupBacklog() == 0 {
+		if c.tagCleanupBacklog() == 0 && c.asyncBacklog() == 0 {
 			return nil
+		}
+		// Async writes wait on a signal — nudge the apply
+		// goroutine so a long-idle drain still happens promptly.
+		if c.async != nil && c.asyncBacklog() > 0 {
+			c.signalAsyncApply()
 		}
 		select {
 		case <-ctx.Done():

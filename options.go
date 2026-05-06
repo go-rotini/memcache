@@ -230,6 +230,15 @@ type config struct {
 	// the configured eviction policy. Resolved to its typed form
 	// in [build].
 	store any
+
+	// asyncWrites is set by [WithAsyncWrites]. When true the cache
+	// decouples Set/Delete from the storage update: callers see an
+	// immediate return after a brief enqueue, while a per-cache
+	// apply goroutine drains the per-shard pending maps in the
+	// background. Reads check pending before storage so the
+	// visibility contract (a Set followed by a Get returns the new
+	// value) holds.
+	asyncWrites bool
 }
 
 // defaultConfig returns the package's baseline configuration. It is
@@ -423,6 +432,42 @@ func WithTTLBuckets(slots, tickPerBucket int) Option {
 		c.ttlBuckets = slots
 		c.ttlBucketsTickPerBucket = tickPerBucket
 	}
+}
+
+// WithAsyncWrites decouples [Cache.Set] / [Cache.Delete] from the
+// storage update so the caller sees a fast return at the cost of
+// deferred visibility into long-tail effects (eviction, [Store]
+// write-through, group enforcement). The cache enqueues each
+// operation in a per-shard pending map and drains the pending state
+// from a single per-cache apply goroutine.
+//
+// Visibility contract: a Set followed by a Get on the same key
+// returns the new value, and a Delete followed by a Get returns a
+// miss — the read paths consult the pending map before the
+// storage. Beyond that single-key after-write read, async writes
+// trade strict ordering for throughput:
+//
+//   - Eviction-policy state (LRU position, S3-FIFO frequency, etc.)
+//     and the expiry heap are updated only when the apply goroutine
+//     processes the queued op.
+//   - Hit counters and [WithRefreshAhead] do not fire for reads
+//     served from pending — those promote on apply.
+//   - When [WithStore] is also configured, Store.Set errors during
+//     apply are LOGGED but cannot be returned to the caller (the
+//     caller has already moved on). Synchronous durability requires
+//     leaving WithAsyncWrites disabled.
+//   - [Cache.Compute] and the rest of the Compute family stay
+//     synchronous regardless: they need a transactional view of the
+//     entry and cannot run via the queue.
+//   - [Cache.Sync] blocks until pending is empty; tests that need
+//     to observe the steady state should call it.
+//   - [Cache.Close] drains pending before stopping the apply
+//     goroutine.
+//
+// EXPERIMENTAL in v0; the surface may tighten in v1 once the
+// Caffeine/otter-style throughput targets are validated.
+func WithAsyncWrites() Option {
+	return func(c *config) { c.asyncWrites = true }
 }
 
 // WithStore wires a user-supplied [Store] in behind the cache as the

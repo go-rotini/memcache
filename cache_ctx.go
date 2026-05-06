@@ -44,6 +44,11 @@ func (c *Cache[K, V]) DeleteCtx(ctx context.Context, key K) (bool, error) {
 	if err := ctx.Err(); err != nil {
 		return false, err //nolint:wrapcheck // sentinel surfaces unwrapped for errors.Is
 	}
+	if c.async != nil {
+		// Async path: enqueue and return. The Store error path is
+		// not surfaced — async writes are best-effort by design.
+		return c.asyncDelete(key), nil
+	}
 	removed := c.deleteWithReason(key, EvictReasonDeleted)
 	if c.store == nil {
 		return removed, nil

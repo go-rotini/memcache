@@ -52,6 +52,14 @@ type shard[K comparable, V any] struct {
 	// key seen at that hash; on insert, a different key at the same
 	// hash bumps Stats.HashCollisions. Accessed under shard.mu.
 	hashIndex map[uint64]any
+
+	// pending is populated only when [WithAsyncWrites] is enabled.
+	// Keys map to the latest queued [pendingOp]; coalescing turns
+	// rapid same-key churn into a single applied op. Read paths
+	// consult this map under shard.mu.RLock before falling through
+	// to storage; the apply goroutine drains it under shard.mu.Lock.
+	// nil when async writes are off.
+	pending map[K]pendingOp[K, V]
 }
 
 // newShard constructs a shard with the given policy, budget, TTL
