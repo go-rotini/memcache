@@ -1,0 +1,253 @@
+version: "2"
+
+linters:
+  default: all
+  disable:
+    # Deprecated
+    - wsl
+
+    # Not applicable to this project
+    - bodyclose
+    - rowserrcheck
+    - sqlclosecheck
+    - noctx
+    - spancheck
+    - zerologlint
+    - loggercheck
+    - promlinter
+    - protogetter
+    - ginkgolinter
+    - testifylint
+    - sloglint
+    - unqueryvet
+    - arangolint
+    - gosmopolitan
+
+    # Too opinionated for a low-level cache library
+    - exhaustruct
+    - varnamelen
+    - wsl_v5
+    - nlreturn
+    - noinlineerr
+    - godox
+    - depguard
+    - goheader
+    - gomodguard
+    - lll
+    - gochecknoglobals
+    - ireturn
+    - nonamedreturns
+    - paralleltest
+    - tparallel
+    - testpackage
+    - mnd
+    - funcorder
+    - containedctx    # context in loader/decoder structs is by design
+    - tagliatelle     # struct tags use cache-specific conventions, not generic casing
+    - forbidigo
+    - exhaustive      # switch exhaustiveness on internal token types is intentional
+    - recvcheck       # numeric helpers intentionally mix value/pointer receivers
+
+  settings:
+    cyclop:
+      max-complexity: 25
+
+    gocognit:
+      min-complexity: 40
+
+    gocyclo:
+      min-complexity: 25
+
+    funlen:
+      lines: 120
+      statements: 80
+      ignore-comments: true
+
+    nestif:
+      min-complexity: 10
+
+    goconst:
+      min-len: 5
+      min-occurrences: 5
+
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - style
+        - performance
+        - opinionated
+      disabled-checks:
+        - hugeParam
+        - rangeValCopy
+        - unnamedResult
+
+    revive:
+      rules:
+        - name: blank-imports
+        - name: context-as-argument
+        - name: dot-imports
+        - name: error-naming
+        - name: error-return
+        - name: error-strings
+        - name: exported
+        - name: increment-decrement
+        - name: indent-error-flow
+        - name: range
+        - name: receiver-naming
+        - name: redefines-builtin-id
+        - name: superfluous-else
+        - name: time-naming
+        - name: unexported-return
+        - name: unreachable-code
+        - name: var-declaration
+        - name: var-naming
+
+    errcheck:
+      check-type-assertions: false
+      check-blank: true
+
+    gosec:
+      excludes:
+        - G304
+        - G115
+        - G404   # math/rand is fine for TTL jitter
+
+    nakedret:
+      max-func-lines: 10
+
+    misspell:
+      locale: US
+
+    interfacebloat:
+      max: 8
+
+    wrapcheck:
+      ignore-interface-regexps:
+        - "Loader"
+        - "Marshaler"
+        - "Unmarshaler"
+        - "Codec"
+        - "Store"
+        - "io\\.Writer"
+      ignore-sig-regexps:
+        - "io\\.Writer\\)\\.Write"
+        - "io\\.Reader\\)\\.Read"
+      ignore-package-globs:
+        - "strconv"
+        - "encoding/base64"
+        - "encoding/gob"
+        - "encoding/json"
+        - "encoding/binary"
+
+    perfsprint:
+      strconcat: false
+
+    godot:
+      scope: toplevel
+
+    maintidx:
+      under: 15
+
+    prealloc:
+      simple: true
+      for-loops: true
+
+  exclusions:
+    presets:
+      - comments
+      - common-false-positives
+      - std-error-handling
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gosec
+          - forcetypeassert
+          - dupl
+          - cyclop
+          - gocognit
+          - gocyclo
+          - funlen
+          - goconst
+          - maintidx
+          - wrapcheck
+          - err113
+          - exhaustive
+          - makezero
+          - unparam
+          - nestif
+          - godot
+          - gocritic
+          - prealloc
+          - perfsprint
+          - errorlint
+          - inamedparam
+          - embeddedstructfieldcheck
+          - modernize
+          - unconvert
+          - revive
+          - misspell
+          - intrange
+          - testableexamples
+          - staticcheck
+          - tagalign
+          - errchkjson
+
+      # Eviction policy implementations have inherent complexity
+      - path: s3fifo\.go
+        linters:
+          - cyclop
+          - gocognit
+          - gocyclo
+          - funlen
+          - maintidx
+          - nestif
+
+      - path: tinylfu\.go
+        linters:
+          - cyclop
+          - gocognit
+          - gocyclo
+          - funlen
+          - maintidx
+          - nestif
+
+      - path: arc\.go
+        linters:
+          - cyclop
+          - gocognit
+          - gocyclo
+          - funlen
+          - maintidx
+          - nestif
+
+      - path: lfu\.go
+        linters:
+          - cyclop
+          - gocognit
+          - gocyclo
+          - funlen
+          - maintidx
+          - nestif
+
+      - path: encode\.go
+        linters:
+          - cyclop
+          - gocognit
+          - gocyclo
+          - funlen
+          - maintidx
+          - nestif
+
+      - path: decode\.go
+        linters:
+          - cyclop
+          - gocognit
+          - gocyclo
+          - funlen
+          - maintidx
+          - nestif
+
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
