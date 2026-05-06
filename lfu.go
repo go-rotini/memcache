@@ -216,3 +216,14 @@ func (l *lfuList[K, V]) remove(n *lfuNode[K, V]) {
 	}
 	n.next, n.prev = nil, nil
 }
+
+// Snapshot returns a [PolicyDetailLFU] summarizing the policy's
+// current state.
+func (p *lfuPolicy[K, V]) Snapshot() any {
+	return PolicyDetailLFU{Size: p.size, DistinctBuckets: len(p.buckets)}
+}
+
+// PromotionNeeded reports true — LFU updates the entry's frequency
+// bucket on every access. Returning false would silently sabotage
+// hit rate.
+func (p *lfuPolicy[K, V]) PromotionNeeded(*entry[K, V]) bool { return true }

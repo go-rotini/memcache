@@ -7,6 +7,15 @@ package memcache
 // The policy is informed of every cache state change so it can
 // maintain its own ordering structure. When the shard exceeds its
 // budget, the cache repeatedly calls Victim until the budget is met.
+//
+// The interface intentionally exceeds the linter's 8-method
+// preference: each method covers a distinct responsibility (insert,
+// access, update, remove, victim selection, fast-path eligibility,
+// budget reconfiguration, capacity introspection, diagnostics,
+// reset) and splitting them produces interface acrobatics with no
+// composition benefit.
+//
+//nolint:interfacebloat // see comment above
 type evictionPolicy[K comparable, V any] interface {
 	// OnInsert is called after a new entry is added to the shard's
 	// map.
@@ -51,6 +60,75 @@ type evictionPolicy[K comparable, V any] interface {
 	// eviction; that remains the cache's responsibility through
 	// subsequent calls to Victim.
 	SetBudget(budget int)
+
+	// Snapshot returns a per-policy diagnostic struct describing the
+	// policy's current state (queue sizes, sketch fill, etc.).
+	// Surfaced via [Stats.PolicyDetail] for `:cache stats`-style
+	// REPL diagnostics. Implementations should return concrete
+	// structs by value; nil is acceptable when the policy has no
+	// useful detail to report. Called under the shard's read lock.
+	Snapshot() any
+
+	// PromotionNeeded reports whether OnAccess(e) would mutate
+	// policy state. Returning false lets [Cache.Get] complete the
+	// hit under a read lock instead of upgrading to a write lock —
+	// the read fast path. Implementations may return false
+	// pessimistically; the worst case is the cache pays for an
+	// unnecessary write lock, which is no worse than today's
+	// always-write-lock behavior.
+	//
+	// Called under the shard's read lock; reads of mutable per-
+	// entry policy state may observe values from a concurrent
+	// OnAccess on another goroutine. False positives ("yes,
+	// promote") force a write-lock retry, which re-reads under
+	// stable conditions; false negatives ("no, skip") would skip a
+	// real promotion and degrade hit rate without breaking
+	// correctness — implementations should err on the side of
+	// returning true.
+	PromotionNeeded(e *entry[K, V]) bool
+}
+
+// PolicyDetailLRU is the [evictionPolicy.Snapshot] payload for
+// [PolicyLRU]. The list size equals the shard's entry count.
+type PolicyDetailLRU struct {
+	Size int
+}
+
+// PolicyDetailFIFO is the snapshot payload for [PolicyFIFO].
+type PolicyDetailFIFO struct {
+	Size int
+}
+
+// PolicyDetailLFU is the snapshot payload for [PolicyLFU]; reports
+// the number of distinct frequency buckets currently populated.
+type PolicyDetailLFU struct {
+	Size            int
+	DistinctBuckets int
+}
+
+// PolicyDetailS3FIFO is the snapshot payload for [PolicyS3FIFO].
+// Sizes are the per-region counts; ghost is a key-only queue with
+// no associated entries.
+type PolicyDetailS3FIFO struct {
+	SmallSize, MainSize, GhostSize int
+	SmallBudget, MainBudget        int
+}
+
+// PolicyDetailTinyLFU is the snapshot payload for [PolicyTinyLFU].
+type PolicyDetailTinyLFU struct {
+	WindowSize, MainSize int
+	SketchOps            uint64
+}
+
+// PolicyDetail2Q is the snapshot payload for [Policy2Q].
+type PolicyDetail2Q struct {
+	A1inSize, AmSize, A1outSize int
+}
+
+// PolicyDetailARC is the snapshot payload for [PolicyARC].
+type PolicyDetailARC struct {
+	T1Size, T2Size, B1Size, B2Size int
+	P                              int
 }
 
 // policyConfig bundles the construction-time parameters that

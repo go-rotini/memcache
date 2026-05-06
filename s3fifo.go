@@ -369,3 +369,24 @@ func (p *s3fifoPolicy[K, V]) unlinkGhost(g *s3GhostNode[K]) {
 	g.next, g.prev = nil, nil
 	p.ghostSize--
 }
+
+// Snapshot returns a [PolicyDetailS3FIFO] summarizing the policy's
+// current state.
+func (p *s3fifoPolicy[K, V]) Snapshot() any {
+	return PolicyDetailS3FIFO{
+		SmallSize: p.smallSize, MainSize: p.mainSize, GhostSize: p.ghostSize,
+		SmallBudget: p.smallBudget, MainBudget: p.mainBudget,
+	}
+}
+
+// PromotionNeeded reports false once the entry's freq counter has
+// saturated at [s3FreqMax]; further accesses produce no state
+// change, so the cache can serve them under a read lock. Other
+// states need a write lock so OnAccess can bump freq.
+func (p *s3fifoPolicy[K, V]) PromotionNeeded(e *entry[K, V]) bool {
+	n, ok := e.policyData.(*s3Node[K, V])
+	if !ok || n == nil {
+		return true
+	}
+	return n.freq < s3FreqMax
+}

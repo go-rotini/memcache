@@ -130,3 +130,17 @@ func (p *lruPolicy[K, V]) unlink(n *lruNode[K, V]) {
 	n.next = nil
 	n.prev = nil
 }
+
+// Snapshot returns a [PolicyDetailLRU] summarizing the policy's
+// current state.
+func (p *lruPolicy[K, V]) Snapshot() any {
+	return PolicyDetailLRU{Size: p.size}
+}
+
+// PromotionNeeded reports whether an access would change the LRU
+// position. The cheap check would be "is this entry already at the
+// head?" — but the head is a moving target under concurrent reads,
+// and the read-fast-path policy is to err on the side of returning
+// true (a write-lock retry is cheap; a missed promotion degrades
+// hit rate). LRU therefore always returns true.
+func (p *lruPolicy[K, V]) PromotionNeeded(*entry[K, V]) bool { return true }

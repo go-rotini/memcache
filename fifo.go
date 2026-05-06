@@ -98,3 +98,14 @@ func (p *fifoPolicy[K, V]) Reset() {
 	p.tail = nil
 	p.size = 0
 }
+
+// Snapshot returns a [PolicyDetailFIFO] summarizing the policy's
+// current state.
+func (p *fifoPolicy[K, V]) Snapshot() any {
+	return PolicyDetailFIFO{Size: p.size}
+}
+
+// PromotionNeeded reports false unconditionally — FIFO never
+// promotes on access, so the read fast path can serve every hit
+// under a read lock.
+func (p *fifoPolicy[K, V]) PromotionNeeded(*entry[K, V]) bool { return false }

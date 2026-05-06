@@ -174,6 +174,64 @@ func TestStatsLastResetAt(t *testing.T) {
 	}
 }
 
+func TestStatsPolicyDetailLRU(t *testing.T) {
+	c, _ := New[string, int](WithMaxEntries(8), WithPolicy(PolicyLRU), WithShards(1))
+	defer c.Close()
+	for i := range 3 {
+		_ = c.Set(itoaSimple(i), i)
+	}
+	d, ok := c.Stats().PolicyDetail.(PolicyDetailLRU)
+	if !ok {
+		t.Fatalf("PolicyDetail type = %T, want PolicyDetailLRU", c.Stats().PolicyDetail)
+	}
+	if d.Size != 3 {
+		t.Errorf("Size = %d, want 3", d.Size)
+	}
+}
+
+func TestStatsPolicyDetailS3FIFO(t *testing.T) {
+	c, _ := New[string, int](WithMaxEntries(8), WithPolicy(PolicyS3FIFO), WithShards(1))
+	defer c.Close()
+	_ = c.Set("a", 1)
+	d, ok := c.Stats().PolicyDetail.(PolicyDetailS3FIFO)
+	if !ok {
+		t.Fatalf("PolicyDetail type = %T, want PolicyDetailS3FIFO", c.Stats().PolicyDetail)
+	}
+	if d.SmallSize+d.MainSize != 1 {
+		t.Errorf("SmallSize+MainSize = %d, want 1", d.SmallSize+d.MainSize)
+	}
+}
+
+func TestStatsLoadLatency(t *testing.T) {
+	clk := NewFakeClock(time.Unix(0, 0))
+	loader := LoaderFunc[string, int](func(context.Context, string) (int, time.Duration, error) {
+		// Each loader call advances the fake clock by 5ms before
+		// returning, so the histogram records that exact duration.
+		clk.Advance(5 * time.Millisecond)
+		return 1, 0, nil
+	})
+	c, _ := New[string, int](
+		WithMaxEntries(8),
+		WithClock(clk),
+		WithLoader(loader),
+	)
+	defer c.Close()
+
+	for i := range 5 {
+		_, _ = c.GetOrLoad(context.Background(), itoaSimple(i))
+	}
+	st := c.Stats()
+	if st.LoadLatency == 0 {
+		t.Error("LoadLatency must be non-zero after loader runs")
+	}
+	if st.LoadLatencyP50 < 1*time.Millisecond {
+		t.Errorf("LoadLatencyP50 = %v, expected within 5ms bucket", st.LoadLatencyP50)
+	}
+	if st.LoadLatencyP99 < 1*time.Millisecond {
+		t.Errorf("LoadLatencyP99 = %v, expected within 5ms bucket", st.LoadLatencyP99)
+	}
+}
+
 func TestStatsRefreshAheadAndSWRCounters(t *testing.T) {
 	clk := NewFakeClock(time.Unix(0, 0))
 	loaderHits := 0

@@ -384,3 +384,18 @@ func (p *tinyLFUPolicy[K, V]) unlinkSegment(n *tinyLFUNode[K, V], head, tail **t
 	n.next, n.prev = nil, nil
 	*size--
 }
+
+// Snapshot returns a [PolicyDetailTinyLFU] summarizing the policy's
+// current state.
+func (p *tinyLFUPolicy[K, V]) Snapshot() any {
+	return PolicyDetailTinyLFU{
+		WindowSize: p.windowSize,
+		MainSize:   p.protectedSize + p.probationarySize,
+		SketchOps:  p.ops,
+	}
+}
+
+// PromotionNeeded reports true — TinyLFU's OnAccess always bumps
+// the frequency sketch and may move the entry between Window and
+// the Main LRU. The fast path is therefore not safe.
+func (p *tinyLFUPolicy[K, V]) PromotionNeeded(*entry[K, V]) bool { return true }

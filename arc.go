@@ -401,3 +401,18 @@ func (p *arcPolicy[K, V]) unlinkB2(g *arcGhostNode[K]) {
 	g.next, g.prev = nil, nil
 	p.b2Size--
 }
+
+// Snapshot returns a [PolicyDetailARC] summarizing the policy's
+// current state.
+func (p *arcPolicy[K, V]) Snapshot() any {
+	return PolicyDetailARC{
+		T1Size: p.t1Size, T2Size: p.t2Size,
+		B1Size: p.b1Size, B2Size: p.b2Size,
+		P: p.p,
+	}
+}
+
+// PromotionNeeded reports true — ARC may move entries between T1
+// and T2 on access and adjust the adaptive parameter p, so the
+// fast path is not safe.
+func (p *arcPolicy[K, V]) PromotionNeeded(*entry[K, V]) bool { return true }

@@ -295,3 +295,13 @@ func (p *twoQPolicy[K, V]) unlinkGhost(g *twoQGhostNode[K]) {
 	g.next, g.prev = nil, nil
 	p.outSize--
 }
+
+// Snapshot returns a [PolicyDetail2Q] summarizing the policy's
+// current state.
+func (p *twoQPolicy[K, V]) Snapshot() any {
+	return PolicyDetail2Q{A1inSize: p.inSize, AmSize: p.amSize, A1outSize: p.outSize}
+}
+
+// PromotionNeeded reports true — 2Q may promote A1in → Am on
+// access, so the fast path is not safe.
+func (p *twoQPolicy[K, V]) PromotionNeeded(*entry[K, V]) bool { return true }

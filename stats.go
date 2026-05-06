@@ -5,6 +5,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/go-rotini/memcache/internal/tdigest"
 )
 
 // Stats is a point-in-time snapshot of per-cache statistics.
@@ -133,6 +135,26 @@ type Stats struct {
 	// [Policy.String].
 	PolicyName string
 
+	// PolicyDetail is the per-policy diagnostic struct returned by
+	// [evictionPolicy.Snapshot] for shard 0; concrete type depends
+	// on the configured policy ([PolicyDetailLRU] / [PolicyDetailS3FIFO]
+	// / etc.). Use a type switch or assertion when consuming.
+	// nil when the cache has no shards (degenerate state).
+	PolicyDetail any
+
+	// LoadLatency is the arithmetic mean of every Loader call that
+	// completed since the last [Cache.ResetStats].
+	LoadLatency time.Duration
+
+	// LoadLatencyP50 is the median Loader-call duration. Computed
+	// from a fixed-bucket log-spaced histogram with roughly half-
+	// bucket precision (see [internal/tdigest]).
+	LoadLatencyP50 time.Duration
+
+	// LoadLatencyP99 is the 99th-percentile Loader-call duration.
+	// Same precision caveat as P50.
+	LoadLatencyP99 time.Duration
+
 	// Entries is the current number of entries in the cache (live
 	// Len at snapshot time).
 	Entries int64
@@ -198,6 +220,11 @@ type statsCounters struct {
 	resizes              atomic.Uint64
 	tagInvalidations     atomic.Uint64
 
+	// loadLatency tracks Loader-call duration for the
+	// [Stats.LoadLatency] / P50 / P99 fields. Pointer so the
+	// counter has a stable address through reset.
+	loadLatency *tdigest.Histogram
+
 	// Wall-clock timestamps. createdAt is set once by New and never
 	// reset; lastSnapshotAt and lastResetAt are stamped on the
 	// corresponding events. All three are protected by tsMu so the
@@ -218,7 +245,10 @@ type statsCounters struct {
 // now stamps createdAt so [Stats.Uptime] is computable from the
 // first Stats call onward.
 func newStatsCounters(sharded bool, now time.Time) *statsCounters {
-	c := &statsCounters{createdAt: now}
+	c := &statsCounters{
+		createdAt:   now,
+		loadLatency: &tdigest.Histogram{},
+	}
 	if sharded {
 		slots := shardedStatsSize(runtime.GOMAXPROCS(0))
 		c.hitsShard = newShardedCounter(slots)
@@ -318,6 +348,12 @@ func (s *statsCounters) snapshot(now time.Time) Stats {
 	out.LastSnapshotAt = s.lastSnapshotAt
 	out.LastResetAt = s.lastResetAt
 	s.tsMu.Unlock()
+	if s.loadLatency != nil {
+		ls := s.loadLatency.Snapshot()
+		out.LoadLatency = ls.Mean
+		out.LoadLatencyP50 = ls.P50
+		out.LoadLatencyP99 = ls.P99
+	}
 	for i := range out.EvictionsByReason {
 		out.EvictionsByReason[i] = s.evictionsByReason[i].Load()
 	}
@@ -355,6 +391,9 @@ func (s *statsCounters) reset() {
 	s.negativeHits.Store(0)
 	s.resizes.Store(0)
 	s.tagInvalidations.Store(0)
+	if s.loadLatency != nil {
+		s.loadLatency.Reset()
+	}
 	for i := range s.evictionsByReason {
 		s.evictionsByReason[i].Store(0)
 	}

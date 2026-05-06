@@ -639,6 +639,16 @@ func (c *Cache[K, V]) Stats() Stats {
 	if c.tags != nil {
 		s.TagsTracked = c.tags.distinctTagCount()
 	}
+	// PolicyDetail samples shard 0's policy. All shards share the
+	// concrete policy type, so the shape is stable; the values
+	// describe a single shard's state and should be read as
+	// representative rather than cache-wide.
+	if len(c.shards) > 0 {
+		sh := c.shards[0]
+		sh.mu.RLock()
+		s.PolicyDetail = sh.policy.Snapshot()
+		sh.mu.RUnlock()
+	}
 	return s
 }
 
@@ -708,6 +718,13 @@ func (c *Cache[K, V]) Peek(key K) (V, bool) {
 // When [WithStaleWhileRevalidate] is enabled, a hit on an entry
 // whose TTL has elapsed by less than `staleFor` returns the stale
 // value AND triggers an asynchronous Loader refresh.
+//
+// Implementation note: a read-lock fast path serves hits where the
+// configured eviction policy doesn't need promotion (FIFO always,
+// S3-FIFO at freq saturation), the entry has no sliding TTL, and
+// no refresh-ahead window applies. The slow path takes the shard
+// write lock so policy promotion and side-effects can proceed
+// safely.
 func (c *Cache[K, V]) Get(key K) (V, bool) {
 	var zero V
 	if c.closed.Load() {
@@ -716,6 +733,29 @@ func (c *Cache[K, V]) Get(key K) (V, bool) {
 	s := c.shardFor(key)
 	now := c.cfg.clock.Now().UnixNano()
 
+	// Fast path: try to serve under the shard read lock.
+	s.mu.RLock()
+	if e, ok := s.entries[key]; ok &&
+		!c.entryExpiredLocked(e, now) &&
+		!e.flags.has(flagNegative) &&
+		!e.flags.has(flagSliding) &&
+		!s.policy.PromotionNeeded(e) &&
+		!c.shouldRefreshAhead(e, now) {
+		// Pure read — `hits` is atomic so we can bump it under
+		// RLock; the value copy lands while still locked so a
+		// concurrent eviction can't pool the entry mid-read.
+		e.hits.Add(1)
+		val := e.value
+		s.mu.RUnlock()
+		c.recordHitObserve(key)
+		c.fireHit(key, val)
+		return c.returnValue(val), true
+	}
+	s.mu.RUnlock()
+
+	// Slow path: full Get under the shard write lock. Re-validates
+	// every condition because the entry may have been evicted or
+	// mutated between RUnlock and Lock.
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -2337,7 +2377,9 @@ func (c *Cache[K, V]) runLoader(
 		}
 	}
 
+	loadStart := c.cfg.clock.Now()
 	val, ttl, err := fn(loaderCtx, key)
+	c.counters.loadLatency.Record(c.cfg.clock.Now().Sub(loadStart))
 	flight.val = val
 	flight.ttl = ttl
 	flight.err = err
