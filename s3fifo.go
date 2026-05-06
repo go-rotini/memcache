@@ -105,7 +105,14 @@ func (p *s3fifoPolicy[K, V]) SetBudget(budget int) {
 }
 
 // OnInsert places e into Main if its key is in the Ghost queue,
-// otherwise into Small. Either way, freq starts at 0.
+// otherwise into Small. Fresh Small entries start at freq=0; Ghost-
+// rebirth entries start at freq=1 so they survive at least one Main
+// second-chance pass, which prevents the just-inserted entry from
+// being chosen as the Main victim by the same operation's post-insert
+// eviction loop (the entry sits at mainHead, and a freq=0 mainHead is
+// the immediate eviction target whenever Main is over budget — most
+// commonly because the same Victim call promoted Small entries to
+// Main, pushing it over).
 func (p *s3fifoPolicy[K, V]) OnInsert(e *entry[K, V]) {
 	n := &s3Node[K, V]{entry: e}
 	e.policyData = n
@@ -114,6 +121,7 @@ func (p *s3fifoPolicy[K, V]) OnInsert(e *entry[K, V]) {
 		// place directly into Main and clear the Ghost record.
 		p.unlinkGhost(g)
 		n.inMain = true
+		n.freq = 1
 		p.pushMainTail(n)
 	} else {
 		p.pushSmallTail(n)

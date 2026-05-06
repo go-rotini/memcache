@@ -1,0 +1,2 @@
+go test fuzz v1
+[]byte("&\xfa00010807090B020A0C0\xfa")
