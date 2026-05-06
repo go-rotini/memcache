@@ -702,8 +702,15 @@ func (c *Cache[K, V]) GetWithExpiry(key K) (V, time.Time, bool) {
 }
 
 // Set stores value under key with the cache's default TTL.
+//
+// If V implements [CacheTTLer], the value's CacheTTL() overrides
+// [WithDefaultTTL] (use [Cache.SetWithTTL] when you need to bypass
+// the value's preference). If V implements [CacheTagger], its
+// CacheTags() are merged into the entry's tag set.
 func (c *Cache[K, V]) Set(key K, value V) error {
-	return c.setLocked(key, value, c.cfg.defaultTTL, c.cfg.slidingTTL, nil)
+	ttl := extractCacheableTTL(value, c.cfg.defaultTTL)
+	tags := extractCacheableTags(value)
+	return c.setLocked(key, value, ttl, c.cfg.slidingTTL, tags)
 }
 
 // SetWithTTL stores value under key with the given TTL. A TTL of 0

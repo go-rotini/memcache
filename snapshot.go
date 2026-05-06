@@ -355,15 +355,16 @@ func (c *Cache[K, V]) writeHeader(w io.Writer, count int64) error {
 	return nil
 }
 
-// writeRecord emits one entry's serialized form. Key and value go
-// through the cache's [Codec]; the rest of the metadata is fixed
-// width.
+// writeRecord emits one entry's serialized form. Key goes through
+// the cache's [Codec]. Value goes through [SnapshotMarshaler] when
+// the value's type implements it; otherwise through the codec.
+// The rest of the metadata is fixed-width.
 func (c *Cache[K, V]) writeRecord(w io.Writer, snap *entrySnapshot[K, V]) error {
 	keyBytes, err := c.cfg.codec.Marshal(snap.key)
 	if err != nil {
 		return wrapSaveErr("key marshal", err)
 	}
-	valBytes, err := c.cfg.codec.Marshal(snap.value)
+	valBytes, err := c.marshalValue(snap.value)
 	if err != nil {
 		return wrapSaveErr("value marshal", err)
 	}
@@ -399,6 +400,33 @@ func (c *Cache[K, V]) writeRecord(w io.Writer, snap *entrySnapshot[K, V]) error 
 		}
 	}
 	return nil
+}
+
+// marshalValue runs the snapshot encoding for a value. When the
+// value's type implements [SnapshotMarshaler] the cache delegates
+// to it; otherwise the cache's [Codec] handles encoding. Both V
+// and *V are tried so types whose Marshal method has a pointer
+// receiver work even when V is a value type.
+func (c *Cache[K, V]) marshalValue(value V) ([]byte, error) {
+	if m, ok := any(value).(SnapshotMarshaler); ok {
+		return m.SnapshotMarshal()
+	}
+	if m, ok := any(&value).(SnapshotMarshaler); ok {
+		return m.SnapshotMarshal()
+	}
+	return c.cfg.codec.Marshal(value)
+}
+
+// unmarshalValue runs the snapshot decoding for a value. dst MUST
+// be a pointer to V so the value can be mutated in place.
+func (c *Cache[K, V]) unmarshalValue(b []byte, dst *V) error {
+	if u, ok := any(*dst).(SnapshotUnmarshaler); ok {
+		return u.SnapshotUnmarshal(b)
+	}
+	if u, ok := any(dst).(SnapshotUnmarshaler); ok {
+		return u.SnapshotUnmarshal(b)
+	}
+	return c.cfg.codec.Unmarshal(b, dst)
 }
 
 // readSnapshotHeader parses magic/version/codec/name/saveTime/count
@@ -479,7 +507,7 @@ func (c *Cache[K, V]) readRecord(r io.Reader, h hash.Hash32) (entrySnapshot[K, V
 	if err := c.cfg.codec.Unmarshal(keyBytes, &snap.key); err != nil {
 		return snap, &SnapshotError{Op: "load", Message: "key unmarshal", Err: err}
 	}
-	if err := c.cfg.codec.Unmarshal(valBytes, &snap.value); err != nil {
+	if err := c.unmarshalValue(valBytes, &snap.value); err != nil {
 		return snap, &SnapshotError{Op: "load", Message: "value unmarshal", Err: err}
 	}
 
