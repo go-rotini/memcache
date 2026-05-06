@@ -65,6 +65,18 @@ type config struct {
 	// while a background Loader refreshes it.
 	swrStaleFor time.Duration
 
+	// eventsBuffer is the per-subscriber default buffer size used
+	// by [Cache.Subscribe] when the caller passes buf <= 0.
+	eventsBuffer int
+
+	// Hook callbacks. Each is type-erased into the config and
+	// type-asserted into the typed shape at cache construction.
+	onHit    any // func(K, V)
+	onMiss   any // func(K)
+	onEvict  any // func(K, V, EvictionReason)
+	onExpire any // func(K, V)
+	onLoad   any // func(K, V, time.Duration, error)
+
 	// Eviction and admission.
 	policy Policy
 
@@ -316,6 +328,77 @@ func WithRefreshAhead(refreshAt float64) Option {
 // staleFor <= 0 disables SWR.
 func WithStaleWhileRevalidate(staleFor time.Duration) Option {
 	return func(c *config) { c.swrStaleFor = staleFor }
+}
+
+// WithEventsBuffer sets the default buffer size used by
+// [Cache.Subscribe] when the caller does not supply an explicit
+// size. Default 64.
+func WithEventsBuffer(n int) Option {
+	return func(c *config) {
+		if n > 0 {
+			c.eventsBuffer = n
+		}
+	}
+}
+
+// WithOnHit registers a synchronous callback invoked on every Get
+// hit. The callback runs under the shard write lock; slow
+// callbacks block the Get path. For asynchronous notification use
+// [Cache.Subscribe] instead.
+func WithOnHit[K comparable, V any](fn func(key K, value V)) Option {
+	return func(c *config) {
+		if fn != nil {
+			c.onHit = fn
+		}
+	}
+}
+
+// WithOnMiss registers a synchronous callback invoked on every Get
+// miss (including expired and negative-tombstone hits). Runs under
+// the shard write lock.
+func WithOnMiss[K comparable](fn func(key K)) Option {
+	return func(c *config) {
+		if fn != nil {
+			c.onMiss = fn
+		}
+	}
+}
+
+// WithOnEvict registers a synchronous callback invoked when an
+// entry is removed for any reason OTHER than TTL expiry. The
+// callback receives the key, the (now-pool-bound) value, and the
+// reason. Runs under the shard write lock.
+func WithOnEvict[K comparable, V any](fn func(key K, value V, reason EvictionReason)) Option {
+	return func(c *config) {
+		if fn != nil {
+			c.onEvict = fn
+		}
+	}
+}
+
+// WithOnExpire registers a synchronous callback invoked when an
+// entry is removed because its TTL has elapsed (lazy or janitor
+// path) or because [WithExpireFunc] returned true. Distinct from
+// [WithOnEvict] so callers can react differently to natural
+// expiration vs capacity-driven eviction.
+func WithOnExpire[K comparable, V any](fn func(key K, value V)) Option {
+	return func(c *config) {
+		if fn != nil {
+			c.onExpire = fn
+		}
+	}
+}
+
+// WithOnLoad registers a synchronous callback invoked after every
+// Loader completion (success or failure). The callback receives
+// the key, the loaded value (or zero V on error), the TTL the
+// Loader returned (or 0), and the error.
+func WithOnLoad[K comparable, V any](fn func(key K, value V, ttl time.Duration, err error)) Option {
+	return func(c *config) {
+		if fn != nil {
+			c.onLoad = fn
+		}
+	}
 }
 
 // WithExpireFunc registers a per-entry expiry predicate. On each

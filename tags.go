@@ -129,6 +129,13 @@ func (c *Cache[K, V]) InvalidateTag(tag string) int {
 		}
 		s.mu.Unlock()
 	}
+	if count > 0 {
+		c.publishEvent(Event[K, V]{
+			Kind: EventInvalidateTag,
+			At:   c.cfg.clock.Now(),
+			Tags: []string{tag},
+		})
+	}
 	return count
 }
 
@@ -154,6 +161,13 @@ func (c *Cache[K, V]) InvalidateTags(tags ...string) int {
 			count++
 		}
 		s.mu.Unlock()
+	}
+	if count > 0 {
+		c.publishEvent(Event[K, V]{
+			Kind: EventInvalidateTag,
+			At:   c.cfg.clock.Now(),
+			Tags: append([]string(nil), tags...),
+		})
 	}
 	return count
 }

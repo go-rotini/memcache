@@ -42,6 +42,19 @@ type Cache[K comparable, V any] struct {
 	// memory cost beyond the struct itself.
 	tags *tagIndex[K]
 
+	// events is the cache-level fan-out bus used by Subscribe.
+	// Always non-nil; with no subscribers, publish acquires the
+	// bus's RLock and immediately returns.
+	events *eventBus[K, V]
+
+	// Resolved hook callbacks. Any of these may be nil when the
+	// corresponding [WithOnXxx] option was not supplied.
+	onHit    func(K, V)
+	onMiss   func(K)
+	onEvict  func(K, V, EvictionReason)
+	onExpire func(K, V)
+	onLoad   func(K, V, time.Duration, error)
+
 	shards    []*shard[K, V]
 	shardMask uint64
 
@@ -130,6 +143,10 @@ func build[K comparable, V any](cfg *config, allowUnbounded bool) (*Cache[K, V],
 	if err != nil {
 		return nil, err
 	}
+	hooks, err := resolveHooks[K, V](cfg)
+	if err != nil {
+		return nil, err
+	}
 
 	if cfg.maxBytes > 0 && weigher == nil {
 		return nil, &ConfigError{
@@ -147,6 +164,12 @@ func build[K comparable, V any](cfg *config, allowUnbounded bool) (*Cache[K, V],
 		loader:     loader,
 		expireFunc: expireFunc,
 		tags:       newTagIndex[K](),
+		events:     newEventBus[K, V](),
+		onHit:      hooks.onHit,
+		onMiss:     hooks.onMiss,
+		onEvict:    hooks.onEvict,
+		onExpire:   hooks.onExpire,
+		onLoad:     hooks.onLoad,
 		shards:     make([]*shard[K, V], shardCount),
 		shardMask:  uint64(shardCount - 1),
 		counters:   &statsCounters{},
@@ -229,6 +252,75 @@ func resolveExpireFunc[K comparable, V any](raw any) (func(K, V, Metadata) bool,
 		}
 	}
 	return fn, nil
+}
+
+// resolvedHooks bundles every typed hook callback resolved from the
+// type-erased fields on config. Each field may be nil when the
+// corresponding [WithOnXxx] option was not supplied.
+type resolvedHooks[K comparable, V any] struct {
+	onHit    func(K, V)
+	onMiss   func(K)
+	onEvict  func(K, V, EvictionReason)
+	onExpire func(K, V)
+	onLoad   func(K, V, time.Duration, error)
+}
+
+// resolveHooks type-asserts every WithOn* option from cfg into its
+// typed shape. A type-mismatch in any one of them surfaces as a
+// [*ConfigError] keyed on the misconfigured option name.
+func resolveHooks[K comparable, V any](cfg *config) (resolvedHooks[K, V], error) {
+	var out resolvedHooks[K, V]
+	if cfg.onHit != nil {
+		fn, ok := cfg.onHit.(func(K, V))
+		if !ok {
+			return out, &ConfigError{
+				Field:   "OnHit",
+				Message: fmt.Sprintf("type mismatch: hook does not match cache type parameters (%T)", cfg.onHit),
+			}
+		}
+		out.onHit = fn
+	}
+	if cfg.onMiss != nil {
+		fn, ok := cfg.onMiss.(func(K))
+		if !ok {
+			return out, &ConfigError{
+				Field:   "OnMiss",
+				Message: fmt.Sprintf("type mismatch: hook does not match cache key type (%T)", cfg.onMiss),
+			}
+		}
+		out.onMiss = fn
+	}
+	if cfg.onEvict != nil {
+		fn, ok := cfg.onEvict.(func(K, V, EvictionReason))
+		if !ok {
+			return out, &ConfigError{
+				Field:   "OnEvict",
+				Message: fmt.Sprintf("type mismatch: hook does not match cache type parameters (%T)", cfg.onEvict),
+			}
+		}
+		out.onEvict = fn
+	}
+	if cfg.onExpire != nil {
+		fn, ok := cfg.onExpire.(func(K, V))
+		if !ok {
+			return out, &ConfigError{
+				Field:   "OnExpire",
+				Message: fmt.Sprintf("type mismatch: hook does not match cache type parameters (%T)", cfg.onExpire),
+			}
+		}
+		out.onExpire = fn
+	}
+	if cfg.onLoad != nil {
+		fn, ok := cfg.onLoad.(func(K, V, time.Duration, error))
+		if !ok {
+			return out, &ConfigError{
+				Field:   "OnLoad",
+				Message: fmt.Sprintf("type mismatch: hook does not match cache type parameters (%T)", cfg.onLoad),
+			}
+		}
+		out.onLoad = fn
+	}
+	return out, nil
 }
 
 // resolveLoader returns the typed Loader[K, V] from a type-erased
@@ -392,6 +484,7 @@ func (c *Cache[K, V]) Get(key K) (V, bool) {
 	e, ok := s.entries[key]
 	if !ok {
 		c.recordMiss()
+		c.fireMiss(key)
 		return zero, false
 	}
 	if c.entryExpiredLocked(e, now) {
@@ -401,15 +494,18 @@ func (c *Cache[K, V]) Get(key K) (V, bool) {
 			e.hits.Add(1)
 			s.policy.OnAccess(e)
 			c.recordHit()
+			c.fireHit(key, e.value)
 			return e.value, true
 		}
 		c.removeLocked(s, e, EvictReasonExpired)
 		c.counters.expirations.Add(1)
 		c.recordMiss()
+		c.fireMiss(key)
 		return zero, false
 	}
 	if e.flags.has(flagNegative) {
 		c.recordMiss()
+		c.fireMiss(key)
 		return zero, false
 	}
 	e.hits.Add(1)
@@ -421,7 +517,25 @@ func (c *Cache[K, V]) Get(key K) (V, bool) {
 		c.triggerAsyncRefreshLocked(s, key)
 	}
 	c.recordHit()
+	c.fireHit(key, e.value)
 	return e.value, true
+}
+
+// fireHit invokes the configured OnHit hook (if any) and publishes
+// no event — there is no EventHit kind in the spec; subscribers
+// derive hit info from Stats. The synchronous hook still runs
+// since it gives callers raw observability.
+func (c *Cache[K, V]) fireHit(key K, value V) {
+	if c.onHit != nil {
+		c.onHit(key, value)
+	}
+}
+
+// fireMiss invokes the configured OnMiss hook.
+func (c *Cache[K, V]) fireMiss(key K) {
+	if c.onMiss != nil {
+		c.onMiss(key)
+	}
 }
 
 // shouldRefreshAhead reports whether the entry has aged past the
@@ -691,16 +805,19 @@ func (c *Cache[K, V]) Reset() {
 }
 
 // Close releases all resources, stops every shard's janitor goroutine,
-// and disables further operations. Subsequent calls return nil — Close
-// is idempotent. Reads and writes after Close return their zero/error
-// path ([ErrClosed] for writes; the zero value with ok=false for
-// reads).
+// closes every active subscriber channel, and disables further
+// operations. Subsequent calls return nil — Close is idempotent.
+// Reads and writes after Close return their zero/error path
+// ([ErrClosed] for writes; the zero value with ok=false for reads).
 func (c *Cache[K, V]) Close() error {
 	if !c.closed.CompareAndSwap(false, true) {
 		return nil
 	}
 	c.stopAllJanitors()
 	c.Reset()
+	if c.events != nil {
+		c.events.close()
+	}
 	return nil
 }
 
@@ -810,6 +927,13 @@ func (c *Cache[K, V]) upsertLocked(
 		if expireAt > 0 {
 			c.startJanitorLocked(s)
 		}
+		c.publishEvent(Event[K, V]{
+			Kind:  EventUpdate,
+			Key:   key,
+			Value: value,
+			At:    c.cfg.clock.Now(),
+			Tags:  tags,
+		})
 		return
 	}
 	e := s.pool.get()
@@ -839,6 +963,13 @@ func (c *Cache[K, V]) upsertLocked(
 		c.startJanitorLocked(s)
 	}
 	c.evictWhileOverBudgetLocked(s)
+	c.publishEvent(Event[K, V]{
+		Kind:  EventInsert,
+		Key:   key,
+		Value: value,
+		At:    c.cfg.clock.Now(),
+		Tags:  tags,
+	})
 }
 
 // weighOf returns the configured weight of value, defaulting to 1
@@ -907,7 +1038,22 @@ func (c *Cache[K, V]) callExpireFunc(e *entry[K, V]) (expired, panicked bool) {
 // caller must hold s.mu. Tags carried by the entry are unindexed
 // from the cache-level tagIndex so future InvalidateTag calls do
 // not see this key.
+//
+// Fires `OnExpire` + publishes `EventExpire` when reason is
+// `EvictReasonExpired` or `EvictReasonExpireFunc`; otherwise fires
+// `OnEvict` + publishes `EventEvict`. Callbacks run synchronously
+// under the shard write lock — slow callbacks block writes for that
+// shard.
 func (c *Cache[K, V]) removeLocked(s *shard[K, V], e *entry[K, V], reason EvictionReason) {
+	// Capture key/value/tags BEFORE returning the entry to the pool.
+	key := e.key
+	value := e.value
+	var tagsCopy []string
+	if len(e.tags) > 0 {
+		tagsCopy = append([]string(nil), e.tags...)
+	}
+	negative := e.flags.has(flagNegative)
+
 	delete(s.entries, e.key)
 	s.expiryRemove(e)
 	s.policy.OnRemove(e)
@@ -920,6 +1066,40 @@ func (c *Cache[K, V]) removeLocked(s *shard[K, V], e *entry[K, V], reason Evicti
 		c.counters.evictionsByReason[reason].Add(1)
 	}
 	s.pool.put(e)
+
+	// Negative tombstones are an internal artifact of the loader
+	// path; suppress callbacks/events for them so subscribers
+	// don't see "evictions" they never asked for.
+	if negative {
+		return
+	}
+
+	switch reason {
+	case EvictReasonExpired, EvictReasonExpireFunc:
+		if c.onExpire != nil {
+			c.onExpire(key, value)
+		}
+		c.publishEvent(Event[K, V]{
+			Kind:   EventExpire,
+			Key:    key,
+			Value:  value,
+			Reason: reason,
+			At:     c.cfg.clock.Now(),
+			Tags:   tagsCopy,
+		})
+	default:
+		if c.onEvict != nil {
+			c.onEvict(key, value, reason)
+		}
+		c.publishEvent(Event[K, V]{
+			Kind:   EventEvict,
+			Key:    key,
+			Value:  value,
+			Reason: reason,
+			At:     c.cfg.clock.Now(),
+			Tags:   tagsCopy,
+		})
+	}
 }
 
 // Range calls fn for every entry in the cache. Iteration is shard by
@@ -1283,6 +1463,10 @@ func (c *Cache[K, V]) Resize(newSize int64) int {
 		evicted += c.shrinkShardLocked(s)
 		s.mu.Unlock()
 	}
+	c.publishEvent(Event[K, V]{
+		Kind: EventResize,
+		At:   c.cfg.clock.Now(),
+	})
 	return evicted
 }
 
@@ -1680,6 +1864,32 @@ func (c *Cache[K, V]) runLoader(
 		}
 	}
 	s.mu.Unlock()
+
+	// OnLoad / EventLoad fire AFTER the shard lock is released so
+	// the callback can call back into the cache without
+	// re-entering the same shard's mutex.
+	if c.onLoad != nil {
+		c.onLoad(key, val, ttl, err)
+	}
+	if err == nil {
+		c.publishEvent(Event[K, V]{
+			Kind:  EventLoad,
+			Key:   key,
+			Value: val,
+			At:    c.cfg.clock.Now(),
+		})
+	} else {
+		kind := EventLoadError
+		if errors.Is(err, context.DeadlineExceeded) {
+			kind = EventLoadTimeout
+		}
+		c.publishEvent(Event[K, V]{
+			Kind: kind,
+			Key:  key,
+			Err:  err,
+			At:   c.cfg.clock.Now(),
+		})
+	}
 }
 
 // storeLoadedLocked applies the Loader's result to the cache. ttl=0
