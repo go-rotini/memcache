@@ -208,6 +208,15 @@ type config struct {
 	// WithEncryptedCodec) when their input is invalid. New
 	// surfaces it as a *ConfigError before any further validation.
 	codecCtorErr error
+
+	// ttlBuckets / ttlBucketsTickPerBucket capture the requested
+	// hashed-wheel parameters. The wheel implementation lives in
+	// internal/wheel; the option is recognized but not yet wired
+	// into the cache's TTL backend. New emits a one-shot info log
+	// when the option is set so users know the option is parsed
+	// but not yet active.
+	ttlBuckets              int
+	ttlBucketsTickPerBucket int
 }
 
 // defaultConfig returns the package's baseline configuration. It is
@@ -382,6 +391,25 @@ func WithStatsEnabled(b bool) Option {
 // investigating a distribution problem.
 func WithCollisionTracking(b bool) Option {
 	return func(c *config) { c.collisionTracking = b }
+}
+
+// WithTTLBuckets requests time-bucketed expiration via the hashed
+// timing wheel implemented in internal/wheel. The wheel uses
+// `slots × tickPerBucket` slots with a per-tick wall duration of
+// roughly the configured janitor interval / tickPerBucket.
+//
+// EXPERIMENTAL in v0: the wheel package ships and is fully tested,
+// but cache hot-path wiring is deferred to v0.2 pending benchmark-
+// driven validation (the per-shard expiry heap is correct and
+// fast for typical CLI workloads). When this option is supplied
+// the cache logs an info message and continues to use the heap;
+// no behavior change yet. The option is recognized so user code
+// targeting v1 compiles unchanged.
+func WithTTLBuckets(slots, tickPerBucket int) Option {
+	return func(c *config) {
+		c.ttlBuckets = slots
+		c.ttlBucketsTickPerBucket = tickPerBucket
+	}
 }
 
 // WithShardedStats requests per-CPU sharded counters for the

@@ -214,6 +214,11 @@ func build[K comparable, V any](cfg *config, allowUnbounded bool) (*Cache[K, V],
 		return nil, err
 	}
 	safeKeysCheck[K](cfg)
+	if cfg.ttlBuckets > 0 && cfg.logger != nil {
+		cfg.logger.Info("memcache: WithTTLBuckets is recognized but not yet wired into the cache's TTL backend; falling back to the per-shard expiry heap",
+			"slots", cfg.ttlBuckets,
+			"tickPerBucket", cfg.ttlBucketsTickPerBucket)
+	}
 
 	if cfg.maxBytes > 0 && weigher == nil {
 		return nil, &ConfigError{

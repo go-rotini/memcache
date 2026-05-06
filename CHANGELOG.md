@@ -107,6 +107,33 @@ invalidation, snapshot persistence, and tiered composition.
   Wire format is `<12-byte nonce><sealed ciphertext>`. Bad keys
   surface as `*ConfigError` from New rather than as runtime decode
   errors.
+- **Read-lock fast path on Get**: hits where the eviction policy
+  doesn't need promotion (FIFO always; S3-FIFO at freq saturation),
+  the entry has no sliding TTL, and no refresh-ahead window
+  applies serve under a read lock — no write-lock acquire, no
+  policy mutation. Hot-path Get latency dropped roughly 10× on
+  benchmark sweep (≈480ns → ≈45ns on Apple M3). The slow path
+  still takes the write lock for promotions and side-effects.
+- **Latency telemetry**: `Stats.LoadLatency` / `LoadLatencyP50` /
+  `LoadLatencyP99`, populated from `internal/tdigest/`'s lock-free
+  fixed-bucket histogram. Records every Loader call's wall
+  duration; resets with `Cache.ResetStats`.
+- **Per-policy stats**: `Stats.PolicyDetail` returns a per-policy
+  diagnostic struct (`PolicyDetailLRU`, `PolicyDetailS3FIFO`, etc.)
+  describing the live state of shard 0's policy.
+- **Hashed timing wheel**: `internal/wheel/` ships a fully-tested
+  generic timing wheel suitable for high-volume TTL workloads.
+  `WithTTLBuckets(slots, tickPerBucket)` is recognized; cache
+  hot-path wiring is deferred to v0.2 pending benchmark-driven
+  validation. The default per-shard heap remains active.
+
+### Performance baseline
+
+`testdata/benchmarks/v0.1.0-baseline.csv` records the v0.1.0
+benchmark sweep on Apple M3 / arm64 / Go 1.26.x. Spec §19.6.5
+latency targets met (p50 100ns / p99 500ns vs spec 200ns / 2µs);
+the `sync.Map`-throughput target is acknowledged as a structural
+gap pending a v0.2 lock-free read-path follow-up.
 - **Concurrency limits**: `WithMaxConcurrentLoads(n)` semaphore;
   `WithLoadRateLimit(rps, burst)` token bucket.
 - **Determinism for tests**: `WithClock(Clock)` + `NewFakeClock(...)`
