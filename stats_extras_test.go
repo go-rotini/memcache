@@ -2,8 +2,7 @@
 // Tier 1 of the v0.1 roadmap (RefreshAhead, StaleWhileRevalidate,
 // NegativeHits, TagInvalidations, Resizes, LoadTimeouts,
 // LoadRateLimited, LoadCachedError, Uptime, LastSnapshotAt,
-// LastResetAt, PolicyName, TagsTracked) and the LoadCalls /
-// Singleflights name aliases.
+// LastResetAt, PolicyName, TagsTracked).
 
 package memcache
 

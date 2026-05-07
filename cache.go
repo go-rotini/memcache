@@ -91,9 +91,12 @@ type Cache[K comparable, V any] struct {
 	// invalidationSubscriber drives the consumer goroutine that
 	// turns remote-channel sends into local Deletes. nil when
 	// not configured. invalidationSubscriberDone is closed by
-	// Close to stop the goroutine.
-	invalidationSubscriber     <-chan K
-	invalidationSubscriberDone chan struct{}
+	// Close to stop the goroutine; invalidationSubscriberExited is
+	// closed by the goroutine on its way out so Close can wait for
+	// it to finish before returning.
+	invalidationSubscriber       <-chan K
+	invalidationSubscriberDone   chan struct{}
+	invalidationSubscriberExited chan struct{}
 
 	// tagCleanupQueue receives untag ops from removeLocked; the
 	// drainer goroutine batches them and applies under a single
@@ -909,7 +912,7 @@ func (c *Cache[K, V]) getCtx(ctx context.Context, key K) (V, bool, error) {
 		c.fireMiss(key)
 		return zero, false, nil
 	}
-	if c.entryExpiredLocked(e, now) {
+	if expired, reason := c.entryExpiredLockedReason(e, now); expired {
 		// Stale-while-revalidate: serve stale + trigger refresh.
 		if !e.flags.has(flagNegative) && c.shouldServeStale(e, now) {
 			c.triggerAsyncRefreshLocked(s, key)
@@ -922,7 +925,7 @@ func (c *Cache[K, V]) getCtx(ctx context.Context, key K) (V, bool, error) {
 			c.fireHit(key, val)
 			return c.returnValue(val), true, nil
 		}
-		c.removeLocked(s, e, EvictReasonExpired)
+		c.removeLocked(s, e, reason)
 		c.counters.expirations.Add(1)
 		c.flushAndUnlock(s)
 		// Expired in-memory — try the Store; the user may have
@@ -1085,8 +1088,8 @@ func (c *Cache[K, V]) GetWithExpiry(key K) (V, time.Time, bool) {
 		c.recordMiss()
 		return zero, time.Time{}, false
 	}
-	if c.entryExpiredLocked(e, now) {
-		c.removeLocked(s, e, EvictReasonExpired)
+	if expired, reason := c.entryExpiredLockedReason(e, now); expired {
+		c.removeLocked(s, e, reason)
 		c.counters.expirations.Add(1)
 		c.recordMiss()
 		return zero, time.Time{}, false
@@ -1278,7 +1281,9 @@ func (c *Cache[K, V]) upsertWithAbsoluteExpiryLocked(
 		existing.hits.Store(0)
 		existing.generation.Add(1)
 		// SetExpireAt always implies absolute, never sliding.
-		existing.flags &^= flagSliding
+		// Also clear any negative-cache tombstone the slot held —
+		// see the matching comment in upsertLocked.
+		existing.flags &^= (flagSliding | flagNegative)
 		existing.slidingTTL = 0
 		if len(sc.tags) > 0 {
 			existing.tags = append(existing.tags[:0], sc.tags...)
@@ -1457,6 +1462,9 @@ func (c *Cache[K, V]) Close() error {
 	c.stopAllJanitors()
 	if c.invalidationSubscriberDone != nil {
 		close(c.invalidationSubscriberDone)
+		if c.invalidationSubscriberExited != nil {
+			<-c.invalidationSubscriberExited
+		}
 	}
 	c.runPurgeVisitor()
 	c.Reset()
@@ -1711,6 +1719,11 @@ func (c *Cache[K, V]) upsertLocked(
 		existing.lastAccess.Store(now)
 		existing.hits.Store(0)
 		existing.generation.Add(1)
+		// Clear flagNegative when transitioning a negative-cache
+		// tombstone into a real value. Otherwise the entry stays
+		// hidden from every read path until the tombstone's TTL
+		// elapses, silently dropping the user's Set.
+		existing.flags &^= flagNegative
 		if sliding {
 			existing.flags |= flagSliding
 			existing.slidingTTL = rawTTL
@@ -1813,18 +1826,33 @@ func (c *Cache[K, V]) evictWhileOverBudgetLocked(s *shard[K, V]) {
 // Caller must hold the entry's shard lock (read or write) so the
 // metadata snapshot it builds reflects a consistent point in time.
 func (c *Cache[K, V]) entryExpiredLocked(e *entry[K, V], now int64) bool {
+	expired, _ := c.entryExpiredLockedReason(e, now)
+	return expired
+}
+
+// entryExpiredLockedReason is the eviction-reason-aware variant of
+// [entryExpiredLocked]. Returns (false, 0) when the entry is fresh.
+// Returns (true, [EvictReasonExpired]) when the entry's TTL has
+// elapsed; (true, [EvictReasonExpireFunc]) when only the
+// [WithExpireFunc] predicate marks it expired. Used by removal-
+// emitting sites (Get, GetWithExpiry) so [Stats.EvictionsByReason]
+// distinguishes the two paths.
+func (c *Cache[K, V]) entryExpiredLockedReason(e *entry[K, V], now int64) (bool, EvictionReason) {
 	if e.expired(now) {
-		return true
+		return true, EvictReasonExpired
 	}
 	if c.expireFunc == nil {
-		return false
+		return false, 0
 	}
 	expired, panicked := c.callExpireFunc(e)
 	if panicked && c.cfg.logger != nil {
 		c.cfg.logger.Warn("memcache: WithExpireFunc panicked; entry treated as fresh",
 			"name", c.cfg.name)
 	}
-	return expired
+	if expired {
+		return true, EvictReasonExpireFunc
+	}
+	return false, 0
 }
 
 // callExpireFunc invokes the configured expire predicate with panic

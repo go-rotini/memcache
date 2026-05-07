@@ -150,7 +150,10 @@ func (c *Cache[K, V]) Clone() (*Cache[K, V], error) {
 	for _, s := range c.shards {
 		s.mu.RLock()
 		s.storage.each(func(e *entry[K, V]) bool {
-			if e.expired(now) || e.flags.has(flagNegative) {
+			// Use entryExpiredLocked so a configured WithExpireFunc
+			// also filters stale entries out of the clone — matches
+			// the predicate used by Get-style methods.
+			if c.entryExpiredLocked(e, now) || e.flags.has(flagNegative) {
 				return true
 			}
 			tagsCopy := append([]string(nil), e.tags...)

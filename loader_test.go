@@ -787,3 +787,32 @@ func TestLoaderFuncAdapter(t *testing.T) {
 		t.Errorf("LoaderFunc adapter = (%d, %v), want (5, nil)", v, err)
 	}
 }
+
+// TestSetClearsNegativeTombstone regression: when WithNegativeCache
+// installs a tombstone after a Loader returns ErrNotFound, a
+// subsequent Set must clear the flagNegative bit so the new value
+// is visible to reads. Before the fix, upsertLocked left the bit
+// set and the user's value disappeared until negativeTTL elapsed.
+func TestSetClearsNegativeTombstone(t *testing.T) {
+	loader := LoaderFunc[string, int](func(_ context.Context, _ string) (int, time.Duration, error) {
+		return 0, 0, ErrNotFound
+	})
+	c, _ := New[string, int](
+		WithMaxEntries(8),
+		WithLoader(loader),
+		WithNegativeCache(time.Hour), // long enough to outlast the test
+	)
+	defer c.Close()
+
+	// Trigger negative tombstone install.
+	if _, err := c.GetOrLoad(context.Background(), "k"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("GetOrLoad: expected ErrNotFound, got %v", err)
+	}
+	// Overwrite via Set — must clear the tombstone.
+	if err := c.Set("k", 42); err != nil {
+		t.Fatalf("Set: %v", err)
+	}
+	if got, ok := c.Get("k"); !ok || got != 42 {
+		t.Errorf("Get(k) after Set-over-tombstone = (%d, %v), want (42, true)", got, ok)
+	}
+}

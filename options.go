@@ -925,14 +925,23 @@ func WithOnLoad[K comparable, V any](fn func(key K, value V, ttl time.Duration, 
 // WithExpireFunc registers a per-entry expiry predicate. On each
 // Get and during each janitor sweep, fn is called with the entry's
 // metadata; returning true causes the cache to treat the entry as
-// expired regardless of its TTL.
+// expired regardless of its TTL. Removals driven by this predicate
+// are recorded under [EvictReasonExpireFunc] (distinct from
+// [EvictReasonExpired] which covers TTL-only expiry).
 //
 // Use cases include "expire when an external resource changes" —
 // e.g., file mtime checks, schema-version comparison, etag mismatch.
-// fn must be fast and side-effect-free; it is called under the
-// shard's read lock on the Get path and the write lock during
-// sweeps. A panicking fn is recovered: the entry is treated as
-// fresh (defensive default — better to keep stale data than lose it)
+//
+// Performance contract: fn must be fast, non-blocking, and side-
+// effect-free. It is called under the shard's read lock on the
+// Get path and the write lock during sweeps; a slow fn directly
+// blocks the entire shard. Unlike [WithOnEvict] / [WithOnExpire],
+// expireFunc is NOT routed through [WithCallbackTimeout] — there
+// is no watchdog, since the predicate's return value is on the
+// hot path.
+//
+// A panicking fn is recovered: the entry is treated as fresh
+// (defensive default — better to keep stale data than lose it)
 // and a warning is logged through the configured slog.Logger.
 //
 // fn is type-asserted at cache construction time; passing a

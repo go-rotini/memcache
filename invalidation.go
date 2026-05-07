@@ -87,16 +87,26 @@ func (c *Cache[K, V]) startInvalidationSubscriber() {
 	if c.invalidationSubscriber == nil {
 		return
 	}
+	c.invalidationSubscriberExited = make(chan struct{})
 	go c.runInvalidationSubscriber()
 }
 
 // runInvalidationSubscriber is the goroutine body. It exits cleanly
-// on cache close or channel close.
+// on cache close or channel close. Closes
+// `invalidationSubscriberExited` on the way out so [Cache.Close]
+// can wait for the goroutine to finish before returning.
 func (c *Cache[K, V]) runInvalidationSubscriber() {
+	defer close(c.invalidationSubscriberExited)
 	for {
 		select {
 		case key, ok := <-c.invalidationSubscriber:
 			if !ok {
+				return
+			}
+			// Bail out without mutating cache state if Close has
+			// already started — every other long-lived goroutine
+			// honors closed.Load() before re-entering the cache.
+			if c.closed.Load() {
 				return
 			}
 			c.deleteWithReason(key, EvictReasonRemote)

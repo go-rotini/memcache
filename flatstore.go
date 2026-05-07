@@ -138,7 +138,15 @@ func (s *flatStore[K, V]) set(key K, e *entry[K, V]) {
 		s.slots[idx].value = e
 		return
 	}
-	if s.shouldGrowBeforeInsert() {
+	// Two scenarios force a rebuild before insertion:
+	//   1. Load factor crossed the grow threshold.
+	//   2. probe wrapped without finding an empty/tombstone slot
+	//      (idx == -1). The 0.75 load-factor invariant should
+	//      prevent this in practice, but a degenerate hasher could
+	//      produce pathological probe paths — rebuilding is a safe
+	//      fallback that avoids the index-out-of-range panic the
+	//      next line would otherwise hit.
+	if idx < 0 || s.shouldGrowBeforeInsert() {
 		s.rebuild(s.nextRebuildCap())
 		idx, _ = s.probe(key)
 	}

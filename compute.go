@@ -142,6 +142,15 @@ func (c *Cache[K, V]) Compute(
 			c.cfg.slidingTTL, int64(c.cfg.defaultTTL), nil)
 		return newValue, nil
 	case ComputeDelete:
+		// Only fire the Computed eviction when the entry was
+		// logically present from `fn`'s perspective. An entry that
+		// was already TTL-expired or a negative-cache tombstone
+		// should not surface as a user-driven Compute deletion —
+		// expired entries are reaped under EvictReasonExpired
+		// elsewhere; negative tombstones are internal bookkeeping.
+		if !present {
+			return zero, nil
+		}
 		if e, ok := s.storage.get(key); ok {
 			c.removeLocked(s, e, EvictReasonComputed)
 		}

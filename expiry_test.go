@@ -407,3 +407,32 @@ func TestExpireFuncHonoredByPeekOrAdd(t *testing.T) {
 		t.Errorf("PeekOrAdd value = %d, want 99 (the freshly inserted value)", got)
 	}
 }
+
+// TestExpireFuncRecordsDistinctEvictionReason regression: removals
+// driven by WithExpireFunc should land in
+// Stats.EvictionsByReason[EvictReasonExpireFunc], not lumped with
+// TTL expirations under EvictReasonExpired. Before the fix, the
+// dedicated reason constant was dead code and the path through
+// Get's slow-path expiry handling always passed EvictReasonExpired.
+func TestExpireFuncRecordsDistinctEvictionReason(t *testing.T) {
+	c, _ := New[string, int](
+		WithMaxEntries(8),
+		WithExpireFunc(func(key string, _ int, _ Metadata) bool {
+			return key == "stale"
+		}),
+	)
+	defer c.Close()
+	_ = c.Set("stale", 1)            // no TTL — only the predicate marks it expired
+	if _, ok := c.Get("stale"); ok { // triggers the predicate-driven eviction
+		t.Fatal("Get on predicate-expired entry should miss")
+	}
+	st := c.Stats()
+	if got := st.EvictionsByReason[EvictReasonExpireFunc]; got != 1 {
+		t.Errorf("EvictionsByReason[EvictReasonExpireFunc] = %d, want 1", got)
+	}
+	// And TTL-only expirations should NOT have ticked.
+	if got := st.EvictionsByReason[EvictReasonExpired]; got != 0 {
+		t.Errorf("EvictionsByReason[EvictReasonExpired] = %d, want 0 "+
+			"(predicate-driven removal should not count as TTL expiry)", got)
+	}
+}
