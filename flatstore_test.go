@@ -22,7 +22,8 @@ func stubHasher(s string) uint64 {
 // identity in flatStore tests. The entry's key field is set so
 // each() callbacks can assert on it.
 func mkEntry(key string, val int) *entry[string, int] {
-	e := &entry[string, int]{key: key, value: val, heapIndex: -1}
+	e := &entry[string, int]{key: key, heapIndex: -1}
+	e.storeValue(val)
 	return e
 }
 
@@ -52,8 +53,8 @@ func TestFlatStoreSetAndGet(t *testing.T) {
 	if got != a {
 		t.Errorf("get(a) returned different entry pointer: %p vs %p", got, a)
 	}
-	if got.value != 1 {
-		t.Errorf("get(a).value = %d, want 1", got.value)
+	if got.loadValue() != 1 {
+		t.Errorf("get(a).value = %d, want 1", got.loadValue())
 	}
 	if fs.length() != 1 {
 		t.Errorf("length = %d, want 1", fs.length())
@@ -108,7 +109,7 @@ func TestFlatStoreDeleteThenInsertReusesTombstone(t *testing.T) {
 	fs.del("a")
 	fs.set("a", mkEntry("a", 2))
 
-	if got, _ := fs.get("a"); got == nil || got.value != 2 {
+	if got, _ := fs.get("a"); got == nil || got.loadValue() != 2 {
 		t.Errorf("get(a) after re-insert = %+v, want value=2", got)
 	}
 	if fs.tombstones != 0 {
@@ -125,7 +126,7 @@ func TestFlatStoreEachVisitsEveryEntry(t *testing.T) {
 
 	got := map[string]int{}
 	fs.each(func(e *entry[string, int]) bool {
-		got[e.key] = e.value
+		got[e.key] = e.loadValue()
 		return true
 	})
 	if len(got) != len(want) {
@@ -212,7 +213,7 @@ func TestFlatStoreGrowsWhenLoadFactorExceeded(t *testing.T) {
 	// All 14 keys must still be reachable.
 	for i := 0; i < 14; i++ {
 		k := fmt.Sprintf("key-%d", i)
-		if got, ok := fs.get(k); !ok || got.value != i {
+		if got, ok := fs.get(k); !ok || got.loadValue() != i {
 			t.Errorf("key %q lost across grow: got=%+v ok=%v", k, got, ok)
 		}
 	}
@@ -243,7 +244,7 @@ func TestFlatStoreCompactsAfterTombstoneAccumulation(t *testing.T) {
 	// Survivors must remain accessible.
 	for i := 8; i < 10; i++ {
 		k := fmt.Sprintf("key-%d", i)
-		if got, ok := fs.get(k); !ok || got.value != i {
+		if got, ok := fs.get(k); !ok || got.loadValue() != i {
 			t.Errorf("key %q lost across compaction: got=%+v ok=%v", k, got, ok)
 		}
 	}
@@ -360,8 +361,8 @@ func TestFlatStoreCollidingKeysCoexist(t *testing.T) {
 		if !ok {
 			t.Errorf("collision-bucketed key %q lost", k)
 		}
-		if got != nil && got.value != i {
-			t.Errorf("key %q value = %d, want %d", k, got.value, i)
+		if got != nil && got.loadValue() != i {
+			t.Errorf("key %q value = %d, want %d", k, got.loadValue(), i)
 		}
 	}
 }

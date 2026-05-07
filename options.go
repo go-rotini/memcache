@@ -239,6 +239,15 @@ type config struct {
 	// visibility contract (a Set followed by a Get returns the new
 	// value) holds.
 	asyncWrites bool
+
+	// lockFreeRead is set by [WithLockFreeRead]. When true each
+	// shard publishes an immutable map snapshot (atomically
+	// updated) that the Get fast path consults without taking the
+	// shard lock; misses fall through to the existing locked path.
+	// Trades pool-recycling for read throughput — entries that
+	// were ever in a snapshot remain GC-managed instead of going
+	// back to the per-shard sync.Pool.
+	lockFreeRead bool
 }
 
 // defaultConfig returns the package's baseline configuration. It is
@@ -432,6 +441,32 @@ func WithTTLBuckets(slots, tickPerBucket int) Option {
 		c.ttlBuckets = slots
 		c.ttlBucketsTickPerBucket = tickPerBucket
 	}
+}
+
+// WithLockFreeRead enables a `sync.Map`-style read fast path: each
+// shard publishes an immutable snapshot of its entries via an
+// atomic pointer, and [Cache.Get] consults that snapshot without
+// taking any shard lock. Misses fall through to the existing
+// locked path; the snapshot is rebuilt periodically when reads
+// observe enough drift between the snapshot and the live shard
+// state.
+//
+// Performance: read-only workloads see Get latency drop into the
+// same range as `sync.Map.Load` (a few nanoseconds per call vs the
+// default ~58 ns/op). Write-heavy workloads see a small overhead
+// from snapshot bookkeeping.
+//
+// Trade-off: entries that have ever been published into a read
+// snapshot are NOT returned to the per-shard sync.Pool — they
+// remain GC-managed so concurrent readers holding the snapshot's
+// entry pointers can dereference them safely. For caches with
+// high churn this can mean modestly increased GC pressure; for
+// read-mostly caches the throughput win dominates.
+//
+// EXPERIMENTAL in v0; will likely become the default in v1 once
+// the throughput target row is validated across more workloads.
+func WithLockFreeRead() Option {
+	return func(c *config) { c.lockFreeRead = true }
 }
 
 // WithAsyncWrites decouples [Cache.Set] / [Cache.Delete] from the

@@ -313,6 +313,7 @@ func build[K comparable, V any](cfg *config, allowUnbounded bool) (*Cache[K, V],
 	}
 
 	initShards(c, cfg, hasher)
+	c.maybeInitReadSnapshot(cfg)
 	c.maybeStartAsync(cfg)
 
 	if err := c.applyAutoLoad(); err != nil {
@@ -805,7 +806,7 @@ func (c *Cache[K, V]) Peek(key K) (V, bool) {
 	if !ok || c.entryExpiredLocked(e, now) || e.flags.has(flagNegative) {
 		return zero, false
 	}
-	return c.returnValue(e.value), true
+	return c.returnValue(e.loadValue()), true
 }
 
 // Get returns the value stored for key, or the zero value of V and
@@ -853,23 +854,11 @@ func (c *Cache[K, V]) getCtx(ctx context.Context, key K) (V, bool, error) {
 	s := c.shardFor(key)
 	now := c.cfg.clock.Now().UnixNano()
 
-	// Async-writes pending check: a queued Set/Delete on this key
-	// must be visible before storage is consulted, so that a Set
-	// followed by a Get returns the new value.
-	if s.pending != nil {
-		s.mu.RLock()
-		val, kind, hit := c.asyncReadHit(s, key, now)
-		s.mu.RUnlock()
-		if hit {
-			if kind == pendingOpDelete {
-				c.recordMiss()
-				c.fireMiss(key)
-				return zero, false, nil
-			}
-			c.recordHitObserve(key)
-			c.fireHit(key, val)
-			return c.returnValue(val), true, nil
-		}
+	if val, hit, terminal := c.tryServeFromAsyncPending(s, key, now); terminal {
+		return val, hit, nil
+	}
+	if val, hit, terminal := c.tryServeFromReadSnapshot(s, key, now); terminal {
+		return val, hit, nil
 	}
 
 	// Fast path: try to serve under the shard read lock.
@@ -884,8 +873,13 @@ func (c *Cache[K, V]) getCtx(ctx context.Context, key K) (V, bool, error) {
 		// RLock; the value copy lands while still locked so a
 		// concurrent eviction can't pool the entry mid-read.
 		e.hits.Add(1)
-		val := e.value
+		val := e.loadValue()
 		s.mu.RUnlock()
+		// Record the under-the-snapshot miss so a stale read
+		// snapshot eventually gets rebuilt.
+		if c.cfg.lockFreeRead {
+			c.recordReadMiss(s, s.snapshotHasKey(key))
+		}
 		c.recordHitObserve(key)
 		c.fireHit(key, val)
 		return c.returnValue(val), true, nil
@@ -920,7 +914,7 @@ func (c *Cache[K, V]) getCtx(ctx context.Context, key K) (V, bool, error) {
 			c.counters.staleWhileRevalidate.Add(1)
 			e.hits.Add(1)
 			s.policy.OnAccess(e)
-			val := e.value
+			val := e.loadValue()
 			s.mu.Unlock()
 			c.recordHitObserve(key)
 			c.fireHit(key, val)
@@ -960,9 +954,10 @@ func (c *Cache[K, V]) getCtx(ctx context.Context, key K) (V, bool, error) {
 		c.counters.refreshAhead.Add(1)
 		c.triggerAsyncRefreshLocked(s, key)
 	}
+	c.maybePromoteOnSlowHit(s, key)
 	c.recordHitObserve(key)
-	c.fireHit(key, e.value)
-	return c.returnValue(e.value), true, nil
+	c.fireHit(key, e.loadValue())
+	return c.returnValue(e.loadValue()), true, nil
 }
 
 // fireHit invokes the configured OnHit hook (if any) and publishes
@@ -1101,9 +1096,9 @@ func (c *Cache[K, V]) GetWithExpiry(key K) (V, time.Time, bool) {
 	c.recordHit()
 	expNanos := e.expireAt.Load()
 	if expNanos == 0 {
-		return e.value, time.Time{}, true
+		return e.loadValue(), time.Time{}, true
 	}
-	return e.value, time.Unix(0, expNanos), true
+	return e.loadValue(), time.Unix(0, expNanos), true
 }
 
 // Set stores value under key with the cache's default TTL.
@@ -1258,7 +1253,7 @@ func (c *Cache[K, V]) upsertWithAbsoluteExpiryLocked(
 			oldTags = append([]string(nil), existing.tags...)
 		}
 		c.counters.bytes.Add(-existing.weight + weight)
-		existing.value = value
+		existing.storeValue(value)
 		existing.weight = weight
 		existing.expireAt.Store(expireAt)
 		existing.lastAccess.Store(now)
@@ -1285,7 +1280,7 @@ func (c *Cache[K, V]) upsertWithAbsoluteExpiryLocked(
 	}
 	e := s.pool.get()
 	e.key = key
-	e.value = value
+	e.storeValue(value)
 	e.weight = weight
 	e.inserted = now
 	e.lastAccess.Store(now)
@@ -1294,6 +1289,7 @@ func (c *Cache[K, V]) upsertWithAbsoluteExpiryLocked(
 		e.tags = append(e.tags[:0], sc.tags...)
 	}
 	s.storage.set(key, e)
+	s.markAmended()
 	s.expiryAdd(e)
 	s.policy.OnInsert(e)
 	c.retagLocked(key, nil, sc.tags)
@@ -1445,7 +1441,7 @@ func (c *Cache[K, V]) runPurgeVisitor() {
 		s.mu.RLock()
 		s.storage.each(func(e *entry[K, V]) bool {
 			if !e.flags.has(flagNegative) {
-				staged = append(staged, kv{k: e.key, v: e.value})
+				staged = append(staged, kv{k: e.key, v: e.loadValue()})
 			}
 			return true
 		})
@@ -1632,7 +1628,7 @@ func (c *Cache[K, V]) upsertLocked(
 			oldTags = append([]string(nil), existing.tags...)
 		}
 		c.counters.bytes.Add(-existing.weight + weight)
-		existing.value = value
+		existing.storeValue(value)
 		existing.weight = weight
 		existing.expireAt.Store(expireAt)
 		existing.lastAccess.Store(now)
@@ -1670,7 +1666,7 @@ func (c *Cache[K, V]) upsertLocked(
 	}
 	e := s.pool.get()
 	e.key = key
-	e.value = value
+	e.storeValue(value)
 	e.weight = weight
 	e.inserted = now
 	e.lastAccess.Store(now)
@@ -1683,6 +1679,7 @@ func (c *Cache[K, V]) upsertLocked(
 		e.tags = append(e.tags[:0], tags...)
 	}
 	s.storage.set(key, e)
+	s.markAmended()
 	s.expiryAdd(e)
 	s.policy.OnInsert(e)
 	c.retagLocked(key, nil, tags)
@@ -1763,7 +1760,7 @@ func (c *Cache[K, V]) callExpireFunc(e *entry[K, V]) (expired, panicked bool) {
 			panicked = true
 		}
 	}()
-	return c.expireFunc(e.key, e.value, e.metadata()), false
+	return c.expireFunc(e.key, e.loadValue(), e.metadata()), false
 }
 
 // removeLocked deletes e from the shard and notifies the policy. The
@@ -1779,7 +1776,7 @@ func (c *Cache[K, V]) callExpireFunc(e *entry[K, V]) (expired, panicked bool) {
 func (c *Cache[K, V]) removeLocked(s *shard[K, V], e *entry[K, V], reason EvictionReason) {
 	// Capture key/value/tags BEFORE returning the entry to the pool.
 	key := e.key
-	value := e.value
+	value := e.loadValue()
 	var tagsCopy []string
 	if len(e.tags) > 0 {
 		tagsCopy = append([]string(nil), e.tags...)
@@ -1798,7 +1795,16 @@ func (c *Cache[K, V]) removeLocked(s *shard[K, V], e *entry[K, V], reason Evicti
 	if c.cfg.statsEnabled {
 		c.counters.evictionsByReason[reason].Add(1)
 	}
-	s.pool.put(e)
+	if c.cfg.lockFreeRead {
+		// Mark the entry as invalidated so any reader holding a
+		// stale snapshot pointer observes the deletion. Skip
+		// pooling — concurrent readers may still be dereferencing
+		// the entry; let GC reclaim it after the next snapshot
+		// promotion drops the last reference.
+		e.markInvalidated()
+	} else {
+		s.pool.put(e)
+	}
 
 	// Negative tombstones are an internal artifact of the loader
 	// path; suppress callbacks/events for them so subscribers
@@ -1868,7 +1874,7 @@ func (c *Cache[K, V]) rangeShard(s *shard[K, V], now int64, fn func(K, V) bool) 
 		if c.entryExpiredLocked(e, now) || e.flags.has(flagNegative) {
 			return true
 		}
-		if !fn(e.key, e.value) {
+		if !fn(e.key, e.loadValue()) {
 			stopped = true
 			return false
 		}
@@ -2098,7 +2104,7 @@ func (c *Cache[K, V]) DeleteIf(key K, pred func(V) bool) bool {
 	if !ok || c.entryExpiredLocked(e, now) || e.flags.has(flagNegative) {
 		return false
 	}
-	if !pred(e.value) {
+	if !pred(e.loadValue()) {
 		return false
 	}
 	c.removeLocked(s, e, EvictReasonDeleted)
@@ -2133,7 +2139,7 @@ func (c *Cache[K, V]) GetOrSet(key K, value V) (V, bool, error) {
 		}
 		s.policy.OnAccess(existing)
 		c.recordHit()
-		return c.returnValue(existing.value), true, nil
+		return c.returnValue(existing.loadValue()), true, nil
 	}
 	c.upsertLocked(s, key, value, weight,
 		c.effectiveTTL(c.cfg.defaultTTL),
@@ -2159,7 +2165,7 @@ func (c *Cache[K, V]) PeekOrAdd(key K, value V) (V, bool, error) {
 	defer s.mu.Unlock()
 	if existing, ok := s.storage.get(key); ok && !existing.expired(now) && !existing.flags.has(flagNegative) {
 		// Peek semantics: do NOT call OnAccess and do not bump hits.
-		return c.returnValue(existing.value), true, nil
+		return c.returnValue(existing.loadValue()), true, nil
 	}
 	c.upsertLocked(s, key, value, weight,
 		c.effectiveTTL(c.cfg.defaultTTL),
@@ -2378,7 +2384,7 @@ func (c *Cache[K, V]) DeleteWhere(pred func(key K, value V) bool) int {
 			if c.entryExpiredLocked(e, now) || e.flags.has(flagNegative) {
 				return true
 			}
-			pairs = append(pairs, candidate{key: e.key, value: e.value})
+			pairs = append(pairs, candidate{key: e.key, value: e.loadValue()})
 			return true
 		})
 		s.mu.RUnlock()
@@ -2520,7 +2526,7 @@ func (c *Cache[K, V]) loadOrJoin(
 
 	// Cache hit on a fresh, non-negative entry.
 	if e, ok := s.storage.get(key); ok && !c.entryExpiredLocked(e, now) && !e.flags.has(flagNegative) {
-		v := e.value
+		v := e.loadValue()
 		e.hits.Add(1)
 		if e.touchAccess(now) {
 			s.expiryFix(e)
@@ -2748,7 +2754,7 @@ func (c *Cache[K, V]) insertNegativeTombstoneLocked(s *shard[K, V], key K) {
 			existing.tags = existing.tags[:0]
 		}
 		var zero V
-		existing.value = zero
+		existing.storeValue(zero)
 		existing.weight = 1
 		existing.expireAt.Store(expireAt)
 		existing.lastAccess.Store(now)
@@ -2772,6 +2778,7 @@ func (c *Cache[K, V]) insertNegativeTombstoneLocked(s *shard[K, V], key K) {
 	e.expireAt.Store(expireAt)
 	e.flags |= flagNegative
 	s.storage.set(key, e)
+	s.markAmended()
 	s.expiryAdd(e)
 	s.policy.OnInsert(e)
 	c.counters.entries.Add(1)

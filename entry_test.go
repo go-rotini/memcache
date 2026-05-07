@@ -106,11 +106,11 @@ func TestEntryTouchAccessNonSliding(t *testing.T) {
 func TestEntryMetadataSnapshotCopiesTags(t *testing.T) {
 	e := &entry[string, int]{
 		key:      "k",
-		value:    1,
 		inserted: time.Now().UnixNano(),
 		weight:   42,
 		tags:     []string{"a", "b"},
 	}
+	e.storeValue(1)
 	m := e.metadata()
 	if m.Weight != 42 {
 		t.Errorf("Weight = %d, want 42", m.Weight)
@@ -129,9 +129,9 @@ func TestEntryMetadataSnapshotCopiesTags(t *testing.T) {
 func TestEntryMetadataNoTTL(t *testing.T) {
 	e := &entry[string, int]{
 		key:      "k",
-		value:    1,
 		inserted: time.Now().UnixNano(),
 	}
+	e.storeValue(1)
 	m := e.metadata()
 	if !m.Expiry.IsZero() {
 		t.Errorf("Expiry should be zero for no-TTL entry, got %v", m.Expiry)
@@ -141,7 +141,6 @@ func TestEntryMetadataNoTTL(t *testing.T) {
 func TestEntryReset(t *testing.T) {
 	e := &entry[string, *int]{
 		key:        "k",
-		value:      new(int),
 		inserted:   1,
 		weight:     5,
 		tags:       []string{"x"},
@@ -149,6 +148,7 @@ func TestEntryReset(t *testing.T) {
 		slidingTTL: int64(time.Minute),
 		policyData: "anything",
 	}
+	e.storeValue(new(int))
 	e.expireAt.Store(999)
 	e.lastAccess.Store(999)
 	e.hits.Store(7)
@@ -156,7 +156,7 @@ func TestEntryReset(t *testing.T) {
 
 	e.reset()
 
-	if e.key != "" || e.value != nil {
+	if e.key != "" || e.value.Load() != nil {
 		t.Error("reset should zero key and value")
 	}
 	if e.weight != 0 || e.flags != 0 || e.slidingTTL != 0 {
@@ -177,7 +177,7 @@ func TestEntryPoolReuse(t *testing.T) {
 	p := newEntryPool[string, int]()
 	a := p.get()
 	a.key = "x"
-	a.value = 42
+	a.storeValue(42)
 	p.put(a)
 
 	// We can't strictly assert that the next Get returns the exact
@@ -185,8 +185,8 @@ func TestEntryPoolReuse(t *testing.T) {
 	// GC pressure), but we can assert that whatever we get back is
 	// zero-valued.
 	b := p.get()
-	if b.key != "" || b.value != 0 {
-		t.Errorf("entry from pool should be reset; got key=%q value=%d", b.key, b.value)
+	if b.key != "" || b.value.Load() != nil {
+		t.Errorf("entry from pool should be reset; got key=%q value=%v", b.key, b.value.Load())
 	}
 }
 

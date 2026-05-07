@@ -1,5 +1,7 @@
 package memcache
 
+import "sync/atomic"
+
 // s3fifoPolicy implements the S3-FIFO eviction algorithm
 // (Yang et al., SOSP 2023).
 //
@@ -47,8 +49,12 @@ type s3fifoPolicy[K comparable, V any] struct {
 type s3Node[K comparable, V any] struct {
 	entry      *entry[K, V]
 	next, prev *s3Node[K, V]
-	freq       uint8 // saturating 0..3
-	inMain     bool
+	// freq is a saturating 0..3 counter mutated atomically so the
+	// lock-free Get fast path ([WithLockFreeRead]) can both read it
+	// (in PromotionNeeded) and bump it (in OnAccess) without taking
+	// the shard lock.
+	freq   atomic.Uint32
+	inMain bool
 }
 
 // s3GhostNode tracks a recently-evicted key (from Small). It carries
@@ -59,7 +65,7 @@ type s3GhostNode[K comparable] struct {
 }
 
 // s3FreqMax is the saturating ceiling for s3Node.freq.
-const s3FreqMax uint8 = 3
+const s3FreqMax uint32 = 3
 
 // newS3FIFO constructs an empty S3-FIFO policy sized for the given
 // shard budget. A non-positive budget produces a policy with
@@ -121,7 +127,7 @@ func (p *s3fifoPolicy[K, V]) OnInsert(e *entry[K, V]) {
 		// place directly into Main and clear the Ghost record.
 		p.unlinkGhost(g)
 		n.inMain = true
-		n.freq = 1
+		n.freq.Store(1)
 		p.pushMainTail(n)
 	} else {
 		p.pushSmallTail(n)
@@ -135,8 +141,8 @@ func (p *s3fifoPolicy[K, V]) OnAccess(e *entry[K, V]) {
 	if !ok || n == nil {
 		return
 	}
-	if n.freq < s3FreqMax {
-		n.freq++
+	if n.freq.Load() < s3FreqMax {
+		n.freq.Add(1)
 	}
 }
 
@@ -181,11 +187,11 @@ func (p *s3fifoPolicy[K, V]) Victim() *entry[K, V] {
 	for range p.smallSize + p.mainSize + 1 {
 		if p.smallSize > p.smallBudget && p.smallHead != nil {
 			n := p.smallHead
-			if n.freq >= 1 {
+			if n.freq.Load() >= 1 {
 				// Promote to Main: clear freq per S3-FIFO
 				// semantics so it gets a fair shake there.
 				p.unlinkSmall(n)
-				n.freq = 0
+				n.freq.Store(0)
 				n.inMain = true
 				p.pushMainTail(n)
 				continue
@@ -197,8 +203,8 @@ func (p *s3fifoPolicy[K, V]) Victim() *entry[K, V] {
 		}
 		if p.mainSize > p.mainBudget && p.mainHead != nil {
 			n := p.mainHead
-			if n.freq >= 1 {
-				n.freq--
+			if n.freq.Load() >= 1 {
+				n.freq.Add(^uint32(0))
 				p.unlinkMain(n)
 				p.pushMainTail(n)
 				continue
@@ -388,5 +394,5 @@ func (p *s3fifoPolicy[K, V]) PromotionNeeded(e *entry[K, V]) bool {
 	if !ok || n == nil {
 		return true
 	}
-	return n.freq < s3FreqMax
+	return n.freq.Load() < s3FreqMax
 }

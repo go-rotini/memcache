@@ -1,6 +1,9 @@
 package memcache
 
-import "sync"
+import (
+	"sync"
+	"sync/atomic"
+)
 
 // shard is one of the cache's hash-routed partitions. Each shard owns
 // its own storage, eviction policy, and sync.Pool of entries;
@@ -60,6 +63,18 @@ type shard[K comparable, V any] struct {
 	// to storage; the apply goroutine drains it under shard.mu.Lock.
 	// nil when async writes are off.
 	pending map[K]pendingOp[K, V]
+
+	// read is the lock-free read snapshot of this shard's storage,
+	// published behind an atomic pointer. nil when [WithLockFreeRead]
+	// is off; non-nil (possibly empty) when the option is on. The
+	// pointer is replaced wholesale on promotion — the underlying
+	// readMap is never mutated after construction.
+	read atomic.Pointer[readMap[K, V]]
+
+	// readMisses counts how many times reads observed a miss in
+	// the snapshot but a hit (or amended state) in dirty since the
+	// last promotion. Used to drive lazy snapshot rebuilding.
+	readMisses atomic.Int64
 }
 
 // newShard constructs a shard with the given policy, budget, TTL

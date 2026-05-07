@@ -19,15 +19,15 @@ func TestS3FIFOInsertAccessVictim(t *testing.T) {
 	}
 	// New entries land in Small. Both have freq=0.
 	p.OnAccess(a) // bump a's freq
-	if n := a.policyData.(*s3Node[string, int]); n.freq != 1 {
-		t.Errorf("a.freq after access = %d, want 1", n.freq)
+	if n := a.policyData.(*s3Node[string, int]); n.freq.Load() != 1 {
+		t.Errorf("a.freq after access = %d, want 1", n.freq.Load())
 	}
 	// Saturate.
 	for range 10 {
 		p.OnAccess(a)
 	}
-	if n := a.policyData.(*s3Node[string, int]); n.freq != s3FreqMax {
-		t.Errorf("a.freq saturated = %d, want %d", n.freq, s3FreqMax)
+	if n := a.policyData.(*s3Node[string, int]); n.freq.Load() != s3FreqMax {
+		t.Errorf("a.freq saturated = %d, want %d", n.freq.Load(), s3FreqMax)
 	}
 }
 

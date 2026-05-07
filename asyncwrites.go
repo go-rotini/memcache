@@ -353,6 +353,32 @@ func (c *Cache[K, V]) asyncDelete(key K) bool {
 	return true
 }
 
+// tryServeFromAsyncPending is the [Cache.getCtx] entry point for
+// the async-writes visibility check. Returns (val, hit, terminal)
+// where `terminal` is true when a pending Set/Delete covers the
+// key and the caller can return immediately. When terminal is
+// false the caller falls through to the storage path.
+func (c *Cache[K, V]) tryServeFromAsyncPending(s *shard[K, V], key K, now int64) (V, bool, bool) {
+	var zero V
+	if s.pending == nil {
+		return zero, false, false
+	}
+	s.mu.RLock()
+	val, kind, hit := c.asyncReadHit(s, key, now)
+	s.mu.RUnlock()
+	if !hit {
+		return zero, false, false
+	}
+	if kind == pendingOpDelete {
+		c.recordMiss()
+		c.fireMiss(key)
+		return zero, false, true
+	}
+	c.recordHitObserve(key)
+	c.fireHit(key, val)
+	return c.returnValue(val), true, true
+}
+
 // asyncReadHit is consulted by every Get-style read path before
 // looking at the shard's storage. Returns (value, kind, true) when
 // a pending op covers the key — Set ops yield the pending value,

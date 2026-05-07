@@ -17,8 +17,13 @@ type entry[K comparable, V any] struct {
 	// Identity
 	key K
 
-	// Value
-	value V
+	// Value is held behind an atomic.Pointer so the lock-free read
+	// path (item #8) can read it without holding the shard lock.
+	// Reads use [entry.loadValue]; writes use [entry.storeValue].
+	// The pointer is non-nil for any live entry; reset() clears it
+	// so the GC can reclaim the previous V before the entry is
+	// recycled through the pool.
+	value atomic.Pointer[V]
 
 	// Lifecycle timestamps (unix nanos; 0 means "no TTL" for expireAt).
 	expireAt   atomic.Int64
@@ -67,6 +72,14 @@ type entry[K comparable, V any] struct {
 
 	// Bit flags (saves memory vs separate bool fields).
 	flags entryFlags
+
+	// invalidatedFlag is set atomically by removeLocked when
+	// [WithLockFreeRead] is enabled; the lock-free read path
+	// consults it before returning the entry's value. It lives
+	// outside `flags` because it must be settable WITHOUT the
+	// shard lock — the read path observes it concurrently with
+	// any write.
+	invalidatedFlag atomic.Bool
 }
 
 // entryFlags is a bit field of per-entry state.
@@ -79,6 +92,22 @@ const (
 	// value field is the zero V; gets return ErrNotFound).
 	flagNegative
 )
+
+// invalidated reports whether the entry has been removed from its
+// owning shard's storage. Set atomically by [Cache.removeLocked]
+// when [WithLockFreeRead] is on, so the lock-free read path can
+// detect "in-snapshot but no longer live" entries and miss
+// correctly. Default zero value (false) covers the common case.
+func (e *entry[K, V]) invalidated() bool {
+	return e.invalidatedFlag.Load()
+}
+
+// markInvalidated atomically marks the entry as removed. Idempotent.
+// Caller may or may not hold the shard lock — the flag is atomic so
+// concurrent readers observe the transition without lock.
+func (e *entry[K, V]) markInvalidated() {
+	e.invalidatedFlag.Store(true)
+}
 
 // has reports whether all f bits are set.
 func (e entryFlags) has(f entryFlags) bool { return e&f == f }
@@ -153,14 +182,34 @@ func (e *entry[K, V]) metadata() Metadata {
 	}
 }
 
+// loadValue atomically reads the entry's value. Returns the zero V
+// when the value pointer is nil (the entry has been reset and not
+// yet re-initialized — practically only observable via races between
+// reset and the lock-free read path, which the invalidation flag is
+// intended to guard).
+func (e *entry[K, V]) loadValue() V {
+	p := e.value.Load()
+	if p == nil {
+		var zero V
+		return zero
+	}
+	return *p
+}
+
+// storeValue atomically replaces the entry's value. The supplied V
+// is heap-allocated by Go's escape analysis (the address-of below)
+// so the resulting pointer can be safely held across goroutines.
+func (e *entry[K, V]) storeValue(v V) {
+	e.value.Store(&v)
+}
+
 // reset zeros out the entry's mutable fields so it can be returned to a
 // sync.Pool. Pointer-bearing fields are explicitly cleared so the GC can
 // reclaim the prior value.
 func (e *entry[K, V]) reset() {
 	var zeroK K
-	var zeroV V
 	e.key = zeroK
-	e.value = zeroV
+	e.value.Store(nil)
 	e.expireAt.Store(0)
 	e.inserted = 0
 	e.lastAccess.Store(0)
@@ -172,6 +221,7 @@ func (e *entry[K, V]) reset() {
 	e.slidingTTL = 0
 	e.heapIndex = -1
 	e.policyData = nil
+	e.invalidatedFlag.Store(false)
 }
 
 // entryPool is a per-cache sync.Pool of entries. Allocating a fresh pool

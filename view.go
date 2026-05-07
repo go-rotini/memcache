@@ -152,7 +152,7 @@ func (c *Cache[K, V]) Clone() (*Cache[K, V], error) {
 			tagsCopy := append([]string(nil), e.tags...)
 			staged = append(staged, cloneEntry{
 				key:        e.key,
-				value:      e.value,
+				value:      e.loadValue(),
 				weight:     e.weight,
 				expireAt:   e.expireAt.Load(),
 				slidingTTL: e.slidingTTL,
@@ -169,7 +169,7 @@ func (c *Cache[K, V]) Clone() (*Cache[K, V], error) {
 		ns.mu.Lock()
 		ne := ns.pool.get()
 		ne.key = ce.key
-		ne.value = ce.value
+		ne.storeValue(ce.value)
 		ne.weight = ce.weight
 		ne.inserted = now
 		ne.lastAccess.Store(now)

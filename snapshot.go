@@ -302,7 +302,7 @@ func (c *Cache[K, V]) snapshotEntries() []entrySnapshot[K, V] {
 			}
 			snap := entrySnapshot[K, V]{
 				key:      e.key,
-				value:    e.value,
+				value:    e.loadValue(),
 				expireAt: e.expireAt.Load(),
 				weight:   e.weight,
 				inserted: e.inserted,
@@ -337,7 +337,7 @@ func (c *Cache[K, V]) applySnapshot(snap entrySnapshot[K, V]) {
 
 	e := s.pool.get()
 	e.key = snap.key
-	e.value = snap.value
+	e.storeValue(snap.value)
 	e.weight = snap.weight
 	e.inserted = snap.inserted
 	e.lastAccess.Store(snap.inserted)

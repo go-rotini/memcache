@@ -179,7 +179,7 @@ func (c *Cache[K, V]) Dump(w io.Writer) error {
 func (e *entry[K, V]) item() Item[V] {
 	m := e.metadata()
 	return Item[V]{
-		Value:      e.value,
+		Value:      e.loadValue(),
 		Expiry:     m.Expiry,
 		LastAccess: m.LastAccess,
 		Inserted:   m.Inserted,

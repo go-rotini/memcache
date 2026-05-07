@@ -122,7 +122,7 @@ func (c *Cache[K, V]) Compute(
 	var current V
 	var present bool
 	if e, ok := s.storage.get(key); ok && !c.entryExpiredLocked(e, now) && !e.flags.has(flagNegative) {
-		current = e.value
+		current = e.loadValue()
 		present = true
 	}
 
@@ -183,7 +183,7 @@ func (c *Cache[K, V]) ComputeIfAbsent(
 	defer s.mu.Unlock()
 
 	if e, ok := s.storage.get(key); ok && !c.entryExpiredLocked(e, now) && !e.flags.has(flagNegative) {
-		return e.value, false, nil
+		return e.loadValue(), false, nil
 	}
 
 	v, ttl, ferr := fn()
@@ -235,7 +235,7 @@ func (c *Cache[K, V]) ComputeIfPresent(
 	if !ok || c.entryExpiredLocked(e, now) || e.flags.has(flagNegative) {
 		return zero, nil
 	}
-	current := e.value
+	current := e.loadValue()
 
 	newValue, action, err := fn(current)
 	if err != nil {
@@ -282,7 +282,7 @@ func (c *Cache[K, V]) Update(key K, fn func(cur V) V) (V, error) {
 	if !ok || c.entryExpiredLocked(e, now) || e.flags.has(flagNegative) {
 		return zero, ErrNotFound
 	}
-	newValue := fn(e.value)
+	newValue := fn(e.loadValue())
 	weight, werr := c.computeWeight(key, newValue)
 	if werr != nil {
 		return zero, werr
@@ -313,7 +313,7 @@ func (c *Cache[K, V]) CompareAndSwap(key K, old, newValue V) bool {
 	if !ok || c.entryExpiredLocked(e, now) || e.flags.has(flagNegative) {
 		return false
 	}
-	if !reflect.DeepEqual(e.value, old) {
+	if !reflect.DeepEqual(e.loadValue(), old) {
 		return false
 	}
 	weight, err := c.computeWeight(key, newValue)
