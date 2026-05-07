@@ -38,7 +38,7 @@ func TestFlatStoreNewHonorsInitialCapMinimum(t *testing.T) {
 func TestFlatStoreNewRoundsToPowerOfTwo(t *testing.T) {
 	fs := newFlatStore[string, int](stubHasher, 33)
 	if got := len(fs.slots); got != 64 {
-		t.Errorf("slots = %d, want 64 (next power of two ≥ 33)", got)
+		t.Errorf("slots = %d, want 64 (next power of two >= 33)", got)
 	}
 }
 
@@ -194,7 +194,7 @@ func TestFlatStoreClearAllResetsState(t *testing.T) {
 }
 
 func TestFlatStoreGrowsWhenLoadFactorExceeded(t *testing.T) {
-	// Initial cap 16; load factor 0.75 → grow at 12 in-use slots.
+	// Initial cap 16; load factor 0.75 grows at 12 in-use slots.
 	fs := newFlatStore[string, int](stubHasher, 16)
 	startCap := len(fs.slots)
 	startCompactions := fs.compactions()
@@ -257,7 +257,7 @@ func TestFlatStoreCompactionsIsIdempotentAfterClear(t *testing.T) {
 		fs.set(k, mkEntry(k, i))
 	}
 	fs.clearAll()
-	// clearAll does not reset the compactions counter — it is a
+	// clearAll does not reset the compactions counter; it is a
 	// monotone history of operations.
 	if got := fs.compactions(); got > 1 {
 		// One grow could have triggered before the clear; that's

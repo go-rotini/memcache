@@ -163,9 +163,8 @@ func TestAsyncWritesPropagatesToStore(t *testing.T) {
 }
 
 func TestAsyncWritesStoreErrorDoesNotBlockCaller(t *testing.T) {
-	// When async writes are on, a Store failure during apply must
-	// not propagate back to the caller — it's logged. The caller
-	// has already moved on.
+	// With async writes on, a Store failure during apply must not
+	// propagate back to the caller; it is logged.
 	inner := NewMemoryStore[string, int](nil)
 	store := newTrackingStore[string, int](inner)
 
@@ -182,9 +181,8 @@ func TestAsyncWritesStoreErrorDoesNotBlockCaller(t *testing.T) {
 	if err := c.Set("k", 1); err != nil {
 		t.Fatalf("Set returned %v, want nil (async writes swallow store errors)", err)
 	}
-	// The in-memory entry is still there — apply ran and the
-	// upsert succeeded; the Store call failed but apply doesn't
-	// roll back in the async path.
+	// The in-memory entry is still there: apply ran and the
+	// upsert succeeded; async path does not roll back on Store fail.
 	_ = c.Sync(context.Background())
 	if got, ok := c.Get("k"); !ok || got != 1 {
 		t.Errorf("post-Sync Get(k) = (%d, %v), want (1, true)", got, ok)

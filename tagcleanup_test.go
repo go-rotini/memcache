@@ -14,8 +14,8 @@ func TestTagCleanupBacklogDrainsAfterEvictions(t *testing.T) {
 	for i := range 50 {
 		_ = c.SetWithTags(itoaSimple(i), i, "tag-shared")
 	}
-	// Delete every entry — this fires removeLocked which enqueues
-	// untag ops. After Sync, the tag index must be empty.
+	// Delete every entry; removeLocked enqueues untag ops. After
+	// Sync the tag index must be empty.
 	for i := range 50 {
 		c.Delete(itoaSimple(i))
 	}
@@ -53,7 +53,7 @@ func TestTagCleanupCloseDrainsRemaining(t *testing.T) {
 		_ = c.SetWithTags(itoaSimple(i), i, "tag")
 		c.Delete(itoaSimple(i))
 	}
-	// Close without Sync — the drainer must catch up before
+	// Close without Sync; the drainer must catch up before
 	// returning so post-Close state is settled.
 	if err := c.Close(); err != nil {
 		t.Fatal(err)
@@ -70,11 +70,11 @@ func TestTagCleanupInvalidateTagAfterEvictionDoesNotDoubleFree(t *testing.T) {
 	for i := range 30 {
 		_ = c.SetWithTags(itoaSimple(i), i, "shared")
 	}
-	// Delete half — these enqueue untags.
+	// Delete half; these enqueue untags.
 	for i := range 15 {
 		c.Delete(itoaSimple(i))
 	}
-	// Invalidate the tag — walks the (still-stale) index.
+	// Invalidate the tag; walks the (still-stale) index.
 	dropped := c.InvalidateTag("shared")
 	if dropped < 0 {
 		t.Errorf("InvalidateTag returned %d", dropped)

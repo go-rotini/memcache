@@ -119,7 +119,6 @@ func (c *FakeClock) collectDueLocked(t time.Time) []*fakeTimer {
 	if len(c.timers) == 0 {
 		return nil
 	}
-	// Sort timers by deadline so that fires happen in chronological order.
 	sort.SliceStable(c.timers, func(i, j int) bool {
 		return c.timers[i].deadline.Before(c.timers[j].deadline)
 	})
@@ -138,8 +137,6 @@ func (c *FakeClock) collectDueLocked(t time.Time) []*fakeTimer {
 		}
 		keep = append(keep, ft)
 	}
-	// Zero out unused slots to release any references held by removed
-	// pointers from the underlying array.
 	for i := len(keep); i < len(c.timers); i++ {
 		c.timers[i] = nil
 	}
@@ -152,11 +149,8 @@ type fakeTimer struct {
 	deadline time.Time
 	fn       func()
 	active   bool
-	// inList tracks whether this timer is currently in the
-	// FakeClock.timers slice. Cleared when the timer fires (or is
-	// stopped via collectDue), set when AfterFunc/Reset re-inserts
-	// it. Reset on a fired timer must re-add it to the list so
-	// repeating callers (the cache janitor) work correctly.
+	// inList tracks whether this timer is in FakeClock.timers; Reset on
+	// a fired timer must re-add it for periodic callers to work.
 	inList bool
 }
 
@@ -175,14 +169,9 @@ func (ft *fakeTimer) Stop() bool {
 	return wasActive
 }
 
-// Reset sets a new deadline for the timer. Returns true if the timer was
-// active before the reset.
-//
-// Reset on a timer that has already fired (and been removed from the
-// FakeClock's pending list) re-inserts it so the next [FakeClock.Advance]
-// or [FakeClock.Set] will fire it again. This matches the semantics of
-// time.Timer.Reset on the real clock and is essential for periodic
-// callers (e.g., the cache's janitor) that re-arm in their own callback.
+// Reset sets a new deadline for the timer and returns true if the timer
+// was active before the reset. Reset on a fired timer re-inserts it into
+// the pending list, matching time.Timer.Reset semantics.
 func (ft *fakeTimer) Reset(d time.Duration) bool {
 	ft.clock.mu.Lock()
 	defer ft.clock.mu.Unlock()

@@ -36,15 +36,9 @@ type subscription[K comparable, V any] struct {
 	kinds eventKindMask
 }
 
-// eventBus is the cache-level fan-out. publish iterates every
-// registered subscription under the bus's read lock, attempting a
-// non-blocking send per matching channel; full channels increment
-// the drop counter and the event is silently dropped for that
-// subscriber.
-//
-// The drop policy is intentional — slow subscribers must not block
-// cache operations. Callers who require lossless delivery should
-// drain on a dedicated goroutine and size their buffer generously.
+// eventBus is the cache-level fan-out. publish does a non-blocking send
+// per matching channel; full channels drop the event and bump the drop
+// counter. Slow subscribers must not block cache operations.
 type eventBus[K comparable, V any] struct {
 	mu     sync.RWMutex
 	subs   map[uint64]*subscription[K, V]
@@ -89,10 +83,8 @@ func (b *eventBus[K, V]) unsubscribe(id uint64) {
 	}
 }
 
-// publish fans the event out to every matching subscriber.
-// dropCounter, when non-nil, is bumped for each subscriber whose
-// channel was full. Safe to call after Close — it just iterates an
-// empty subs map.
+// publish fans e out. dropCounter, when non-nil, is bumped per full
+// channel. Safe to call after Close.
 func (b *eventBus[K, V]) publish(e Event[K, V], dropCounter *atomic.Uint64) {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
@@ -127,19 +119,10 @@ func (b *eventBus[K, V]) close() {
 	}
 }
 
-// Subscribe registers a buffered channel that receives every event
-// whose kind matches the supplied filter. Pass no kinds to receive
-// every event. The returned channel has buffer capacity buf (or the
-// cache-configured [WithEventsBuffer] default when buf <= 0).
-//
-// The returned cancel function unsubscribes and closes the channel
-// so a `for ... range ch` loop will terminate. Closing the cache
-// also closes every subscriber channel.
-//
-// If buf events stack up before the consumer drains them, further
-// events are silently dropped — drops are counted in
-// [Stats.EventsDropped]. Slow consumers should size buf generously
-// or drain on a dedicated goroutine.
+// Subscribe registers a buffered channel for events matching kinds (no
+// kinds = all). The returned cancel function unsubscribes and closes
+// the channel. Drops on full channels are counted in
+// [Stats.EventsDropped].
 func (c *Cache[K, V]) Subscribe(buf int, kinds ...EventKind) (<-chan Event[K, V], func()) {
 	if buf <= 0 {
 		buf = c.cfg.eventsBuffer

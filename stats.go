@@ -11,10 +11,9 @@ import (
 
 // Stats is a point-in-time snapshot of per-cache statistics.
 //
-// All counters are monotonic from the cache's perspective — they are
-// reset only via [Cache.ResetStats]. Loads of [Stats] from a running
-// cache are best-effort consistent: each field is loaded atomically,
-// but the snapshot as a whole may straddle concurrent operations.
+// All counters are monotonic and are reset only by [Cache.ResetStats].
+// Each field is loaded atomically; the snapshot as a whole may straddle
+// concurrent operations.
 type Stats struct {
 	// Hits is the number of Get-style operations that returned a
 	// fresh value.
@@ -102,7 +101,7 @@ type Stats struct {
 
 	// TagInvalidations counts [Cache.InvalidateTag] /
 	// [Cache.InvalidateTags] calls (one per call, not per dropped
-	// entry — those land in EvictionsByReason[EvictReasonTag]).
+	// entry; those land in EvictionsByReason[EvictReasonTag]).
 	TagInvalidations uint64
 
 	// TagsTracked is the live tag-index size (distinct tag count).
@@ -115,12 +114,8 @@ type Stats struct {
 	// reducing tag churn.
 	TagCleanupBacklog int
 
-	// Compactions counts the cumulative number of storage rebuilds
-	// performed across all shards. Always 0 unless [WithFlatStorage]
-	// is enabled — the default map storage never compacts. A
-	// persistently-rising counter under steady-state load suggests
-	// the workload is dominated by tombstone churn and the default
-	// map storage may serve it better.
+	// Compactions counts cumulative storage rebuilds across shards;
+	// always 0 unless [WithFlatStorage] is enabled.
 	Compactions uint64
 
 	// Uptime is the wall-clock duration since [New] returned.
@@ -186,17 +181,9 @@ func (s Stats) HitRate() float64 {
 	return float64(s.Hits) / float64(total)
 }
 
-// statsCounters is the live, mutable counter set updated on the hot
-// path. It is converted to a [Stats] value on demand by Snapshot.
-//
-// Hits and misses use [shardedCounter] when [WithShardedStats] is
-// enabled (slot count = runtime.GOMAXPROCS×4, capped at 256) so
-// >32-core machines avoid cache-line contention. The remaining
-// fields stay as plain atomic.Uint64 — they are touched
-// significantly less often (only on inserts, evictions, etc.) and
-// the constant-factor savings would not justify the indirection.
-// hitsShard / missesShard are nil when sharded stats are off; in
-// that case hits / misses are the live counters.
+// statsCounters is the live mutable counter set converted to [Stats] by
+// Snapshot. With [WithShardedStats], hits/misses use [shardedCounter]
+// to avoid cache-line contention; other fields stay as atomic.Uint64.
 type statsCounters struct {
 	hits                 atomic.Uint64
 	misses               atomic.Uint64

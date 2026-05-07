@@ -55,12 +55,9 @@ type entry[K comparable, V any] struct {
 	// the wheel-based backend is active.
 	heapIndex int
 
-	// wheelHandle is the back-pointer to the wheel entry tracking
-	// this expiration. Used only by the wheel-based ttlBackend
-	// ([WithTTLBuckets]); nil when the heap-based backend is
-	// active. The field is `any` rather than the concrete wheel
-	// type to keep entry independent of the wheel package — the
-	// wheel backend type-asserts to recover the *wheel.Entry.
+	// wheelHandle is the back-pointer to the wheel entry. Typed as any
+	// to keep entry independent of the wheel package; the wheel backend
+	// type-asserts to recover the *wheel.Entry.
 	wheelHandle any
 
 	// Tags (nil if untagged).
@@ -74,11 +71,9 @@ type entry[K comparable, V any] struct {
 	flags entryFlags
 
 	// invalidatedFlag is set atomically by removeLocked when
-	// [WithLockFreeRead] is enabled; the lock-free read path
-	// consults it before returning the entry's value. It lives
-	// outside `flags` because it must be settable WITHOUT the
-	// shard lock — the read path observes it concurrently with
-	// any write.
+	// [WithLockFreeRead] is on. Lives outside flags because it MUST be
+	// settable without the shard lock; the read path observes it
+	// concurrently with writes.
 	invalidatedFlag atomic.Bool
 }
 
@@ -94,17 +89,14 @@ const (
 )
 
 // invalidated reports whether the entry has been removed from its
-// owning shard's storage. Set atomically by [Cache.removeLocked]
-// when [WithLockFreeRead] is on, so the lock-free read path can
-// detect "in-snapshot but no longer live" entries and miss
-// correctly. Default zero value (false) covers the common case.
+// owning shard's storage. Used by the lock-free read path to detect
+// "in-snapshot but no longer live" entries.
 func (e *entry[K, V]) invalidated() bool {
 	return e.invalidatedFlag.Load()
 }
 
-// markInvalidated atomically marks the entry as removed. Idempotent.
-// Caller may or may not hold the shard lock — the flag is atomic so
-// concurrent readers observe the transition without lock.
+// markInvalidated atomically marks the entry as removed. Idempotent;
+// caller may or may not hold the shard lock.
 func (e *entry[K, V]) markInvalidated() {
 	e.invalidatedFlag.Store(true)
 }
@@ -119,19 +111,11 @@ func (e *entry[K, V]) expired(now int64) bool {
 	return exp != 0 && now >= exp
 }
 
-// touchAccess updates lastAccess. For sliding-TTL entries it also
-// pushes the expireAt forward to `now + slidingTTL`. To avoid a
-// write-storm on hot keys, the sliding refresh is COALESCED: it
-// only fires when the access is more than `slidingTTL/4` newer than
-// the previously recorded lastAccess. Non-sliding entries always
-// update lastAccess (the cost is one atomic store per Get).
-//
-// Returns true when the entry's expireAt was actually moved — the
-// caller can use this signal to drive [Cache.expiryFix].
-//
-// Multiple concurrent readers may race here under the shard read
-// lock; the race is benign because all racers write approximately
-// the same value.
+// touchAccess updates lastAccess and, for sliding-TTL entries, pushes
+// expireAt forward to now+slidingTTL. The sliding refresh is coalesced:
+// it only fires when the access is more than slidingTTL/4 newer than
+// the previously recorded lastAccess. Returns true when expireAt was
+// moved (signal for [Cache.expiryFix]). Concurrent racers are benign.
 func (e *entry[K, V]) touchAccess(nowNanos int64) (expiryShifted bool) {
 	if !e.flags.has(flagSliding) || e.slidingTTL <= 0 {
 		e.lastAccess.Store(nowNanos)
@@ -139,12 +123,8 @@ func (e *entry[K, V]) touchAccess(nowNanos int64) (expiryShifted bool) {
 	}
 	prev := e.lastAccess.Load()
 	if nowNanos-prev < e.slidingTTL/4 {
-		// Access too close to the previous one — skip the
-		// expireAt write entirely. Sliding semantics are
-		// preserved because the recorded expireAt already
-		// covers `now`. (If prev == 0 this is the post-insert
-		// read, which is by definition close to insertion and
-		// safe to coalesce.)
+		// Access too close to the previous one; skip the expireAt
+		// write. The recorded expireAt already covers now.
 		return false
 	}
 	e.lastAccess.Store(nowNanos)
@@ -183,10 +163,8 @@ func (e *entry[K, V]) metadata() Metadata {
 }
 
 // loadValue atomically reads the entry's value. Returns the zero V
-// when the value pointer is nil (the entry has been reset and not
-// yet re-initialized — practically only observable via races between
-// reset and the lock-free read path, which the invalidation flag is
-// intended to guard).
+// when the value pointer is nil (entry reset, observable only via
+// reset/lock-free-read races that the invalidation flag guards).
 func (e *entry[K, V]) loadValue() V {
 	p := e.value.Load()
 	if p == nil {

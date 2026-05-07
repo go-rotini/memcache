@@ -15,47 +15,27 @@ import (
 	"time"
 )
 
-// snapshotMagic is the 4-byte file signature prefix. The bytes
-// spell "RTNI" (rotini); a reader that doesn't see these refuses
-// the file with [ErrSnapshotIncompatible].
+// snapshotMagic is the 4-byte file signature ("RTNI"). Readers reject
+// non-matching files with [ErrSnapshotIncompatible].
 const snapshotMagic = "RTNI"
 
-// snapshotVersion is the on-disk format version. Writers stamp
-// this; readers reject anything they don't understand.
-//
-// Version history:
-//   - v1: original format (magic + version + codec + name +
-//     saveTime + count + records + CRC32C).
-//   - v2 (current): adds a length-prefixed string→string metadata
-//     bag immediately after `name`, supporting [WithSnapshotMetadata]
-//     and [InspectSnapshot]'s Metadata accessor.
+// snapshotVersion is the on-disk format version. v2 adds a metadata
+// map after `name` for [WithSnapshotMetadata] / [InspectSnapshot].
 const snapshotVersion uint8 = 2
 
-// defaultMaxSnapshotBytes caps Load input when [WithMaxSnapshotBytes]
-// is not set — protects against OOM on a corrupt or hostile file.
+// defaultMaxSnapshotBytes caps Load input when [WithMaxSnapshotBytes] is
+// not set.
 const defaultMaxSnapshotBytes = int64(256 << 20) // 256 MiB
 
-// crcTable is the precomputed CRC32-Castagnoli polynomial table used
-// for snapshot integrity checks.
 var crcTable = crc32.MakeTable(crc32.Castagnoli)
 
-// errFieldTooBig fires when a snapshot field exceeds the 2 GiB
-// limit imposed by the uint32 length prefix. Wrapped by call
-// sites for context.
 var errFieldTooBig = errors.New("memcache: snapshot field exceeds 2 GiB")
-
-// errTooManyTags fires when an entry carries more than 255 tags;
-// the on-disk format reserves a single byte for the count.
 var errTooManyTags = errors.New("memcache: more than 255 tags per entry")
 
-// snapshotSchemaVersionKey is the reserved metadata key under which
-// versioned-struct fingerprints are stamped. Loads compare the
-// snapshot's value against the current schema and refuse mismatches
-// with [ErrSnapshotIncompatible].
+// snapshotSchemaVersionKey is the reserved metadata key for versioned
+// struct fingerprints; Load refuses mismatches with [ErrSnapshotIncompatible].
 const snapshotSchemaVersionKey = "__memcache_schema_version"
 
-// entrySnapshot is the per-entry record extracted from a live cache
-// at Save time and reconstructed during Load.
 type entrySnapshot[K comparable, V any] struct {
 	key      K
 	value    V
@@ -67,14 +47,10 @@ type entrySnapshot[K comparable, V any] struct {
 	tags     []string
 }
 
-// Save writes a snapshot of the cache to w using the cache's
-// configured [Codec]. The format is described in §9.2 of the
-// requirements: a magic-prefixed header, length-prefixed records,
-// and a trailing CRC32-Castagnoli over every preceding byte.
-//
-// Save acquires each shard's read lock in turn — concurrent reads
-// are unaffected, but writers to a shard being snapshotted block
-// until that shard's pass completes.
+// Save writes a snapshot of the cache to w using the cache's configured
+// [Codec]: magic-prefixed header, length-prefixed records, and a
+// trailing CRC32-Castagnoli. Acquires each shard's read lock in turn;
+// writers to a shard being snapshotted block until its pass completes.
 func (c *Cache[K, V]) Save(w io.Writer) (err error) {
 	if c.closed.Load() {
 		return ErrClosed
@@ -84,12 +60,9 @@ func (c *Cache[K, V]) Save(w io.Writer) (err error) {
 	return c.saveTo(w)
 }
 
-// saveTo is the closed-check-free Save implementation. Close calls
-// this directly so the final auto-save runs even though `closed`
-// has already been flipped.
+// saveTo is the closed-check-free Save implementation. Called by Close
+// so the final auto-save runs even with closed already flipped.
 func (c *Cache[K, V]) saveTo(w io.Writer) error {
-	// Materialize a stable view of every live entry under per-shard
-	// read locks so subsequent encoding can run lock-free.
 	staged := c.snapshotEntries()
 
 	crc := crc32.New(crcTable)
@@ -103,7 +76,7 @@ func (c *Cache[K, V]) saveTo(w io.Writer) error {
 			return err
 		}
 	}
-	// CRC trailer is written WITHOUT updating the CRC accumulator.
+	// CRC trailer is written without updating the CRC accumulator.
 	if err := binary.Write(w, binary.LittleEndian, crc.Sum32()); err != nil {
 		return wrapSaveErr("crc", err)
 	}
@@ -112,10 +85,8 @@ func (c *Cache[K, V]) saveTo(w io.Writer) error {
 	return nil
 }
 
-// SaveFile writes a snapshot to path atomically: the contents are
-// first written to a sibling temp file, fsync'd, then renamed into
-// place. Readers either see the prior snapshot or the new one,
-// never a torn write.
+// SaveFile writes a snapshot to path atomically via temp file + fsync +
+// rename. Readers see either the prior or new snapshot, never torn.
 func (c *Cache[K, V]) SaveFile(path string) error {
 	if c.closed.Load() {
 		return ErrClosed
@@ -124,8 +95,6 @@ func (c *Cache[K, V]) SaveFile(path string) error {
 }
 
 // saveFileTo is the closed-check-free SaveFile implementation.
-// Close calls this directly so the final auto-save runs even
-// though `closed` has already been flipped.
 func (c *Cache[K, V]) saveFileTo(path string) (err error) {
 	_, span := c.tracer.Start(context.Background(), "memcache.snapshot.save",
 		Attr{Key: "path", Value: path})
@@ -165,31 +134,21 @@ func (c *Cache[K, V]) saveFileTo(path string) (err error) {
 	return nil
 }
 
-// Load replaces the cache contents with the snapshot read from r.
-// Returns the number of entries actually inserted (records past
-// their TTL are skipped — they would expire instantly anyway).
-//
-// On any read or validation error the cache is left in a partially
-// loaded state; callers concerned about atomicity should use
-// [Cache.Merge] in concert with their own rollback strategy, or
-// load into a fresh cache via [Cache.Clone] semantics.
+// Load replaces the cache contents with the snapshot read from r and
+// returns the number of entries inserted. Records past their TTL are
+// skipped. On error the cache may be partially loaded.
 func (c *Cache[K, V]) Load(r io.Reader) (n int, err error) {
 	_, span := c.tracer.Start(context.Background(), "memcache.snapshot.load")
 	defer func() { span.End(err) }()
 	return c.loadInto(r, true)
 }
 
-// Merge reads a snapshot and folds its entries into the cache,
-// overwriting existing keys. Existing entries that are NOT in the
-// snapshot are left as-is. Returns the number of entries inserted
-// or replaced.
+// Merge folds the snapshot's entries into the cache, overwriting existing
+// keys. Untouched keys are preserved. Returns inserts plus replacements.
 func (c *Cache[K, V]) Merge(r io.Reader) (int, error) {
 	return c.loadInto(r, false)
 }
 
-// loadInto is the shared Load/Merge implementation. reset chooses
-// between the two semantics — true wipes the cache before
-// inserting (Load), false preserves untouched keys (Merge).
 func (c *Cache[K, V]) loadInto(r io.Reader, reset bool) (int, error) {
 	if c.closed.Load() {
 		return 0, ErrClosed
@@ -199,8 +158,7 @@ func (c *Cache[K, V]) loadInto(r io.Reader, reset bool) (int, error) {
 	if limit <= 0 {
 		limit = defaultMaxSnapshotBytes
 	}
-	// +1 so we can detect "exceeded the limit" rather than silently
-	// truncating at the limit.
+	// +1 so we detect exceeding the limit rather than silent truncation.
 	r = io.LimitReader(r, limit+1)
 
 	br := bufio.NewReader(r)
@@ -240,7 +198,6 @@ func (c *Cache[K, V]) loadInto(r io.Reader, reset bool) (int, error) {
 		if err != nil {
 			return loaded, err
 		}
-		// Skip records past their TTL.
 		if snap.expireAt != 0 && snap.expireAt <= now {
 			continue
 		}
@@ -248,7 +205,7 @@ func (c *Cache[K, V]) loadInto(r io.Reader, reset bool) (int, error) {
 		loaded++
 	}
 
-	// Trailing CRC is read directly (NOT through the tee) so the
+	// Trailing CRC is read directly (not through the tee) so the
 	// computed CRC does not mix with the stored one.
 	var stored uint32
 	if err := binary.Read(br, binary.LittleEndian, &stored); err != nil {
@@ -262,8 +219,8 @@ func (c *Cache[K, V]) loadInto(r io.Reader, reset bool) (int, error) {
 	return loaded, nil
 }
 
-// LoadFile loads a snapshot from path. Convenience wrapper around
-// [Cache.Load] that handles file open/close.
+// LoadFile loads a snapshot from path; convenience wrapper for
+// [Cache.Load] that opens and closes the file.
 func (c *Cache[K, V]) LoadFile(path string) (n int, err error) {
 	_, span := c.tracer.Start(context.Background(), "memcache.snapshot.load",
 		Attr{Key: "path", Value: path})
@@ -276,10 +233,9 @@ func (c *Cache[K, V]) LoadFile(path string) (n int, err error) {
 	return c.loadInto(f, true)
 }
 
-// InspectSnapshot reads only the header of a snapshot file and
-// returns its metadata without touching the records or running CRC
-// validation. Useful for compatibility checks before committing to
-// a full Load (e.g. "is this snapshot the right format/version?").
+// InspectSnapshot reads only the header of a snapshot file and returns
+// its metadata, skipping records and CRC. Useful for compatibility
+// checks before a full Load.
 func InspectSnapshot(path string) (*SnapshotInfo, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -297,17 +253,14 @@ func InspectSnapshot(path string) (*SnapshotInfo, error) {
 	return info, nil
 }
 
-// snapshotEntries returns a slice of entry records suitable for
-// serialization. Per-shard read locks bound concurrent writers
-// only for the shard being staged.
 func (c *Cache[K, V]) snapshotEntries() []entrySnapshot[K, V] {
 	now := c.cfg.clock.Now().UnixNano()
 	var out []entrySnapshot[K, V]
 	for _, s := range c.shards {
 		s.mu.RLock()
 		s.storage.each(func(e *entry[K, V]) bool {
-			// Skip TTL-expired and negative-cache tombstones —
-			// neither carries useful warm-restart state.
+			// Skip TTL-expired and negative tombstones; neither
+			// carries useful warm-restart state.
 			if e.expired(now) || e.flags.has(flagNegative) {
 				return true
 			}
@@ -331,18 +284,15 @@ func (c *Cache[K, V]) snapshotEntries() []entrySnapshot[K, V] {
 	return out
 }
 
-// applySnapshot inserts (or overwrites) one snapshotted record
-// into the cache while preserving the snapshot's expireAt and
-// inserted timestamps. Hits / generation reset to zero per spec —
-// the policy state is freshly initialized on Load.
+// applySnapshot inserts (or overwrites) one snapshotted record while
+// preserving the snapshot's expireAt and inserted timestamps. Hits and
+// generation reset to zero; policy state initializes fresh on Load.
 func (c *Cache[K, V]) applySnapshot(snap entrySnapshot[K, V]) {
 	s := c.shardFor(snap.key)
 	s.mu.Lock()
 	defer c.unlockShard(s)
 
 	if existing, ok := s.storage.get(snap.key); ok {
-		// Overwrite path (Merge semantics, or Load-after-non-empty
-		// edge case).
 		c.removeLocked(s, existing, EvictReasonReplaced)
 	}
 
@@ -370,9 +320,6 @@ func (c *Cache[K, V]) applySnapshot(snap entrySnapshot[K, V]) {
 	c.evictWhileOverBudgetLocked(s)
 }
 
-// writeHeader emits the fixed-shape file header. v2 adds a
-// metadata map between `name` and `saveTime` so InspectSnapshot
-// can recover it without scanning the records section.
 func (c *Cache[K, V]) writeHeader(w io.Writer, count int64) error {
 	if _, err := io.WriteString(w, snapshotMagic); err != nil {
 		return wrapSaveErr("magic", err)
@@ -398,11 +345,8 @@ func (c *Cache[K, V]) writeHeader(w io.Writer, count int64) error {
 	return nil
 }
 
-// effectiveSnapshotMetadata returns the user-supplied metadata
-// merged with package-reserved entries (currently the schema
-// version when V opts into versioning via the `versioned` cache
-// tag). The user's map is never mutated; reserved keys overwrite
-// any user value.
+// effectiveSnapshotMetadata returns user metadata merged with reserved
+// entries (e.g. schema version). Reserved keys win over user values.
 func (c *Cache[K, V]) effectiveSnapshotMetadata() map[string]string {
 	version := c.schemaVersion()
 	user := c.cfg.snapshotMetadata
@@ -415,17 +359,13 @@ func (c *Cache[K, V]) effectiveSnapshotMetadata() map[string]string {
 	return out
 }
 
-// schemaVersion returns the fingerprint produced by [schemaVersion]
-// (the package-level helper) for V's zero value, or "" when V is
-// not a versioned struct type.
 func (c *Cache[K, V]) schemaVersion() string {
 	var zero V
 	return schemaVersion(zero)
 }
 
-// writeMetadata emits a length-prefixed map. uint16 count then
-// (key, value) string pairs. Keys are sorted so saves are
-// deterministic given the same metadata.
+// writeMetadata emits a uint16 count then sorted (key, value) string
+// pairs so saves are deterministic.
 func writeMetadata(w io.Writer, meta map[string]string) error {
 	if len(meta) > 65535 {
 		return errFieldTooBig
@@ -452,9 +392,8 @@ func writeMetadata(w io.Writer, meta map[string]string) error {
 	return nil
 }
 
-// readMetadata is the inverse of writeMetadata. Returns an empty
-// (non-nil) map when the snapshot carries no metadata, so callers
-// can range over the result without nil-checking.
+// readMetadata inverts writeMetadata. Returns a non-nil empty map when
+// the snapshot has no metadata.
 func readMetadata(r io.Reader) (map[string]string, error) {
 	var n uint16
 	if err := binary.Read(r, binary.LittleEndian, &n); err != nil {
@@ -475,10 +414,8 @@ func readMetadata(r io.Reader) (map[string]string, error) {
 	return out, nil
 }
 
-// sortStrings is a tiny helper to keep snapshot.go free of a
-// `sort` import. The metadata sets are at most 65k entries; a
-// simple insertion sort is fine for typical sizes (≤16) and stays
-// linear-ish for larger.
+// sortStrings avoids a sort import; insertion sort is fine for typical
+// metadata sizes (<=16 entries).
 func sortStrings(a []string) {
 	for i := 1; i < len(a); i++ {
 		for j := i; j > 0 && a[j-1] > a[j]; j-- {
@@ -487,10 +424,6 @@ func sortStrings(a []string) {
 	}
 }
 
-// writeRecord emits one entry's serialized form. Key goes through
-// the cache's [Codec]. Value goes through [SnapshotMarshaler] when
-// the value's type implements it; otherwise through the codec.
-// The rest of the metadata is fixed-width.
 func (c *Cache[K, V]) writeRecord(w io.Writer, snap *entrySnapshot[K, V]) error {
 	keyBytes, err := c.cfg.codec.Marshal(snap.key)
 	if err != nil {
@@ -534,17 +467,9 @@ func (c *Cache[K, V]) writeRecord(w io.Writer, snap *entrySnapshot[K, V]) error 
 	return nil
 }
 
-// marshalValue runs the snapshot encoding for a value. Order of
-// dispatch:
-//
-//  1. Apply the `cache:"..."` struct-tag filter — fields tagged
-//     `-` or `secret` are zeroed in a defensive copy so they
-//     don't leak into the snapshot. Caches whose V type has no
-//     such tags (the common case) skip the copy.
-//  2. If the (possibly-filtered) value implements
-//     [SnapshotMarshaler], delegate to it. Both V and *V are
-//     tried so pointer-receiver methods on value V types work.
-//  3. Otherwise fall back to the cache's configured [Codec].
+// marshalValue applies the cache:"..." filter, then tries
+// [SnapshotMarshaler] (V and *V), then falls back to the configured
+// [Codec].
 func (c *Cache[K, V]) marshalValue(value V) ([]byte, error) {
 	value = applySnapshotFilter(value)
 	if m, ok := any(value).(SnapshotMarshaler); ok {
@@ -556,8 +481,7 @@ func (c *Cache[K, V]) marshalValue(value V) ([]byte, error) {
 	return c.cfg.codec.Marshal(value)
 }
 
-// unmarshalValue runs the snapshot decoding for a value. dst MUST
-// be a pointer to V so the value can be mutated in place.
+// unmarshalValue runs snapshot decoding. dst MUST be a pointer to V.
 func (c *Cache[K, V]) unmarshalValue(b []byte, dst *V) error {
 	if u, ok := any(*dst).(SnapshotUnmarshaler); ok {
 		return u.SnapshotUnmarshal(b)
@@ -568,9 +492,8 @@ func (c *Cache[K, V]) unmarshalValue(b []byte, dst *V) error {
 	return c.cfg.codec.Unmarshal(b, dst)
 }
 
-// readSnapshotHeader parses magic/version/codec/name/saveTime/count
-// from r. Updates h with every byte consumed when h is non-nil
-// (used by Load's CRC accumulator; nil for InspectSnapshot).
+// readSnapshotHeader parses the header. h, when non-nil, accumulates
+// every byte consumed for CRC checking.
 func readSnapshotHeader(r io.Reader, h hash.Hash32) (*SnapshotInfo, error) {
 	tee := r
 	if h != nil {
@@ -633,8 +556,6 @@ func readSnapshotHeader(r io.Reader, h hash.Hash32) (*SnapshotInfo, error) {
 	return info, nil
 }
 
-// readRecord reads one entry's serialized form. Updates h with
-// every byte consumed.
 func (c *Cache[K, V]) readRecord(r io.Reader, h hash.Hash32) (entrySnapshot[K, V], error) {
 	var snap entrySnapshot[K, V]
 	tee := io.TeeReader(r, h)
@@ -686,8 +607,7 @@ func (c *Cache[K, V]) readRecord(r io.Reader, h hash.Hash32) (entrySnapshot[K, V
 	return snap, nil
 }
 
-// writeBytes prefixes b with its uint32 length and writes the
-// concatenation. Used for keys, values, and string slices.
+// writeBytes prefixes b with its uint32 length and writes the payload.
 func writeBytes(w io.Writer, b []byte) error {
 	if uint64(len(b)) > 1<<31-1 {
 		return errFieldTooBig
@@ -702,8 +622,7 @@ func writeBytes(w io.Writer, b []byte) error {
 	return err
 }
 
-// writeString is writeBytes specialized to string. Avoids an
-// allocation by going through io.WriteString for the payload.
+// writeString is writeBytes specialized to string.
 func writeString(w io.Writer, s string) error {
 	if uint64(len(s)) > 1<<31-1 {
 		return errFieldTooBig
@@ -720,7 +639,6 @@ func writeString(w io.Writer, s string) error {
 	return nil
 }
 
-// readBytes is the inverse of writeBytes.
 func readBytes(r io.Reader) ([]byte, error) {
 	var n uint32
 	if err := binary.Read(r, binary.LittleEndian, &n); err != nil {
@@ -736,7 +654,6 @@ func readBytes(r io.Reader) ([]byte, error) {
 	return b, nil
 }
 
-// readString is the inverse of writeString.
 func readString(r io.Reader) (string, error) {
 	b, err := readBytes(r)
 	if err != nil {
@@ -745,8 +662,6 @@ func readString(r io.Reader) (string, error) {
 	return string(b), nil
 }
 
-// wrapSaveErr packages an inner error into a [*SnapshotError]
-// keyed on the field that failed.
 func wrapSaveErr(field string, err error) error {
 	return &SnapshotError{Op: "save", Message: "writing " + field, Err: err}
 }

@@ -35,7 +35,7 @@ func TestS3FIFOSmallToGhostOnEvict(t *testing.T) {
 	// budget=2 → smallBudget=1, mainBudget=1.
 	p := newS3FIFO[string, int](2)
 	a := makeS3Entry("a") // small, freq=0
-	b := makeS3Entry("b") // small, freq=0 — this puts smallSize over budget
+	b := makeS3Entry("b") // small, freq=0; puts smallSize over budget
 	p.OnInsert(a)
 	p.OnInsert(b)
 
@@ -92,7 +92,7 @@ func TestS3FIFOReinsertFromGhostGoesToMain(t *testing.T) {
 	}
 	v.policyData = nil
 
-	// Re-insert "a" — it was in Ghost, so should land in Main.
+	// Re-insert "a"; it was in Ghost, so should land in Main.
 	a2 := makeS3Entry("a")
 	p.OnInsert(a2)
 	n := a2.policyData.(*s3Node[string, int])

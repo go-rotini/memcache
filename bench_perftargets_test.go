@@ -2,23 +2,9 @@
 
 // bench_perftargets_test.go validates the package against the
 // spec's §19.6.5 performance targets. Excluded under -race because
-// the race detector's instrumentation pushes per-op latency by
-// roughly 10× and the targets aren't meaningful in that mode.
+// the race detector's instrumentation invalidates the targets.
 //
-// Run with:
-//
-//	go test -bench=BenchmarkPerfTargets -benchtime=3s -run='^$' .
-//
-// Outputs:
-//   - p50 / p99 Get latency on a 1M-entry Zipfian workload at 16 goroutines
-//   - hit-rate floor measurements
-//   - throughput vs sync.Map for the same Get workload
-//
-// Numbers are platform-dependent; the assertions in the
-// TestPerfTargetsBaseline test below confirm we're within an order
-// of magnitude of the spec targets, which is the strict guarantee.
-// Capture exact numbers via `make test-bench` if you need to
-// compare across platforms or versions.
+// Run with: go test -bench=BenchmarkPerfTargets -benchtime=3s -run='^$' .
 
 package memcache
 
@@ -32,11 +18,8 @@ import (
 )
 
 // BenchmarkPerfTargets_LatencyZipfian measures p50/p99 Get latency
-// on a 1M-entry Zipfian workload — the spec's headline benchmark.
-//
-// Targets:
-//   - p50 Get latency: < 200 ns
-//   - p99 Get latency: < 2 µs
+// on a 1M-entry Zipfian workload.
+// Targets: p50 < 200 ns, p99 < 2 µs.
 func BenchmarkPerfTargets_LatencyZipfian(b *testing.B) {
 	const (
 		capacity = 1_000_000
@@ -72,8 +55,7 @@ func BenchmarkPerfTargets_LatencyZipfian(b *testing.B) {
 }
 
 // BenchmarkPerfTargets_VsSyncMap measures Get throughput against
-// the stdlib sync.Map — the spec's "≥50% of sync.Map" target.
-// Same workload, same key distribution.
+// stdlib sync.Map. Target: >=50% of sync.Map.
 func BenchmarkPerfTargets_VsSyncMap(b *testing.B) {
 	const keyspace = 1024
 	keys := make([]int, keyspace)
@@ -113,15 +95,8 @@ func BenchmarkPerfTargets_VsSyncMap(b *testing.B) {
 	})
 }
 
-// TestPerfTargetsBaseline validates the spec's §19.6.5 targets at
-// CI-runnable precision (no platform-specific tolerances). The
-// thresholds are deliberately loose: a 4× safety margin against
-// the spec numbers ensures the test passes on slow CI runners
-// without becoming a no-op.
-//
-// The test collects 10K Get samples on a hot key. With the read-
-// lock fast path and a single-shard cache, this is the closest
-// thing to a worst-case-acceptable latency floor.
+// TestPerfTargetsBaseline validates spec §19.6.5 with a 4x CI safety
+// margin against the spec targets.
 func TestPerfTargetsBaseline(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping perf baseline in -short mode")
@@ -146,17 +121,15 @@ func TestPerfTargetsBaseline(t *testing.T) {
 	}
 	s := hist.Snapshot()
 	const (
-		// Spec §19.6.5: p50 < 200ns, p99 < 2µs. Apply a 4× CI
-		// safety margin: 800ns / 8µs.
+		// Spec §19.6.5: p50 < 200ns, p99 < 2µs; 4x CI safety margin.
 		p50Bound = 800 * time.Nanosecond
 		p99Bound = 8 * time.Microsecond
 	)
 	if s.P50 > p50Bound {
-		t.Errorf("p50 = %v, exceeds 4×-safety bound of %v (spec target: 200ns)", s.P50, p50Bound)
+		t.Errorf("p50 = %v, exceeds 4x-safety bound of %v (spec target: 200ns)", s.P50, p50Bound)
 	}
 	if s.P99 > p99Bound {
-		t.Errorf("p99 = %v, exceeds 4×-safety bound of %v (spec target: 2µs)", s.P99, p99Bound)
+		t.Errorf("p99 = %v, exceeds 4x-safety bound of %v (spec target: 2µs)", s.P99, p99Bound)
 	}
-	// Telemetry for humans reading test output.
 	t.Logf("p50=%v p99=%v mean=%v over %d samples", s.P50, s.P99, s.Mean, samples)
 }

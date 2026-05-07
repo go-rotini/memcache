@@ -5,18 +5,9 @@ import (
 	"time"
 )
 
-// rateLimiter is a simple token-bucket rate limiter used by
-// [WithLoaderRateLimit]. Tokens accrue at the configured rate
-// (tokens/second) up to the bucket's capacity, which equals the
-// configured rate (so the bucket holds at most one second's worth
-// of work).
-//
-// Semantics: Allow returns true and consumes a token when one is
-// available; otherwise it returns false WITHOUT blocking. This
-// matches the spec's "excess callers receive ErrLoaderRateLimited
-// rather than blocking" contract.
-//
-// rateLimiter is safe for concurrent use.
+// rateLimiter is a token bucket used by [WithLoaderRateLimit]. Capacity
+// equals the per-second refill rate. Allow consumes a token if available
+// and returns false without blocking otherwise. Safe for concurrent use.
 type rateLimiter struct {
 	mu       sync.Mutex
 	clock    Clock
@@ -26,13 +17,8 @@ type rateLimiter struct {
 	last     time.Time // last update timestamp
 }
 
-// newRateLimiter constructs a steady-rate limiter. perSecond is
-// the steady refill rate AND the bucket capacity. clock controls
-// the refill schedule; pass [RealClock] for production and a
-// [FakeClock] in tests so [FakeClock.Advance] drives accrual.
-//
-// Returns nil when perSecond <= 0 — the convention "no limiter
-// configured" stays nil for cheap nil-checks on the hot path.
+// newRateLimiter returns a limiter or nil when perSecond <= 0 ("no
+// limiter configured"). clock controls refill scheduling.
 func newRateLimiter(perSecond int, clock Clock) *rateLimiter {
 	if perSecond <= 0 {
 		return nil
@@ -50,10 +36,8 @@ func newRateLimiter(perSecond int, clock Clock) *rateLimiter {
 	}
 }
 
-// Allow returns true and consumes one token when the bucket has
-// at least one. Returns false otherwise; the caller's context is
-// NOT consulted (the limiter rejects synchronously, matching
-// spec §5.9).
+// Allow consumes one token if available, otherwise returns false. Does
+// NOT block and does NOT consult any caller context.
 func (l *rateLimiter) Allow() bool {
 	if l == nil {
 		return true
@@ -74,8 +58,6 @@ func (l *rateLimiter) Allow() bool {
 	return true
 }
 
-// minFloat returns the smaller of a, b. Tiny helper to keep the
-// limiter code free of math/min imports.
 func minFloat(a, b float64) float64 {
 	if a < b {
 		return a

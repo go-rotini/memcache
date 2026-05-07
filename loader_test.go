@@ -104,10 +104,8 @@ func TestGetOrLoadFn(t *testing.T) {
 	}
 }
 
-// TestStampede1000Goroutines is the spec's headline guarantee:
-// 1000 concurrent GetOrLoad on a missing key invoke the Loader
-// EXACTLY once. The remaining 999 join the in-flight call via
-// singleflight.
+// TestStampede1000Goroutines: 1000 concurrent GetOrLoad on a
+// missing key MUST invoke the Loader exactly once.
 func TestStampede1000Goroutines(t *testing.T) {
 	hold := make(chan struct{})
 	loader := &countingLoader{value: 42, holdCh: hold}
@@ -156,7 +154,7 @@ func TestStampede1000Goroutines(t *testing.T) {
 }
 
 func TestCtxAggregationCancelsLoaderWhenAllCancel(t *testing.T) {
-	// Two waiters; both cancel their ctx → loader's ctx.Done
+	// Two waiters; both cancel their ctx, so loader's ctx.Done
 	// fires and the loader returns ctx.Canceled.
 	cancelObserved := atomic.Bool{}
 	loader := LoaderFunc[string, int](func(ctx context.Context, _ string) (int, time.Duration, error) {
@@ -201,8 +199,7 @@ func TestCtxAggregationCancelsLoaderWhenAllCancel(t *testing.T) {
 			t.Fatal("waiters did not return")
 		}
 	}
-	// Loader observation runs in a separate goroutine — poll
-	// briefly for the flag to flip rather than racing.
+	// Loader observation runs in a separate goroutine; poll briefly.
 	deadline := time.Now().Add(time.Second)
 	for time.Now().Before(deadline) {
 		if cancelObserved.Load() {
@@ -243,7 +240,7 @@ func TestCtxPartialCancelKeepsLoaderRunning(t *testing.T) {
 	if err := <-r1; !errors.Is(err, context.Canceled) {
 		t.Errorf("waiter 1 = %v, want context.Canceled", err)
 	}
-	// Loader still alive — release it.
+	// Loader still alive; release it.
 	close(hold)
 	if v := <-r2; v != 99 {
 		t.Errorf("surviving waiter = %d, want 99", v)
@@ -320,7 +317,7 @@ func TestGetOrLoadNegativeCache(t *testing.T) {
 		t.Errorf("first call: loader calls = %d, want 1", loader.calls.Load())
 	}
 
-	// Second call should NOT invoke loader — negative cache hit.
+	// Second call should NOT invoke loader (negative cache hit).
 	_, err = c.GetOrLoad(context.Background(), "missing")
 	if !errors.Is(err, ErrNotFound) {
 		t.Fatalf("second GetOrLoad = %v, want ErrNotFound", err)
@@ -465,14 +462,14 @@ func TestRefreshAhead(t *testing.T) {
 	defer c.Close()
 	_ = c.SetWithTTL("k", 1, 100*time.Millisecond)
 
-	// Read at t=10ms — well below threshold; no refresh.
+	// Read at t=10ms (well below threshold); no refresh.
 	clk.Advance(10 * time.Millisecond)
 	_, _ = c.Get("k")
 	if calls.Load() != 0 {
 		t.Errorf("refresh-ahead fired too early; calls = %d", calls.Load())
 	}
 
-	// Read at t=60ms — past 50% threshold; should fire.
+	// Read at t=60ms (past 50% threshold); should fire.
 	clk.Advance(50 * time.Millisecond)
 	_, _ = c.Get("k")
 	for range 100 {
@@ -503,7 +500,7 @@ func TestStaleWhileRevalidate(t *testing.T) {
 	defer c.Close()
 	_ = c.SetWithTTL("k", 42, 100*time.Millisecond)
 
-	// Past expiry but within staleFor window — Get returns stale.
+	// Past expiry but within staleFor window: Get returns stale.
 	clk.Advance(150 * time.Millisecond)
 	v, ok := c.Get("k")
 	if !ok || v != 42 {
@@ -668,7 +665,7 @@ func TestGetMultiOrLoadNoLoader(t *testing.T) {
 	c, _ := New[string, int](WithMaxEntries(4))
 	defer c.Close()
 	_ = c.Set("k", 1)
-	// Hit-only path — no loader configured but no misses either.
+	// Hit-only path: no loader configured but no misses either.
 	got, err := c.GetMultiOrLoad(context.Background(), []string{"k"})
 	if err != nil {
 		t.Errorf("GetMultiOrLoad on full-hit without loader = %v; want nil", err)
@@ -788,11 +785,8 @@ func TestLoaderFuncAdapter(t *testing.T) {
 	}
 }
 
-// TestSetClearsNegativeTombstone regression: when WithNegativeCache
-// installs a tombstone after a Loader returns ErrNotFound, a
-// subsequent Set must clear the flagNegative bit so the new value
-// is visible to reads. Before the fix, upsertLocked left the bit
-// set and the user's value disappeared until negativeTTL elapsed.
+// TestSetClearsNegativeTombstone is a regression: Set over a
+// negative-tombstone entry must clear flagNegative.
 func TestSetClearsNegativeTombstone(t *testing.T) {
 	loader := LoaderFunc[string, int](func(_ context.Context, _ string) (int, time.Duration, error) {
 		return 0, 0, ErrNotFound
@@ -808,7 +802,7 @@ func TestSetClearsNegativeTombstone(t *testing.T) {
 	if _, err := c.GetOrLoad(context.Background(), "k"); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("GetOrLoad: expected ErrNotFound, got %v", err)
 	}
-	// Overwrite via Set — must clear the tombstone.
+	// Overwrite via Set; MUST clear the tombstone.
 	if err := c.Set("k", 42); err != nil {
 		t.Fatalf("Set: %v", err)
 	}

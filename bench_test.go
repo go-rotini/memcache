@@ -1,10 +1,5 @@
 // bench_test.go covers the performance-critical hot paths. Run via
-// `make test-bench` (which the Makefile invokes with -count=5
-// -benchmem). Cross-package comparisons against ristretto/otter/
-// golang-lru/v2/ttlcache/v3 are tracked as a follow-up — they
-// require adding test-only dev dependencies and a separate
-// benchmark binary; the spec lists them in §19.6 as targets to
-// match, not gates to pass before v0.1.0.
+// `make test-bench` (-count=5 -benchmem).
 
 package memcache
 
@@ -16,9 +11,6 @@ import (
 	"time"
 )
 
-// BenchmarkGetHit measures the steady-state cost of a Get that
-// always hits a hot key. Single-key contention is the upper bound
-// on any-policy lock churn.
 func BenchmarkGetHit(b *testing.B) {
 	c, _ := New[string, int](WithMaxEntries(1024))
 	defer c.Close()
@@ -29,8 +21,6 @@ func BenchmarkGetHit(b *testing.B) {
 	}
 }
 
-// BenchmarkGetMiss measures the cost of a Get on a missing key —
-// no policy promotion, just shard lookup + miss-path cleanup.
 func BenchmarkGetMiss(b *testing.B) {
 	c, _ := New[string, int](WithMaxEntries(1024))
 	defer c.Close()
@@ -40,9 +30,6 @@ func BenchmarkGetMiss(b *testing.B) {
 	}
 }
 
-// BenchmarkSet measures the cost of inserting fresh keys, churning
-// through eviction. A pool of 1024 keys with budget 1024 keeps the
-// hit path cold.
 func BenchmarkSet(b *testing.B) {
 	c, _ := New[string, int](WithMaxEntries(1024))
 	defer c.Close()
@@ -56,9 +43,6 @@ func BenchmarkSet(b *testing.B) {
 	}
 }
 
-// BenchmarkGetParallel measures concurrent reads on a hot working
-// set. Demonstrates that shard sharding scales linearly with cores
-// up to GOMAXPROCS × 4 shards.
 func BenchmarkGetParallel(b *testing.B) {
 	c, _ := New[string, int](WithMaxEntries(1024))
 	defer c.Close()
@@ -75,9 +59,6 @@ func BenchmarkGetParallel(b *testing.B) {
 	})
 }
 
-// BenchmarkSetParallel measures concurrent inserts. Per-shard
-// mutexes serialize same-shard writers but distinct shards run
-// truly in parallel.
 func BenchmarkSetParallel(b *testing.B) {
 	c, _ := New[string, int](WithMaxEntries(4096))
 	defer c.Close()
@@ -91,9 +72,7 @@ func BenchmarkSetParallel(b *testing.B) {
 	})
 }
 
-// BenchmarkGetOrLoad measures the singleflight-coalesced miss
-// path. Loader is a no-op so the benchmark isolates singleflight
-// overhead.
+// BenchmarkGetOrLoad: loader is a no-op to isolate singleflight overhead.
 func BenchmarkGetOrLoad(b *testing.B) {
 	loader := LoaderFunc[string, int](func(context.Context, string) (int, time.Duration, error) {
 		return 1, 0, nil
@@ -107,13 +86,12 @@ func BenchmarkGetOrLoad(b *testing.B) {
 	b.ResetTimer()
 	ctx := context.Background()
 	for range b.N {
-		_, _ = c.GetOrLoad(ctx, "k") // always hot — singleflight not exercised
+		_, _ = c.GetOrLoad(ctx, "k") // always hot; singleflight not exercised
 	}
 }
 
 // BenchmarkPolicy_Zipfian compares hit rates across policies on a
-// synthetic Zipfian workload. Surfaces in `make test-bench` as
-// `BenchmarkPolicy_Zipfian/<policy>`.
+// synthetic Zipfian workload.
 func BenchmarkPolicy_Zipfian(b *testing.B) {
 	const (
 		capacity = 4096
@@ -151,9 +129,6 @@ func BenchmarkPolicy_Zipfian(b *testing.B) {
 	}
 }
 
-// BenchmarkSnapshotSave measures the cost of persisting a
-// reasonably sized cache to a buffer. Reflects the work paid on
-// `Cache.Close` for caches with WithAutoSave.
 func BenchmarkSnapshotSave(b *testing.B) {
 	c, _ := New[string, int](WithMaxEntries(8192))
 	defer c.Close()
@@ -173,8 +148,7 @@ func BenchmarkSnapshotSave(b *testing.B) {
 }
 
 // writeOnlyBuffer is a benchmark-only Writer that grows in place
-// without copying — keeps the benchmark dominated by the cache's
-// own work rather than buffer-resize overhead.
+// without copying.
 type writeOnlyBuffer struct{ buf []byte }
 
 func (w *writeOnlyBuffer) Write(p []byte) (int, error) {

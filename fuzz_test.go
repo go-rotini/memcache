@@ -1,13 +1,6 @@
 // fuzz_test.go drives randomized correctness exploration. The
 // Makefile's `test-fuzz` target runs each FuzzXxx target for 30-60
-// seconds; in CI the same targets run with corpus seeds checked
-// into testdata/fuzz/. Each target has a deterministic seed corpus
-// in addition to the live fuzzer's evolved one.
-//
-// Each fuzz target is paired with a model — a simple in-memory
-// reference cache — and asserts behavioral equivalence on every
-// operation. Divergence between the model and the cache is the
-// signature we hunt for.
+// seconds; CI replays a corpus from testdata/fuzz/.
 
 package memcache
 
@@ -20,27 +13,9 @@ import (
 )
 
 // FuzzCacheOps drives a random sequence of Set/Get/Delete/Has
-// operations against the cache and asserts invariants that hold
-// regardless of eviction order:
-//
-//   - Cache size stays within the configured bound.
-//   - Has and Get agree on presence: a Has==true implies Get
-//     returns ok==true (the inverse may differ across promotions
-//     but the existence direction is observable).
-//   - A Set immediately followed by a same-key Get returns the
-//     value that was set (the entry can't be evicted before the
-//     subsequent Get because no other writes intervene).
-//   - Delete returns true iff the key was present (verified via
-//     pre-Delete Has).
-//
-// We deliberately AVOID comparing against a reference map because
-// eviction races make any "model" prone to false positives. The
-// targeted invariants above are what the cache contract actually
-// guarantees.
-//
-// Encoding: the input is a sequence of (op, key) pairs; op selects
-// among 8 operations modulo the byte; key is a single byte so the
-// keyspace is small enough to stress overflow.
+// operations and asserts size-bound, Has/Get presence agreement,
+// Set-then-Get round-trip, and Delete-after-Has consistency.
+// Encoding: (op, key) pairs; op = byte%8; key = single byte.
 func FuzzCacheOps(f *testing.F) {
 	f.Add([]byte{0, 1, 2, 1, 4, 1, 6, 1}) // set, get, delete, get
 	f.Add([]byte{0, 1, 0, 1, 0, 1, 0, 1}) // repeated overwrites
@@ -48,9 +23,8 @@ func FuzzCacheOps(f *testing.F) {
 	f.Add([]byte{})
 
 	f.Fuzz(func(t *testing.T, data []byte) {
-		// Single shard with budget 8 + 10% slop = 9 max
-		// entries. Allow +1 margin for the insert→evict
-		// transient inside Set.
+		// Single shard, budget 8 + 10% slop = 9 entries; +1
+		// margin for the insert/evict transient inside Set.
 		c, err := New[byte, byte](WithMaxEntries(8), WithShards(1))
 		if err != nil {
 			t.Fatal(err)
@@ -68,7 +42,7 @@ func FuzzCacheOps(f *testing.F) {
 					t.Fatalf("Set: %v", err)
 				}
 				if got, ok := c.Get(key); !ok || got != val {
-					t.Fatalf("Set(%d, %d) → Get = (%d, %v)", key, val, got, ok)
+					t.Fatalf("Set(%d, %d) -> Get = (%d, %v)", key, val, got, ok)
 				}
 			case 1: // Get
 				_, _ = c.Get(key)
@@ -89,7 +63,7 @@ func FuzzCacheOps(f *testing.F) {
 					t.Fatalf("SetWithTTL: %v", err)
 				}
 				if got, ok := c.Get(key); !ok || got != val {
-					t.Fatalf("SetWithTTL(%d, %d) → Get = (%d, %v)", key, val, got, ok)
+					t.Fatalf("SetWithTTL(%d, %d) -> Get = (%d, %v)", key, val, got, ok)
 				}
 			case 5: // Peek does not crash
 				_, _ = c.Peek(key)
@@ -106,11 +80,9 @@ func FuzzCacheOps(f *testing.F) {
 	})
 }
 
-// FuzzSnapshot drives Save → Load round-trips across a cache. The
-// invariant: a Save followed by a Load on a fresh cache restores
-// every non-expired entry. A randomly truncated snapshot must
-// surface as an error rather than panicking or producing a
-// half-loaded cache that lies about its state.
+// FuzzSnapshot: Save followed by Load on a fresh cache must
+// restore every non-expired entry; truncated snapshots must
+// surface an error without panicking.
 func FuzzSnapshot(f *testing.F) {
 	f.Add(uint8(1), uint8(0))
 	f.Add(uint8(8), uint8(0))
@@ -139,7 +111,7 @@ func FuzzSnapshot(f *testing.F) {
 		defer dst.Close()
 		_, err := dst.Load(bytes.NewReader(truncated))
 		if truncatePercent == 0 {
-			// Full snapshot — must round-trip cleanly.
+			// Full snapshot: must round-trip cleanly.
 			if err != nil {
 				t.Fatalf("full snapshot Load = %v", err)
 			}
@@ -148,17 +120,12 @@ func FuzzSnapshot(f *testing.F) {
 			}
 			return
 		}
-		// Truncated snapshot — must fail gracefully (an error,
-		// any error, but no panic).
+		// Truncated snapshot: must fail gracefully (any error, no panic).
 		_ = err
 	})
 }
 
-// FuzzLoader drives the loader path with random key sequences and
-// confirms the cache never mishandles concurrent miss-then-hit
-// transitions. Each input byte selects either a fresh-key load or
-// a hot-key replay; the model tracks which keys have been
-// previously loaded.
+// FuzzLoader drives the loader path with random key sequences.
 func FuzzLoader(f *testing.F) {
 	f.Add([]byte{0, 1, 2, 0, 1, 2})
 	f.Add([]byte{1, 1, 1, 1})
@@ -188,10 +155,8 @@ func FuzzLoader(f *testing.F) {
 	})
 }
 
-// FuzzKeyHash confirms the package's defaultHasher type-switch
-// never panics on arbitrary string keys. The output value isn't
-// checked beyond determinism — same input must hash to the same
-// output across calls.
+// FuzzKeyHash: defaultHasher must not panic on arbitrary keys
+// and must be deterministic.
 func FuzzKeyHash(f *testing.F) {
 	f.Add("")
 	f.Add("hello")
@@ -207,18 +172,11 @@ func FuzzKeyHash(f *testing.F) {
 	})
 }
 
-// Sanity: the fuzzer's seeds themselves run as table-driven tests
-// when invoked without `-fuzz`. This means `make test` covers the
-// happy path even when no live fuzzer is running.
+// TestFuzzSeedsDoNotPanic ensures the seed corpus loads without
+// errors when invoked without `-fuzz`.
 func TestFuzzSeedsDoNotPanic(t *testing.T) {
-	// Just ensure the seed corpus loads without errors. Each
-	// FuzzXxx target's `f.Add(...)` calls become test cases when
-	// run without the `-fuzz` flag.
 	if testing.Short() {
 		t.Skip("skipping fuzz seed sanity in -short mode")
 	}
-	// No-op — by reaching here, the f.Fuzz seed iteration in
-	// each target completed cleanly. Failures would surface as
-	// test failures already.
 	_ = errors.New("placeholder")
 }

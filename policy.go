@@ -51,14 +51,10 @@ type evictionPolicy[K comparable, V any] interface {
 	Reset()
 
 	// SetBudget updates the policy's notion of capacity at runtime.
-	// Used by [Cache.Resize] so capacity-aware policies (S3-FIFO,
-	// TinyLFU, 2Q, ARC) can recompute their internal sub-budgets.
-	// Simple policies (LRU, LFU, FIFO) treat this as a no-op.
-	//
-	// Implementations are responsible for keeping their internal
-	// sub-budgets consistent — they may NOT cause an immediate
-	// eviction; that remains the cache's responsibility through
-	// subsequent calls to Victim.
+	// Capacity-aware policies (S3-FIFO, TinyLFU, 2Q, ARC) recompute
+	// sub-budgets; simple policies treat this as a no-op.
+	// Implementations MUST NOT trigger immediate eviction; the cache
+	// drives that through subsequent Victim calls.
 	SetBudget(budget int)
 
 	// Snapshot returns a per-policy diagnostic struct describing the
@@ -69,22 +65,11 @@ type evictionPolicy[K comparable, V any] interface {
 	// useful detail to report. Called under the shard's read lock.
 	Snapshot() any
 
-	// PromotionNeeded reports whether OnAccess(e) would mutate
-	// policy state. Returning false lets [Cache.Get] complete the
-	// hit under a read lock instead of upgrading to a write lock —
-	// the read fast path. Implementations may return false
-	// pessimistically; the worst case is the cache pays for an
-	// unnecessary write lock, which is no worse than today's
-	// always-write-lock behavior.
-	//
-	// Called under the shard's read lock; reads of mutable per-
-	// entry policy state may observe values from a concurrent
-	// OnAccess on another goroutine. False positives ("yes,
-	// promote") force a write-lock retry, which re-reads under
-	// stable conditions; false negatives ("no, skip") would skip a
-	// real promotion and degrade hit rate without breaking
-	// correctness — implementations should err on the side of
-	// returning true.
+	// PromotionNeeded reports whether OnAccess(e) would mutate state.
+	// Returning false lets [Cache.Get] complete the hit under a read
+	// lock. Called under the shard's read lock; implementations should
+	// err on the side of returning true (false positives only cost an
+	// unnecessary write lock).
 	PromotionNeeded(e *entry[K, V]) bool
 }
 

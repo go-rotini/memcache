@@ -1,32 +1,10 @@
 package memcache
 
-// arcPolicy implements the Adaptive Replacement Cache (Megiddo &
-// Modha, FAST 2003).
+// arcPolicy implements Adaptive Replacement Cache (Megiddo & Modha,
+// FAST 2003) with T1/T2 (recency/frequency LRUs), B1/B2 ghosts, and an
+// adaptive target p in [0, c]. NOT safe for concurrent use.
 //
-// State:
-//   - T1: recency LRU. Entries arrive here on first cache miss.
-//   - T2: frequency LRU. Entries promoted from T1 on a re-access.
-//   - B1: ghost LRU of keys recently evicted from T1.
-//   - B2: ghost LRU of keys recently evicted from T2.
-//   - p: an adaptive target size for T1, in the range [0, c].
-//
-// Invariants:
-//
-//	|T1| + |T2|  ≤ c
-//	|T1| + |B1|  ≤ c
-//	|T2| + |B2|  ≤ 2c
-//
-// On a re-insert that falls in B1 or B2, p shifts to favor recency or
-// frequency respectively. ARC then evicts according to whichever sub-
-// cache is currently above its share of p.
-//
-// Compared to the canonical ARC pseudocode, this implementation
-// reorders steps to fit the package's "insert first, then Victim()"
-// shard architecture: ghost-driven eviction policy decisions happen
-// at OnInsert (where p adjusts) and at Victim (where T1/T2 victim
-// selection runs against the freshly-updated p).
-//
-// arcPolicy is NOT safe for concurrent use.
+// Invariants: |T1|+|T2|<=c, |T1|+|B1|<=c, |T2|+|B2|<=2c.
 type arcPolicy[K comparable, V any] struct {
 	c int // total capacity (budget)
 	p int // adaptive target size of T1, 0..c
@@ -52,21 +30,17 @@ type arcPolicy[K comparable, V any] struct {
 }
 
 // arcNode is the intrusive list node attached to entry.policyData.
-// inT2 disambiguates which list owns it.
 type arcNode[K comparable, V any] struct {
 	entry      *entry[K, V]
 	next, prev *arcNode[K, V]
 	inT2       bool
 }
 
-// arcGhostNode tracks a recently-evicted key (no value).
 type arcGhostNode[K comparable] struct {
 	key        K
 	next, prev *arcGhostNode[K]
 }
 
-// newARC constructs an empty ARC policy sized for the given shard
-// capacity.
 func newARC[K comparable, V any](budget int) *arcPolicy[K, V] {
 	return &arcPolicy[K, V]{
 		c:     max(budget, 1),
@@ -75,38 +49,29 @@ func newARC[K comparable, V any](budget int) *arcPolicy[K, V] {
 	}
 }
 
-// SetBudget updates ARC's notion of capacity (`c`) and clamps the
-// adaptive `p` parameter into the new range. Ghost lists are
-// trimmed so the |T_i|+|B_i| invariants still hold.
 func (p *arcPolicy[K, V]) SetBudget(budget int) {
 	p.c = max(budget, 1)
 	if p.p > p.c {
 		p.p = p.c
 	}
-	// Re-enforce |T1|+|B1| ≤ c by trimming B1.
 	limit1 := max(p.c-p.t1Size, 0)
 	for p.b1Size > limit1 && p.b1Tail != nil {
 		p.unlinkB1(p.b1Tail)
 	}
-	// Re-enforce |T2|+|B2| ≤ 2c.
 	limit2 := max(2*p.c-p.t2Size, 0)
 	for p.b2Size > limit2 && p.b2Tail != nil {
 		p.unlinkB2(p.b2Tail)
 	}
 }
 
-// OnInsert handles ARC's three insertion cases (paper §III, cases
-// II–IV restated for the post-insert architecture):
-//
-//  1. key ∈ B1 — recency ghost hit: increase p, send entry to T2.
-//  2. key ∈ B2 — frequency ghost hit: decrease p, send entry to T2.
-//  3. key ∉ any list — new entry, send to T1.
+// OnInsert handles ARC's three insertion cases: B1 ghost hit (recency
+// adapt, send to T2), B2 ghost hit (frequency adapt, send to T2), or
+// new key (send to T1).
 func (p *arcPolicy[K, V]) OnInsert(e *entry[K, V]) {
 	n := &arcNode[K, V]{entry: e}
 	e.policyData = n
 	switch {
 	case p.inB1(e.key):
-		// Recency adaptation.
 		delta := 1
 		if p.b1Size > 0 && p.b2Size > p.b1Size {
 			delta = max(p.b2Size/p.b1Size, 1)
@@ -116,7 +81,6 @@ func (p *arcPolicy[K, V]) OnInsert(e *entry[K, V]) {
 		n.inT2 = true
 		p.pushT2Head(n)
 	case p.inB2(e.key):
-		// Frequency adaptation.
 		delta := 1
 		if p.b2Size > 0 && p.b1Size > p.b2Size {
 			delta = max(p.b1Size/p.b2Size, 1)
@@ -130,9 +94,8 @@ func (p *arcPolicy[K, V]) OnInsert(e *entry[K, V]) {
 	}
 }
 
-// OnAccess handles ARC's "case I" (cache hit): if the entry is in
-// T1, transition it to T2 (it has now been seen twice). If already
-// in T2, just LRU-promote to MRU.
+// OnAccess promotes T1 entries to T2 on re-access; T2 entries are
+// LRU-promoted to MRU.
 func (p *arcPolicy[K, V]) OnAccess(e *entry[K, V]) {
 	n, ok := e.policyData.(*arcNode[K, V])
 	if !ok || n == nil {
@@ -150,12 +113,10 @@ func (p *arcPolicy[K, V]) OnAccess(e *entry[K, V]) {
 	}
 }
 
-// OnUpdate is treated as an access.
 func (p *arcPolicy[K, V]) OnUpdate(e *entry[K, V]) {
 	p.OnAccess(e)
 }
 
-// OnRemove unlinks e from whichever sub-cache holds it.
 func (p *arcPolicy[K, V]) OnRemove(e *entry[K, V]) {
 	n, ok := e.policyData.(*arcNode[K, V])
 	if !ok || n == nil {
@@ -171,19 +132,11 @@ func (p *arcPolicy[K, V]) OnRemove(e *entry[K, V]) {
 	e.policyData = nil
 }
 
-// Victim implements ARC's REPLACE decision: if T1's size exceeds the
-// adaptive target p (or T2 is empty), drop the LRU of T1 and remember
-// the key in B1; otherwise drop the LRU of T2 and remember the key
-// in B2.
-//
-// Simplification vs. Megiddo & Modha: canonical ARC uses |T1| ≥ p
-// when the just-arrived key hit B2 (case ii) and |T1| > p otherwise.
-// We always use strict >, which biases evictions slightly toward T2
-// and reduces (but does not eliminate) the recency-favoring side of
-// the adapt. The policy still adapts via increase/decreaseP on
-// ghost hits; the simplification trades a small adaptation-quality
-// loss for not having to thread the ghost-provenance signal through
-// the policy interface.
+// Victim implements ARC's REPLACE: if |T1|>p (or T2 is empty), drop
+// T1's LRU into B1; otherwise drop T2's LRU into B2. Uses strict > on
+// |T1| in both cases; canonical ARC uses >= when the just-arrived key
+// hit B2. The simplification trades a small adaptation-quality loss for
+// not threading ghost-provenance through the policy interface.
 func (p *arcPolicy[K, V]) Victim() *entry[K, V] {
 	if p.t1Size+p.t2Size == 0 {
 		return nil
@@ -219,10 +172,9 @@ func (p *arcPolicy[K, V]) Victim() *entry[K, V] {
 	return n.entry
 }
 
-// Len returns |T1| + |T2|. Ghost sizes are not included.
+// Len returns |T1|+|T2|; ghost sizes are not included.
 func (p *arcPolicy[K, V]) Len() int { return p.t1Size + p.t2Size }
 
-// Reset clears all four lists and the adaptive parameter.
 func (p *arcPolicy[K, V]) Reset() {
 	for n := p.t1Head; n != nil; {
 		nxt := n.next
@@ -319,8 +271,7 @@ func (p *arcPolicy[K, V]) unlinkT2(n *arcNode[K, V]) {
 	p.t2Size--
 }
 
-// recordB1 pushes key onto B1's MRU end and trims B1 to satisfy
-// |T1|+|B1| ≤ c.
+// recordB1 pushes key onto B1's MRU end; trims to satisfy |T1|+|B1|<=c.
 func (p *arcPolicy[K, V]) recordB1(key K) {
 	if _, exists := p.b1Set[key]; exists {
 		return
@@ -341,8 +292,7 @@ func (p *arcPolicy[K, V]) recordB1(key K) {
 	}
 }
 
-// recordB2 pushes key onto B2's MRU end and trims B2 to satisfy
-// |T2|+|B2| ≤ 2c.
+// recordB2 pushes key onto B2's MRU end; trims to satisfy |T2|+|B2|<=2c.
 func (p *arcPolicy[K, V]) recordB2(key K) {
 	if _, exists := p.b2Set[key]; exists {
 		return
@@ -411,8 +361,7 @@ func (p *arcPolicy[K, V]) unlinkB2(g *arcGhostNode[K]) {
 	p.b2Size--
 }
 
-// Snapshot returns a [PolicyDetailARC] summarizing the policy's
-// current state.
+// Snapshot returns a [PolicyDetailARC] summary of the policy's state.
 func (p *arcPolicy[K, V]) Snapshot() any {
 	return PolicyDetailARC{
 		T1Size: p.t1Size, T2Size: p.t2Size,
@@ -421,7 +370,6 @@ func (p *arcPolicy[K, V]) Snapshot() any {
 	}
 }
 
-// PromotionNeeded reports true — ARC may move entries between T1
-// and T2 on access and adjust the adaptive parameter p, so the
-// fast path is not safe.
+// PromotionNeeded always returns true: ARC may move entries between T1
+// and T2 on access, so the read-only fast path is unsafe.
 func (p *arcPolicy[K, V]) PromotionNeeded(*entry[K, V]) bool { return true }

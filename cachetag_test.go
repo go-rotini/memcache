@@ -76,7 +76,7 @@ type plainValue struct {
 }
 
 func TestApplySnapshotFilterNoTagsReturnsOriginal(t *testing.T) {
-	// V types with no secret/skip tags MUST pay no copy cost —
+	// V types with no secret/skip tags MUST pay no copy cost:
 	// applySnapshotFilter returns the same struct value.
 	v := plainValue{Name: "abc"}
 	got := applySnapshotFilter(v)
@@ -98,7 +98,7 @@ func TestSnapshotOmitsSecretFields(t *testing.T) {
 		t.Fatal(err)
 	}
 	if bytes.Contains(buf.Bytes(), []byte("supersecret-token")) {
-		t.Error("snapshot bytes contain the secret value — filter did not fire")
+		t.Error("snapshot bytes contain the secret value; filter did not fire")
 	}
 	if !bytes.Contains(buf.Bytes(), []byte("user@example.com")) {
 		t.Error("snapshot bytes lost the public value")

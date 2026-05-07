@@ -198,7 +198,7 @@ func TestWithStoreSetErrorRollsBackInMemory(t *testing.T) {
 	if err == nil || !errors.Is(err, failure) {
 		t.Errorf("Set returned %v, want %v", err, failure)
 	}
-	// In-memory must NOT have the entry — the rollback ran.
+	// In-memory must NOT have the entry; the rollback ran.
 	if _, ok := c.Get("k"); ok {
 		t.Error("in-memory cache holds entry after Store-write rollback")
 	}
@@ -267,9 +267,7 @@ func TestWithStoreEvictionDoesNotDeleteFromStore(t *testing.T) {
 	inner := NewMemoryStore[string, int](nil)
 	store := newTrackingStore[string, int](inner)
 
-	// Tight bound — the policy will evict entries from the in-
-	// memory cache as new ones come in. Those evictions must NOT
-	// reach the Store.
+	// Tight bound: in-memory evictions must NOT reach the Store.
 	c, _ := New[string, int](
 		WithMaxEntries(2),
 		WithShards(1),

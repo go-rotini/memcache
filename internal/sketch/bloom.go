@@ -1,13 +1,7 @@
 package sketch
 
-// Bloom is a small bit-array bloom filter used as the W-TinyLFU
-// "doorkeeper": one-hit wonders are filtered out before they pollute
-// the count-min sketch.
-//
-// The filter is sized for ~8 bits/key with 4 hash functions, giving a
-// false-positive rate of ~3% — adequate for an admission filter where
-// the cost of a false-positive (an extra count-min sketch increment)
-// is negligible.
+// Bloom is a bit-array bloom filter used as the W-TinyLFU "doorkeeper".
+// Sized for ~8 bits/key with 4 hash functions (~3% false-positive rate).
 type Bloom struct {
 	bits  []uint64 // bit array; 64 bits per entry
 	mask  uint64   // (bit count - 1); bit count is power of two

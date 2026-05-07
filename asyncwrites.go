@@ -6,7 +6,6 @@ import (
 	"time"
 )
 
-// pendingOpKind tags the operation a [pendingOp] records.
 type pendingOpKind uint8
 
 const (
@@ -14,14 +13,9 @@ const (
 	pendingOpDelete
 )
 
-// pendingOp captures everything the apply goroutine needs to
-// faithfully reproduce a Set or Delete that the caller has already
-// returned from. Pending ops coalesce by key — a second op on the
-// same key replaces the first, so churn collapses to its final
-// state.
-//
-// Field reuse follows the upsertLocked signature so apply can call
-// the same path the synchronous Set would take.
+// pendingOp captures a Set or Delete the caller has already returned
+// from. Ops coalesce by key: a second op on the same key replaces the
+// first.
 type pendingOp[K comparable, V any] struct {
 	kind         pendingOpKind
 	key          K
@@ -34,34 +28,19 @@ type pendingOp[K comparable, V any] struct {
 	tags         []string
 }
 
-// asyncWrites holds the per-cache state for [WithAsyncWrites]. nil
-// when the option is off. The apply goroutine is the sole writer
-// to the per-shard pending maps from the storage side; producers
-// write under the shard lock so the data-race detector is happy.
+// asyncWrites holds per-cache state for [WithAsyncWrites].
 type asyncWrites struct {
-	// signal collapses wakeup notifications. Producers do a non-
-	// blocking send; the apply goroutine receives and immediately
-	// drains every shard. Capacity 1 is sufficient — multiple
-	// pending ops between two drains coalesce into a single
-	// drain.
+	// signal collapses wakeup notifications; capacity 1 because
+	// multiple ops between drains coalesce into one drain.
 	signal chan struct{}
 
-	// stop is closed by [Cache.Close] to make the apply goroutine
-	// return. exited is closed by the goroutine on its way out so
-	// Close can wait for the drain to finish.
 	stop   chan struct{}
 	exited chan struct{}
 
-	// inflight is the count of pending ops the cache has accepted
-	// but the apply goroutine has not yet drained. Bumped at
-	// enqueue, decremented at apply. [Cache.Sync] polls it for the
-	// drained signal.
+	// inflight tracks accepted-but-not-applied ops; [Cache.Sync] polls.
 	inflight atomic.Int64
 }
 
-// newAsyncWrites constructs the per-cache async-writes state. It
-// allocates the signal/stop/exited channels and the per-shard
-// pending maps. The apply goroutine starts in [Cache.startAsyncApply].
 func newAsyncWrites[K comparable, V any](shards []*shard[K, V]) *asyncWrites {
 	for _, s := range shards {
 		s.pending = make(map[K]pendingOp[K, V])
@@ -73,11 +52,6 @@ func newAsyncWrites[K comparable, V any](shards []*shard[K, V]) *asyncWrites {
 	}
 }
 
-// enqueueAsyncSet places a Set op in the target shard's pending map
-// and signals the apply goroutine. The pending map is keyed; a prior
-// pending op for the same key is overwritten (coalescing). The
-// shard lock is held only for the map write; everything else
-// happens off-lock.
 func (c *Cache[K, V]) enqueueAsyncSet(s *shard[K, V], key K, value V, weight int64,
 	effectiveTTL time.Duration, sliding bool, rawTTL int64, tags []string,
 ) {
@@ -100,8 +74,6 @@ func (c *Cache[K, V]) enqueueAsyncSet(s *shard[K, V], key K, value V, weight int
 	c.signalAsyncApply()
 }
 
-// enqueueAsyncSetWithExpiry is the absolute-expiry variant for the
-// [SetExpireAt] path.
 func (c *Cache[K, V]) enqueueAsyncSetWithExpiry(s *shard[K, V], key K, value V, weight int64,
 	expireAt int64, sliding bool, rawTTL int64, tags []string,
 ) {
@@ -124,9 +96,6 @@ func (c *Cache[K, V]) enqueueAsyncSetWithExpiry(s *shard[K, V], key K, value V, 
 	c.signalAsyncApply()
 }
 
-// enqueueAsyncDelete records a delete tombstone in the pending map.
-// Like Set, this coalesces with any earlier op on the same key —
-// the final apply just removes the entry.
 func (c *Cache[K, V]) enqueueAsyncDelete(s *shard[K, V], key K) {
 	op := pendingOp[K, V]{
 		kind: pendingOpDelete,
@@ -141,8 +110,6 @@ func (c *Cache[K, V]) enqueueAsyncDelete(s *shard[K, V], key K) {
 	c.signalAsyncApply()
 }
 
-// signalAsyncApply wakes the apply goroutine. Non-blocking: a
-// pending wakeup already in the channel covers the new op.
 func (c *Cache[K, V]) signalAsyncApply() {
 	select {
 	case c.async.signal <- struct{}{}:
@@ -150,21 +117,10 @@ func (c *Cache[K, V]) signalAsyncApply() {
 	}
 }
 
-// startAsyncApply launches the per-cache apply goroutine. Called
-// from [build] when [WithAsyncWrites] is configured.
 func (c *Cache[K, V]) startAsyncApply() {
 	go c.runAsyncApply()
 }
 
-// runAsyncApply is the apply loop. It blocks on the signal channel,
-// drains every shard's pending map under that shard's write lock,
-// and exits when [Cache.Close] closes async.stop.
-//
-// Drain order: shards are walked in slice order (deterministic).
-// Within a shard the pending map is walked in Go's map-iteration
-// order (non-deterministic) — applying each op via the standard
-// upsertLocked / removeLocked path, then propagating to the
-// configured Store.
 func (c *Cache[K, V]) runAsyncApply() {
 	defer close(c.async.exited)
 	for {
@@ -178,9 +134,6 @@ func (c *Cache[K, V]) runAsyncApply() {
 	}
 }
 
-// drainAllShards walks every shard's pending map and applies the
-// queued ops. Returns the number of ops applied (currently unused
-// but useful in future telemetry hooks).
 func (c *Cache[K, V]) drainAllShards() int {
 	applied := 0
 	for _, s := range c.shards {
@@ -189,10 +142,8 @@ func (c *Cache[K, V]) drainAllShards() int {
 	return applied
 }
 
-// drainShard moves every pending op on s into storage. The shard
-// write lock is held for the duration so reads see a consistent
-// snapshot — they either observe the pending op (before the drain
-// fires) or the storage state (after).
+// drainShard moves every pending op into storage under the shard write
+// lock so reads observe either the pending op or the post-drain state.
 func (c *Cache[K, V]) drainShard(s *shard[K, V]) int {
 	s.mu.Lock()
 	if len(s.pending) == 0 {
@@ -223,10 +174,9 @@ func (c *Cache[K, V]) drainShard(s *shard[K, V]) int {
 	}
 	c.flushAndUnlock(s)
 
-	// Phase 2 (off-shard-lock): propagate each op to the
-	// configured Store + enforce group budgets. Failing fast on
-	// Store errors is impossible — the caller's already returned —
-	// so we log and move on.
+	// Off-shard-lock: propagate to the Store and enforce group
+	// budgets. Store errors are logged; the caller has already
+	// returned and there is no fast-fail path.
 	for i := range ops {
 		op := ops[i]
 		c.applyAsyncSideEffects(op)
@@ -235,10 +185,8 @@ func (c *Cache[K, V]) drainShard(s *shard[K, V]) int {
 	return len(ops)
 }
 
-// applyAsyncSetWithExpiryLocked is the absolute-expiry equivalent
-// of upsertLocked, mirroring [Cache.upsertWithAbsoluteExpiryLocked]
-// but driven by a pendingOp instead of a setConfig. Caller holds
-// shard.mu.
+// applyAsyncSetWithExpiryLocked is the absolute-expiry equivalent of
+// upsertLocked, driven by a pendingOp. Caller MUST hold s.mu.
 func (c *Cache[K, V]) applyAsyncSetWithExpiryLocked(s *shard[K, V], op pendingOp[K, V]) {
 	sc := setConfig{
 		ttl:       0,
@@ -252,9 +200,6 @@ func (c *Cache[K, V]) applyAsyncSetWithExpiryLocked(s *shard[K, V], op pendingOp
 	c.upsertWithAbsoluteExpiryLocked(s, op.key, op.value, op.weight, sc)
 }
 
-// applyAsyncSideEffects runs the post-shard-lock work for a drained
-// op: Store propagation and group budgets. Errors from the Store are
-// logged but cannot be surfaced to the original caller.
 func (c *Cache[K, V]) applyAsyncSideEffects(op pendingOp[K, V]) {
 	switch op.kind {
 	case pendingOpSet:
@@ -279,9 +224,8 @@ func (c *Cache[K, V]) applyAsyncSideEffects(op pendingOp[K, V]) {
 	}
 }
 
-// stopAsyncApply signals the apply goroutine to drain remaining
-// work and exit. Blocks until the goroutine has returned. Called
-// from [Cache.Close].
+// stopAsyncApply signals the apply goroutine to drain and exit, blocking
+// until it has returned.
 func (c *Cache[K, V]) stopAsyncApply() {
 	if c.async == nil {
 		return
@@ -290,9 +234,6 @@ func (c *Cache[K, V]) stopAsyncApply() {
 	<-c.async.exited
 }
 
-// asyncBacklog returns the number of pending ops the cache has
-// accepted but not yet applied. Used by [Cache.Sync] to detect
-// drained state. Safe to call without locks (atomic).
 func (c *Cache[K, V]) asyncBacklog() int64 {
 	if c.async == nil {
 		return 0
@@ -300,9 +241,7 @@ func (c *Cache[K, V]) asyncBacklog() int64 {
 	return c.async.inflight.Load()
 }
 
-// asyncSet runs the synchronous validation portion of Set —
-// closed-check, weight, tag limits — and then enqueues a pending
-// Set op. The caller has already extracted TTL and tags.
+// asyncSet validates the Set synchronously and enqueues a pending op.
 func (c *Cache[K, V]) asyncSet(key K, value V, ttl time.Duration, sliding bool, tags []string) error {
 	if c.closed.Load() {
 		return ErrClosed
@@ -322,9 +261,6 @@ func (c *Cache[K, V]) asyncSet(key K, value V, ttl time.Duration, sliding bool, 
 	return nil
 }
 
-// asyncSetWithExpiry mirrors [Cache.asyncSet] for the absolute-
-// expiry path used by [Cache.SetWithOptions] when [SetExpireAt] is
-// supplied.
 func (c *Cache[K, V]) asyncSetWithExpiry(key K, value V, weight int64, sc setConfig) error {
 	if c.closed.Load() {
 		return ErrClosed
@@ -344,11 +280,9 @@ func (c *Cache[K, V]) asyncSetWithExpiry(key K, value V, weight int64, sc setCon
 	return nil
 }
 
-// asyncDelete is the [Cache.Delete] counterpart of [Cache.asyncSet].
-// Returns false when the cache is closed; otherwise queues the
-// delete and returns true (the caller cannot know whether an entry
-// existed without inspecting state, which would defeat the async
-// optimization).
+// asyncDelete queues a delete and returns true unless the cache is
+// closed. The result cannot reflect whether an entry existed without
+// defeating the async optimization.
 func (c *Cache[K, V]) asyncDelete(key K) bool {
 	if c.closed.Load() {
 		return false
@@ -359,11 +293,9 @@ func (c *Cache[K, V]) asyncDelete(key K) bool {
 	return true
 }
 
-// tryServeFromAsyncPending is the [Cache.getCtx] entry point for
-// the async-writes visibility check. Returns (val, hit, terminal)
-// where `terminal` is true when a pending Set/Delete covers the
-// key and the caller can return immediately. When terminal is
-// false the caller falls through to the storage path.
+// tryServeFromAsyncPending checks pending ops for the visibility
+// contract. Returns terminal=true when a pending Set/Delete covers the
+// key and the caller can return immediately.
 func (c *Cache[K, V]) tryServeFromAsyncPending(s *shard[K, V], key K, now int64) (V, bool, bool) {
 	var zero V
 	if s.pending == nil {
@@ -385,14 +317,10 @@ func (c *Cache[K, V]) tryServeFromAsyncPending(s *shard[K, V], key K, now int64)
 	return c.returnValue(val), true, true
 }
 
-// asyncReadHit is consulted by every Get-style read path before
-// looking at the shard's storage. Returns (value, kind, true) when
-// a pending op covers the key — Set ops yield the pending value,
-// Delete ops yield the zero value with kind=pendingOpDelete so the
-// caller can short-circuit to a miss. The third return is false
-// when no pending op exists.
-//
-// Caller must hold shard.mu.RLock (or stronger).
+// asyncReadHit returns (value, kind, true) when a pending op covers key:
+// Set yields the pending value, Delete yields zero+pendingOpDelete so
+// the caller short-circuits to a miss. Caller MUST hold s.mu (read or
+// write).
 func (c *Cache[K, V]) asyncReadHit(s *shard[K, V], key K, now int64) (V, pendingOpKind, bool) {
 	var zero V
 	if s.pending == nil {
@@ -406,15 +334,13 @@ func (c *Cache[K, V]) asyncReadHit(s *shard[K, V], key K, now int64) (V, pending
 	case pendingOpDelete:
 		return zero, pendingOpDelete, true
 	case pendingOpSet:
-		// Honor any expiry encoded on the pending op so
-		// readers don't see "fresh" data that the apply path
-		// would have rejected.
+		// Honor any absolute expiry on the pending op so readers
+		// don't see "fresh" data the apply path would reject.
 		if op.expireAt > 0 && now >= op.expireAt {
 			return zero, pendingOpDelete, true
 		}
-		// Pending Set ops with a relative effectiveTTL are
-		// treated as fresh — the apply pass will materialize the
-		// absolute expireAt and the next Get will see it.
+		// Pending Sets with a relative TTL are treated as fresh; apply
+		// materializes the absolute expireAt later.
 		return op.value, pendingOpSet, true
 	}
 	return zero, 0, false

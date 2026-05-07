@@ -105,7 +105,6 @@ func (p *fifoPolicy[K, V]) Snapshot() any {
 	return PolicyDetailFIFO{Size: p.size}
 }
 
-// PromotionNeeded reports false unconditionally — FIFO never
-// promotes on access, so the read fast path can serve every hit
-// under a read lock.
+// PromotionNeeded always returns false: FIFO never promotes on access,
+// so the read fast path serves every hit under a read lock.
 func (p *fifoPolicy[K, V]) PromotionNeeded(*entry[K, V]) bool { return false }

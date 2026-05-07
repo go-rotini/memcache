@@ -18,14 +18,12 @@ import (
 //
 // Store implementations MUST be safe for concurrent use.
 //
-// Wiring: a Cache constructed with [WithStore] treats the Store as
-// its source of truth — reads on in-memory miss fall through to
-// the Store and a Store hit is promoted into the in-memory cache;
-// writes and deletes propagate through. The Store also serves as
-// the L2 backend for [Tiered].
+// A Cache built with [WithStore] treats the Store as its source of
+// truth (read-through with promotion, write-through, delete-through).
+// Store also serves as L2 for [Tiered].
 type Store[K comparable, V any] interface {
 	// Get returns the value stored for key. Missing keys produce
-	// (zero V, false, nil) — only I/O failures populate err.
+	// (zero V, false, nil); only I/O failures populate err.
 	Get(ctx context.Context, key K) (V, bool, error)
 
 	// Set stores value under key with the given TTL. ttl <= 0
@@ -50,13 +48,9 @@ type Store[K comparable, V any] interface {
 	Close() error
 }
 
-// MemoryStore is the default in-process [Store] backed by a
-// `map[K]storedEntry[V]` plus a single mutex. TTLs are enforced
-// lazily on Get; the store does not run a janitor of its own (the
-// expectation is that the [Cache] above it drives expiry).
-//
-// MemoryStore is safe for concurrent use. Its zero value is not
-// valid — use [NewMemoryStore].
+// MemoryStore is the default in-process [Store]. TTLs are enforced
+// lazily on Get. Safe for concurrent use; zero value is invalid (use
+// [NewMemoryStore]).
 type MemoryStore[K comparable, V any] struct {
 	mu      sync.RWMutex
 	entries map[K]storedEntry[V]

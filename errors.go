@@ -88,8 +88,7 @@ type CapacityError struct {
 	Reason     string
 	LimitField string
 	// Cause is the underlying sentinel (e.g. [ErrTooManyTags]).
-	// Optional — populated only when the limit field has a
-	// dedicated sentinel.
+	// Optional; populated when the limit field has a dedicated sentinel.
 	Cause error
 }
 

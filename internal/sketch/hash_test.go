@@ -2,18 +2,9 @@ package sketch
 
 import "testing"
 
-// SipHash-2-4 reference vectors from the official paper.
-//
-// Key (k0, k1) is the bytes 00..0f interpreted little-endian:
-//
-//	k0 = 0x0706050403020100
-//	k1 = 0x0f0e0d0c0b0a0908
-//
-// data = 00..ee (15 bytes)
-// expected: 0xa129ca6149be45e5
-//
-// This single vector is sufficient to detect implementation bugs that
-// would otherwise produce systematically incorrect hashes.
+// SipHash-2-4 reference vector from the official paper.
+// Key (k0, k1) is bytes 00..0f little-endian; data = 00..0e (15 bytes);
+// expected: 0xa129ca6149be45e5.
 func TestSipHash24ReferenceVector(t *testing.T) {
 	const (
 		k0 = uint64(0x0706050403020100)
@@ -52,9 +43,6 @@ func TestSipHash24DistinctKeys(t *testing.T) {
 }
 
 func TestMixUint64Avalanche(t *testing.T) {
-	// Adjacent inputs should produce very different outputs (avalanche).
-	// We don't enforce a strict bound — just that we don't get the
-	// trivial near-equality that a bad mixer would yield.
 	for i := uint64(0); i < 100; i++ {
 		a := MixUint64(i)
 		b := MixUint64(i + 1)

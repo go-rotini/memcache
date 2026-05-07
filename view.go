@@ -2,32 +2,20 @@ package memcache
 
 import "time"
 
-// CacheView is a read-only handle on a [Cache]. It shares storage
-// with the parent — there is no copy — but exposes only methods that
-// cannot mutate the cache. CacheView is the right tool for handing a
-// cache to subsystems that should observe but not modify it.
-//
-// The handle does not pin the parent: when the underlying cache is
-// closed, view methods behave as if the entry is absent (Get returns
-// the zero value with ok=false, Len returns 0, etc.). Callers
-// detect closure via the parent's [Cache.Close] return or by
-// observing absent reads.
+// CacheView is a read-only handle that shares storage with a [Cache].
+// View methods that touch a closed cache return zero values.
 type CacheView[K comparable, V any] struct {
 	cache *Cache[K, V]
 }
 
-// View returns a [CacheView] that shares storage with c. The
-// returned view is independent of the caller's reference to c —
-// closing c invalidates the view's reads but does not free it.
+// View returns a [CacheView] that shares storage with c. Closing c
+// invalidates the view's reads but does not free it.
 func (c *Cache[K, V]) View() *CacheView[K, V] {
 	return &CacheView[K, V]{cache: c}
 }
 
-// Get delegates to the underlying cache's [Cache.Get] — including
-// any eviction-policy promotion on hit. CacheView is "read-only"
-// in the sense that it forbids Set/Delete/Compute mutations; it
-// is NOT a side-effect-free view. Use [CacheView.Peek] when you
-// need a no-promotion read.
+// Get delegates to [Cache.Get], including eviction-policy promotion on
+// hit. Use [CacheView.Peek] for a no-promotion read.
 func (v *CacheView[K, V]) Get(key K) (V, bool) {
 	if v == nil || v.cache == nil {
 		var zero V
@@ -109,19 +97,10 @@ func (v *CacheView[K, V]) Stats() Stats {
 	return v.cache.Stats()
 }
 
-// Clone returns a new [Cache] populated with a snapshot of the
-// receiver's live entries. The clone has its own configuration copy,
-// shards, eviction policies, and stats counters; mutations to one
-// cache do not affect the other.
-//
-// Each entry's value, weight, expireAt, sliding-TTL flag/duration,
-// and tags are copied. Hit counts and eviction-policy positioning
-// are NOT preserved — the clone's policy starts in a fresh state.
-//
-// Clone runs while holding each source shard's read lock for its
-// pass; it does not lock all shards simultaneously. Concurrent
-// mutations to the source during the clone produce a snapshot that
-// is consistent within each shard but may straddle shards.
+// Clone returns a new [Cache] populated with a snapshot of c's live
+// entries. Hit counts and policy positioning are not preserved. Holds
+// each source shard's read lock per pass; concurrent mutations produce
+// a per-shard-consistent (not cache-wide-consistent) snapshot.
 func (c *Cache[K, V]) Clone() (*Cache[K, V], error) {
 	if c.closed.Load() {
 		return nil, ErrClosed
@@ -150,9 +129,8 @@ func (c *Cache[K, V]) Clone() (*Cache[K, V], error) {
 	for _, s := range c.shards {
 		s.mu.RLock()
 		s.storage.each(func(e *entry[K, V]) bool {
-			// Use entryExpiredLocked so a configured WithExpireFunc
-			// also filters stale entries out of the clone — matches
-			// the predicate used by Get-style methods.
+			// entryExpiredLocked also runs WithExpireFunc, matching the
+			// predicate used by Get-style methods.
 			if c.entryExpiredLocked(e, now) || e.flags.has(flagNegative) {
 				return true
 			}

@@ -49,7 +49,6 @@ func TestHistogramBucketing(t *testing.T) {
 
 func TestHistogramQuantilesUniform(t *testing.T) {
 	var h Histogram
-	// 100 records at 1µs each → P50 and P99 both land in the 1µs bucket.
 	for range 100 {
 		h.Record(1 * time.Microsecond)
 	}
@@ -64,9 +63,7 @@ func TestHistogramQuantilesUniform(t *testing.T) {
 
 func TestHistogramQuantilesSkewed(t *testing.T) {
 	var h Histogram
-	// 90 fast loads, 10 slow loads — P99 must include the tail
-	// (90/100 = 90% are fast, so the 99th percentile lies past the
-	// fast cluster).
+	// 90 fast loads, 10 slow loads; P99 must include the tail.
 	for range 90 {
 		h.Record(1 * time.Microsecond)
 	}

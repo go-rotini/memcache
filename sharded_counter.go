@@ -40,9 +40,7 @@ func (c *shardedCounter) Add(delta uint64) {
 	c.slots[rand.Uint64()&c.mask].Add(delta)
 }
 
-// Load returns the sum across every slot. Pays for every slot's
-// atomic load on every call — Stats() callers are expected to
-// snapshot infrequently.
+// Load returns the sum across every slot.
 func (c *shardedCounter) Load() uint64 {
 	var sum uint64
 	for i := range c.slots {
@@ -70,10 +68,8 @@ func (c *shardedCounter) Store(v uint64) {
 	}
 }
 
-// shardedStatsSize returns the slot count chosen for a sharded
-// stats counter when [WithShardedStats] is enabled. Targets 4× the
-// number of P (logical processors) capped at 256 — enough to spread
-// contention without burning unbounded memory on huge boxes.
+// shardedStatsSize returns the slot count for a sharded stats counter:
+// 4*GOMAXPROCS capped at 256.
 func shardedStatsSize(p int) int {
 	if p <= 0 {
 		p = 1

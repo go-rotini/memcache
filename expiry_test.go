@@ -120,7 +120,7 @@ func TestUpdateChangesExpireAtFixesHeap(t *testing.T) {
 	defer c.Close()
 	_ = c.SetWithTTL("a", 1, 100*time.Millisecond)
 	_ = c.SetWithTTL("b", 2, 200*time.Millisecond)
-	// Re-set "a" with a much longer TTL — heap should re-balance.
+	// Re-set "a" with a much longer TTL; heap should re-balance.
 	_ = c.SetWithTTL("a", 1, time.Hour)
 	s := c.shardFor("a")
 	s.mu.RLock()
@@ -183,7 +183,7 @@ func TestJanitorRepeats(t *testing.T) {
 	clk.Advance(150 * time.Millisecond)
 	waitFor(t, time.Second, func() bool { return !c.Has("a") })
 
-	// Second sweep — janitor must rearm and fire again
+	// Second sweep: janitor must rearm and fire again.
 	_ = c.SetWithTTL("b", 2, 50*time.Millisecond)
 	clk.Advance(150 * time.Millisecond)
 	waitFor(t, time.Second, func() bool { return !c.Has("b") })
@@ -199,7 +199,7 @@ func TestJanitorLazyStart(t *testing.T) {
 	if s.janitor.running.Load() {
 		t.Error("janitor should not be running before any TTL'd insert")
 	}
-	_ = c.Set("nottl", 1) // no TTL — janitor stays asleep
+	_ = c.Set("nottl", 1) // no TTL; janitor stays asleep
 	if s.janitor.running.Load() {
 		t.Error("no-TTL Set should not start the janitor")
 	}
@@ -299,7 +299,7 @@ func TestSlidingTTLCoalesces(t *testing.T) {
 	first := e.lastAccess.Load()
 	s.mu.RUnlock()
 
-	// Advance by less than slide/4 (15s) and read — coalesced.
+	// Advance by less than slide/4 (15s) and read; coalesced.
 	clk.Advance(5 * time.Second)
 	_, _ = c.Get("k")
 	s.mu.RLock()
@@ -310,7 +310,7 @@ func TestSlidingTTLCoalesces(t *testing.T) {
 		t.Errorf("coalesced sliding-TTL Get advanced lastAccess from %d to %d", first, got)
 	}
 
-	// Advance past slide/4 — next Get must update lastAccess.
+	// Advance past slide/4: next Get must update lastAccess.
 	clk.Advance(20 * time.Second) // total 25s > 15s
 	_, _ = c.Get("k")
 	s.mu.RLock()
@@ -365,10 +365,8 @@ func TestJanitorConcurrentSetGet(t *testing.T) {
 	wg.Wait()
 }
 
-// TestExpireFuncHonoredBySetIfAbsent regression: SetIfAbsent and
-// PeekOrAdd previously checked entry.expired(now) (TTL only),
-// bypassing WithExpireFunc. A custom expire predicate's "this
-// entry is stale" verdict was silently ignored on those paths.
+// TestExpireFuncHonoredBySetIfAbsent: SetIfAbsent must consult
+// WithExpireFunc, not just entry.expired(now).
 func TestExpireFuncHonoredBySetIfAbsent(t *testing.T) {
 	c, _ := New[string, int](
 		WithMaxEntries(8),
@@ -408,12 +406,8 @@ func TestExpireFuncHonoredByPeekOrAdd(t *testing.T) {
 	}
 }
 
-// TestExpireFuncRecordsDistinctEvictionReason regression: removals
-// driven by WithExpireFunc should land in
-// Stats.EvictionsByReason[EvictReasonExpireFunc], not lumped with
-// TTL expirations under EvictReasonExpired. Before the fix, the
-// dedicated reason constant was dead code and the path through
-// Get's slow-path expiry handling always passed EvictReasonExpired.
+// TestExpireFuncRecordsDistinctEvictionReason: removals driven by
+// WithExpireFunc must land in EvictReasonExpireFunc, not Expired.
 func TestExpireFuncRecordsDistinctEvictionReason(t *testing.T) {
 	c, _ := New[string, int](
 		WithMaxEntries(8),
@@ -422,7 +416,7 @@ func TestExpireFuncRecordsDistinctEvictionReason(t *testing.T) {
 		}),
 	)
 	defer c.Close()
-	_ = c.Set("stale", 1)            // no TTL — only the predicate marks it expired
+	_ = c.Set("stale", 1)            // no TTL; only the predicate marks it expired
 	if _, ok := c.Get("stale"); ok { // triggers the predicate-driven eviction
 		t.Fatal("Get on predicate-expired entry should miss")
 	}

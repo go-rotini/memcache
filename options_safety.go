@@ -5,15 +5,8 @@ import (
 	"time"
 )
 
-// safeKeysCheck inspects K's reflect.Type at construction time.
-// When [WithSafeKeys] is on, it logs a warning via cfg.logger for
-// patterns that almost always indicate user error: pointer key
-// types (compare by identity, not contents), and structs that
-// contain pointer fields (mutable equality is fragile across
-// snapshots).
-//
-// The check has zero runtime cost — it runs once during New and
-// emits at most one warning per cache.
+// safeKeysCheck logs a warning at [New] time when K is a pointer or a
+// struct containing pointer fields. Runs once per cache.
 func safeKeysCheck[K comparable](cfg *config) {
 	if !cfg.safeKeys || cfg.logger == nil {
 		return
@@ -25,16 +18,14 @@ func safeKeysCheck[K comparable](cfg *config) {
 	}
 	switch {
 	case t.Kind() == reflect.Pointer:
-		cfg.logger.Warn("memcache: WithSafeKeys: K is a pointer type — compares by identity, not contents",
+		cfg.logger.Warn("memcache: WithSafeKeys: K is a pointer type, compares by identity not contents",
 			"type", t.String())
 	case t.Kind() == reflect.Struct && structContainsPointer(t):
-		cfg.logger.Warn("memcache: WithSafeKeys: K is a struct containing pointer fields — equality is fragile",
+		cfg.logger.Warn("memcache: WithSafeKeys: K is a struct containing pointer fields, equality is fragile",
 			"type", t.String())
 	}
 }
 
-// structContainsPointer recursively reports whether t (a struct)
-// has any pointer-typed field at any depth.
 func structContainsPointer(t reflect.Type) bool {
 	if t.Kind() != reflect.Struct {
 		return false
@@ -52,37 +43,22 @@ func structContainsPointer(t reflect.Type) bool {
 	return false
 }
 
-// WithSafeKeys enables construction-time validation of the cache's
-// key type. When K is a pointer or contains pointer fields the
-// constructor logs a warning via the configured [WithLogger]. The
-// option is opt-in; default is off so legitimate pointer keys
-// (e.g., `*atomic.Value` for sentinel singletons) don't spam logs.
+// WithSafeKeys enables a construction-time check that warns when K is a
+// pointer or contains pointer fields. Off by default.
 func WithSafeKeys(b bool) Option {
 	return func(c *config) { c.safeKeys = b }
 }
 
-// WithCallbackTimeout bounds how long synchronous hooks (OnHit /
-// OnMiss / OnEvict / OnExpire / OnLoad / OnEvent / PurgeVisitor)
-// may run before the cache logs a warning. The watchdog is
-// best-effort: Go has no goroutine cancellation, so the callback
-// continues to run after the warning is emitted. Setting d <= 0
-// disables the watchdog (callbacks may block indefinitely);
-// default is 0.
+// WithCallbackTimeout bounds synchronous-hook duration before a warning
+// is logged. Best-effort: Go cannot preempt the callback. d <= 0
+// disables; default 0.
 func WithCallbackTimeout(d time.Duration) Option {
 	return func(c *config) { c.callbackTimeout = d }
 }
 
-// WithPurgeVisitor registers a function called for every entry
-// during [Cache.Clear] and [Cache.Close]. Distinct from
-// [WithOnEvict] — purge visitors fire exactly once per entry
-// during whole-cache teardown, on the path to draining state.
-//
-// The visitor is called outside any shard lock, so it may block,
-// perform I/O, or call back into the cache (no re-entry detection
-// is applied to purge — Clear has already snapshotted the entries).
-//
-// Errors returned by the visitor are logged and otherwise ignored;
-// the purge proceeds.
+// WithPurgeVisitor registers fn called for every entry during
+// [Cache.Clear] and [Cache.Close]. Called outside any shard lock; may
+// block, do I/O, or re-enter the cache. Errors are logged.
 func WithPurgeVisitor[K comparable, V any](fn func(key K, value V) error) Option {
 	return func(c *config) {
 		if fn != nil {
@@ -91,16 +67,9 @@ func WithPurgeVisitor[K comparable, V any](fn func(key K, value V) error) Option
 	}
 }
 
-// WithCopyOnGet installs a copy function applied to V on every
-// successful [Cache.Get] / [Cache.Peek] return. The cached value
-// is preserved as-is; callers receive the result of fn(value), so
-// they can mutate it without affecting the cache. Useful when V is
-// a slice, map, or struct containing pointers and callers can't be
-// trusted to copy-on-read.
-//
-// fn must be deterministic and side-effect-free. It is called
-// under the shard's read lock on the Get path; expensive copy
-// implementations will serialize concurrent reads of the same key.
+// WithCopyOnGet installs fn applied to V on every successful Get/Peek
+// return; callers receive fn(value). fn is called under the shard's
+// read lock and MUST be fast and side-effect-free.
 func WithCopyOnGet[V any](fn func(V) V) Option {
 	return func(c *config) {
 		if fn != nil {

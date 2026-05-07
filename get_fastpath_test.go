@@ -1,8 +1,5 @@
-// get_fastpath_test.go covers the read-lock fast path added in
-// Tier 2 of the v0.1 roadmap. The behavioral contract is exactly
-// the same as the slow-path Get; the test surface ensures
-// equivalent observable behavior on every code path the fast path
-// can short-circuit.
+// get_fastpath_test.go covers the read-lock fast path. The
+// behavioral contract is identical to the slow-path Get.
 
 package memcache
 
@@ -14,10 +11,7 @@ import (
 )
 
 func TestFastPathFIFOServesUnderRLock(t *testing.T) {
-	// FIFO never promotes, so every hit takes the fast path. We
-	// can't observe "did the fast path fire?" directly, but we can
-	// confirm correctness: 1000 concurrent Get goroutines all see
-	// the same value with no torn reads.
+	// FIFO never promotes, so every hit takes the fast path.
 	c, _ := New[string, int](
 		WithMaxEntries(64),
 		WithPolicy(PolicyFIFO),
@@ -120,9 +114,8 @@ func TestFastPathSlidingTTLTakesSlowPath(t *testing.T) {
 	if _, ok := c.Get("k"); !ok {
 		t.Fatal("Get should hit before half-TTL")
 	}
-	// The entry's expireAt should have advanced (sliding TTL took
-	// effect on the slow path). Advance past the original expiry —
-	// if sliding worked, the entry is still alive.
+	// Advance past the original expiry; if sliding worked, the
+	// entry is still alive.
 	clk.Advance(45 * time.Minute) // total = 1h15m
 	if _, ok := c.Get("k"); !ok {
 		t.Error("sliding TTL should have moved expiry past wall-clock advance")

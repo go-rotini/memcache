@@ -38,8 +38,7 @@ func (b *wheelBackend[K, V]) Add(e *entry[K, V]) {
 	e.wheelHandle = we
 }
 
-// Remove unlinks e's wheel entry. Idempotent — safe for entries
-// the wheel never saw or has already returned via Sweep.
+// Remove unlinks e's wheel entry. Idempotent.
 func (b *wheelBackend[K, V]) Remove(e *entry[K, V]) {
 	if e.wheelHandle == nil {
 		return
@@ -81,7 +80,6 @@ func (b *wheelBackend[K, V]) Sweep(now int64) []*entry[K, V] {
 // Len reports the wheel's currently-tracked entry count.
 func (b *wheelBackend[K, V]) Len() int { return b.wheel.Len() }
 
-// Reset clears every slot. Per-entry wheelHandle pointers are
-// left dangling — the cache's own Reset path is what nils them
-// when the entries are pooled.
+// Reset clears every slot; the cache's Reset path nils per-entry
+// wheelHandle pointers when entries are pooled.
 func (b *wheelBackend[K, V]) Reset() { b.wheel.Reset() }

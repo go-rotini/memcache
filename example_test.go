@@ -12,10 +12,8 @@ import (
 	"github.com/go-rotini/memcache"
 )
 
-// ExampleNew shows the canonical zero-config construction. Either
-// WithMaxEntries or WithMaxBytes must be supplied — an unbounded
-// cache is a memory leak in disguise and the constructor refuses
-// it.
+// ExampleNew shows zero-config construction. Either WithMaxEntries
+// or WithMaxBytes MUST be supplied; New refuses an unbounded cache.
 func ExampleNew() {
 	c, err := memcache.New[string, int](memcache.WithMaxEntries(1000))
 	if err != nil {

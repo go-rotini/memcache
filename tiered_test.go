@@ -74,9 +74,9 @@ func TestTieredGetL2HitPromotes(t *testing.T) {
 	st := tc.Stats()
 	if st.L1Hits != 1 || st.L2Hits != 1 {
 		// L1Hits=1 because the post-promotion l1.Get hit.
-		// Wait — that l1.Get is on the underlying cache, NOT the
+		// (That l1.Get is on the underlying cache, not the
 		// Tiered wrapper. Tiered.L1Hits counts only Tiered.Get
-		// calls served by L1. So L1Hits should still be 0 here.
+		// calls served by L1, so L1Hits should still be 0 here.)
 		t.Logf("Stats: %+v", st)
 	}
 	if st.L2Hits != 1 || st.Promotions != 1 {

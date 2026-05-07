@@ -223,7 +223,6 @@ func (p *lfuPolicy[K, V]) Snapshot() any {
 	return PolicyDetailLFU{Size: p.size, DistinctBuckets: len(p.buckets)}
 }
 
-// PromotionNeeded reports true — LFU updates the entry's frequency
-// bucket on every access. Returning false would silently sabotage
-// hit rate.
+// PromotionNeeded always returns true: LFU updates the frequency bucket
+// on every access.
 func (p *lfuPolicy[K, V]) PromotionNeeded(*entry[K, V]) bool { return true }

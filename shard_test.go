@@ -74,8 +74,8 @@ func TestShardKeysDistributeAcrossShards(t *testing.T) {
 		idx := c.hasher(k) & c.shardMask
 		hits[idx]++
 	}
-	// No shard should claim more than ~3× its fair share. Loose
-	// bound — we're checking the hasher isn't pathologically biased.
+	// No shard should claim more than ~3x its fair share. Loose
+	// bound to confirm the hasher isn't pathologically biased.
 	expected := n / shards
 	for i, h := range hits {
 		if h > expected*3 || h < expected/3 {

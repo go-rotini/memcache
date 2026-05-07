@@ -30,8 +30,7 @@ func TestCacheKeyer_GetCacheable_PrototypePattern(t *testing.T) {
 	defer c.Close()
 	_ = SetCacheable(c, userByID{ID: 7, Name: "bob"})
 
-	// Look up using only the ID-bearing prototype; the rest of
-	// the value can be its zero — CacheKey() ignores Name.
+	// Look up using only the ID-bearing prototype; CacheKey() ignores Name.
 	got, ok := GetCacheable(c, userByID{ID: 7})
 	if !ok || got.Name != "bob" {
 		t.Errorf("GetCacheable proto = (%+v, %v); want bob", got, ok)

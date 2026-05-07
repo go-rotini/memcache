@@ -1,10 +1,8 @@
 package memcache
 
-// untagOp is a queued tag-removal request produced by the eviction
-// path (`removeLocked`) and consumed by the drainer goroutine.
-// Carrying the slice rather than a pointer keeps the entry's pool
-// recycle independent of the queue's drain order — the entry's tag
-// slice is captured by value at enqueue time.
+// untagOp is a queued tag-removal request from removeLocked, consumed
+// by the drainer. Carries the tag slice by value so entry pool recycle
+// is independent of queue drain order.
 type untagOp[K comparable] struct {
 	key  K
 	tags []string
@@ -148,7 +146,7 @@ func (c *Cache[K, V]) enqueueUntag(key K, tags []string) {
 	case c.tagCleanupQueue <- op:
 		// queued; drainer will pick it up
 	default:
-		// queue full — apply inline so the index doesn't drift.
+		// Queue full; apply inline so the index doesn't drift.
 		c.tags.untag(key, tags)
 		c.tagCleanupInflight.Add(-1)
 		c.tagCleanupOverflows.Add(1)

@@ -96,8 +96,8 @@ func (p *twoQPolicy[K, V]) OnInsert(e *entry[K, V]) {
 	}
 }
 
-// OnAccess promotes Am entries to MRU; A1in entries are unchanged
-// (FIFO semantics — a hit while in A1in does not delay eviction).
+// OnAccess promotes Am entries to MRU; A1in entries are unchanged (FIFO
+// semantics: a hit in A1in does not delay eviction).
 func (p *twoQPolicy[K, V]) OnAccess(e *entry[K, V]) {
 	n, ok := e.policyData.(*twoQNode[K, V])
 	if !ok || n == nil {
@@ -149,8 +149,8 @@ func (p *twoQPolicy[K, V]) Victim() *entry[K, V] {
 		p.unlinkAm(n)
 		return n.entry
 	}
-	// Total over budget but neither queue alone is — pick the
-	// oldest from A1in if it has anything, else Am's tail.
+	// Total over budget but neither queue alone is; pick the oldest
+	// from A1in if any, else Am's tail.
 	if p.inHead != nil {
 		n := p.inHead
 		p.unlinkIn(n)
@@ -300,6 +300,6 @@ func (p *twoQPolicy[K, V]) Snapshot() any {
 	return PolicyDetail2Q{A1inSize: p.inSize, AmSize: p.amSize, A1outSize: p.outSize}
 }
 
-// PromotionNeeded reports true — 2Q may promote A1in → Am on
-// access, so the fast path is not safe.
+// PromotionNeeded always returns true: 2Q may promote A1in to Am on
+// access, so the read-only fast path is unsafe.
 func (p *twoQPolicy[K, V]) PromotionNeeded(*entry[K, V]) bool { return true }

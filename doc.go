@@ -1,5 +1,5 @@
 // Package memcache implements a bounded, generic, thread-safe in-memory
-// cache designed for long-running Go programs — REPLs, daemons, watch-mode
+// cache designed for long-running Go programs: REPLs, daemons, watch-mode
 // build tools, and other CLI workloads where cache state must survive across
 // many requests but the host process restarts often enough that warm-restart
 // matters.
@@ -44,7 +44,7 @@
 // # Snapshot & Restore
 //
 // The cache can be persisted to disk and restored on the next process
-// launch — the killer feature for REPL-style workloads where a 30-second
+// launch, the killer feature for REPL-style workloads where a 30-second
 // warm-up cost dominates user perception. [Cache.Save] and [Cache.Load]
 // handle the basic flow; [WithAutoSave] and [WithAutoLoad] make persistence
 // transparent for the typical CLI case.

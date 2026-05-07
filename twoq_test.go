@@ -32,7 +32,7 @@ func TestTwoQGhostHitPromotesToAm(t *testing.T) {
 	}
 	v.policyData = nil
 
-	// Re-insert "a" — should go to Am, not A1in.
+	// Re-insert "a"; should go to Am, not A1in.
 	a2 := makeTwoQEntry("a")
 	p.OnInsert(a2)
 	n := a2.policyData.(*twoQNode[string, int])

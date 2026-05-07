@@ -47,7 +47,7 @@ func TestWithDoorkeeper_RejectsFirstSet(t *testing.T) {
 	if err := c.Set("k", 1); err != nil {
 		t.Fatal(err)
 	}
-	// Doorkeeper hadn't seen "k" before — first Set rejected.
+	// Doorkeeper hadn't seen "k" before; first Set rejected.
 	if _, ok := c.Get("k"); ok {
 		t.Error("first Set under WithDoorkeeper should be rejected")
 	}
@@ -73,8 +73,8 @@ func TestWithDoorkeeper_UpdateBypassesGate(t *testing.T) {
 	// Two Sets to land the value.
 	_ = c.Set("k", 1)
 	_ = c.Set("k", 2)
-	// Now the entry exists. Mutating it must always succeed —
-	// the admission policy gates inserts, not updates.
+	// Mutating an existing entry MUST always succeed: the
+	// admission policy gates inserts, not updates.
 	if err := c.Set("k", 99); err != nil {
 		t.Fatal(err)
 	}

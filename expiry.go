@@ -108,13 +108,8 @@ func (c *Cache[K, V]) startJanitorLocked(s *shard[K, V]) {
 	go c.runJanitor(s, stop, tick)
 }
 
-// stopJanitor signals the janitor to exit. Idempotent — calling on
-// a stopped janitor is a no-op.
-//
-// Acquires s.mu so reads of `s.janitor.stop`/`s.janitor.timer` are
-// serialized with [startJanitorLocked]'s writes; otherwise a
-// concurrent restart (e.g., from a refresh-ahead Loader Set during
-// Close) races on those fields.
+// stopJanitor signals the janitor to exit. Idempotent. Acquires s.mu
+// so reads of janitor.stop/timer are serialized with startJanitorLocked.
 func (c *Cache[K, V]) stopJanitor(s *shard[K, V]) {
 	if !s.janitor.running.CompareAndSwap(true, false) {
 		return
@@ -160,9 +155,8 @@ func (c *Cache[K, V]) runJanitor(s *shard[K, V], stop, tick <-chan struct{}) {
 			if removed == 0 && heapEmpty {
 				idle++
 				if idle >= janitorIdleShutdownTicks {
-					// Confirm still idle under the lock — if
-					// the race lost (a concurrent insert added
-					// a TTL'd entry), stay alive and re-arm.
+					// Confirm still idle under the lock; on race,
+					// stay alive and re-arm.
 					if s.ttl.Len() == 0 {
 						s.janitor.running.Store(false)
 						if s.janitor.timer != nil {

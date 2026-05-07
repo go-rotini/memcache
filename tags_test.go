@@ -275,8 +275,8 @@ func TestWithGroupCapsMembers(t *testing.T) {
 	)
 	defer c.Close()
 
-	// Add 5 entries with the "session" tag — capacity 3, so the
-	// oldest 2 should be evicted as we exceed the cap.
+	// Add 5 entries with the "session" tag (capacity 3); oldest 2
+	// should be evicted as we exceed the cap.
 	clk := NewFakeClock(time.Unix(0, 0))
 	c.cfg.clock = clk // Use fake clock for deterministic ordering.
 	for _, k := range []string{"a", "b", "c", "d", "e"} {
@@ -366,9 +366,7 @@ func TestSetWithOptionsExpireAtAlsoIndexesTags(t *testing.T) {
 }
 
 // TestTagsConcurrencyStress exercises SetWithTags + InvalidateTag
-// under many concurrent goroutines. Race detector confirms there
-// are no data races and the snapshot-then-delete InvalidateTag
-// pattern stays deadlock-free even when intermixed with writes.
+// under many concurrent goroutines (race detector + deadlock-free).
 func TestTagsConcurrencyStress(t *testing.T) {
 	c, _ := New[string, int](WithMaxEntries(1000), WithShards(8))
 	defer c.Close()
@@ -409,10 +407,8 @@ func TestTagsConcurrencyStress(t *testing.T) {
 	wg.Wait()
 }
 
-// TestValidateTagLimitsDeduplicatesPerEntryCount regression: the
-// per-entry tag cap and the cache-wide tag cap must agree on what
-// counts as "distinct." A caller passing the same tag multiple
-// times should not bust the per-entry cap.
+// TestValidateTagLimitsDeduplicatesPerEntryCount: a caller passing
+// the same tag multiple times must not bust the per-entry cap.
 func TestValidateTagLimitsDeduplicatesPerEntryCount(t *testing.T) {
 	c, _ := New[string, int](
 		WithMaxEntries(8),
@@ -426,7 +422,7 @@ func TestValidateTagLimitsDeduplicatesPerEntryCount(t *testing.T) {
 		// Note: dedupe applies only to the limit check; the entry
 		// retains the raw tag list as supplied by the caller.
 		// This test documents that distinction.
-		t.Logf("Tags(k) = %v (raw, not deduped — only the limit checks are deduped)", got)
+		t.Logf("Tags(k) = %v (raw, not deduped; only the limit checks are deduped)", got)
 	}
 }
 

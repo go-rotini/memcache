@@ -36,21 +36,12 @@ type flatSlot[K comparable, V any] struct {
 	state flatSlotState
 }
 
-// flatStore is a flat hash-probed shard storage layout. It uses open
-// addressing with linear probing; deletion creates a tombstone so
-// in-cluster probes still find later-inserted keys.
-//
-// Compaction triggers when (occupied + tombstones) / cap exceeds the
-// load factor. If tombstones make up at least half of the in-use
-// slots the rebuild stays at the current capacity (just collects the
-// tombstones); otherwise the table grows by 2x. The compactions
-// counter is incremented on every rebuild and surfaces as
-// [Stats.Compactions].
-//
-// Concurrency: flatStore is NOT independently safe — the owning
-// shard's RWMutex guards every method. The compactions counter is
-// atomic only so [Cache.Stats] can read it without grabbing the
-// shard lock.
+// flatStore is a flat open-addressing/linear-probing shard storage with
+// tombstone-aware compaction. Compaction grows by 2x unless tombstones
+// dominate (>=50% of in-use slots), in which case it rebuilds at the
+// same capacity. compactCount is atomic so [Cache.Stats] can read it
+// without the shard lock; otherwise the owning shard's mutex serializes
+// all method calls.
 type flatStore[K comparable, V any] struct {
 	hasher       func(K) uint64
 	slots        []flatSlot[K, V]
@@ -59,10 +50,8 @@ type flatStore[K comparable, V any] struct {
 	compactCount atomic.Uint64
 }
 
-// newFlatStore constructs a flatStore with the given hasher and an
-// initial slot count rounded up to the next power of two (minimum
-// [flatStoreInitialCap]). Power-of-two capacity is required so the
-// hot path can reduce hashes via bit-mask instead of modulo.
+// newFlatStore constructs a flatStore with hasher and a power-of-two
+// slot count (minimum [flatStoreInitialCap]) so probes use bit-mask.
 func newFlatStore[K comparable, V any](hasher func(K) uint64, initialCap int) *flatStore[K, V] {
 	if initialCap < flatStoreInitialCap {
 		initialCap = flatStoreInitialCap
@@ -74,16 +63,10 @@ func newFlatStore[K comparable, V any](hasher func(K) uint64, initialCap int) *f
 	}
 }
 
-// probe scans the slot table starting at the bucket implied by key.
-// On a hit it returns (idx, true) for the occupied slot.
-// On a miss it returns (insertIdx, false) where insertIdx is the
-// first empty-or-tombstone slot encountered along the probe — the
-// position a subsequent set should write to. The caller is
-// responsible for maintaining the occupied / tombstones counts.
-//
-// The probe terminates at the first empty (not tombstone) slot
-// because keys past that point must have been written before the
-// empty was created (linear probing invariant).
+// probe linear-scans for key. On hit returns (idx, true); on miss
+// returns (insertIdx, false) where insertIdx is the first
+// empty-or-tombstone slot. Probe terminates at the first empty (not
+// tombstone) slot per the linear-probing invariant.
 func (s *flatStore[K, V]) probe(key K) (idx int, found bool) {
 	mask := uint64(len(s.slots) - 1)
 	start := s.hasher(key) & mask
@@ -108,13 +91,8 @@ func (s *flatStore[K, V]) probe(key K) (idx int, found bool) {
 		}
 		i = (i + 1) & mask
 		if i == start {
-			// Full sweep without an empty slot — the table is
-			// pathologically full. Caller must have triggered a
-			// resize before reaching this state; if not, returning
-			// (insertIdx, false) gives the caller something to act
-			// on (insertIdx will be >=0 unless every slot is
-			// occupied with a non-matching key, which is impossible
-			// when the load-factor invariant holds).
+			// Full sweep without an empty slot. Caller should have
+			// triggered a resize before reaching this state.
 			return insertIdx, false
 		}
 	}
@@ -129,23 +107,14 @@ func (s *flatStore[K, V]) get(key K) (*entry[K, V], bool) {
 }
 
 func (s *flatStore[K, V]) set(key K, e *entry[K, V]) {
-	// Probe first so a pure update on an existing key doesn't
-	// trigger a rebuild — only a fresh insert (Empty / Tombstone
-	// slot consumption) can push the load factor over the
-	// threshold.
+	// Probe first; pure updates on existing keys don't trigger rebuild.
 	idx, found := s.probe(key)
 	if found {
 		s.slots[idx].value = e
 		return
 	}
-	// Two scenarios force a rebuild before insertion:
-	//   1. Load factor crossed the grow threshold.
-	//   2. probe wrapped without finding an empty/tombstone slot
-	//      (idx == -1). The 0.75 load-factor invariant should
-	//      prevent this in practice, but a degenerate hasher could
-	//      produce pathological probe paths — rebuilding is a safe
-	//      fallback that avoids the index-out-of-range panic the
-	//      next line would otherwise hit.
+	// Rebuild before inserting if the load factor crossed the grow
+	// threshold or probe wrapped without an empty slot (defensive).
 	if idx < 0 || s.shouldGrowBeforeInsert() {
 		s.rebuild(s.nextRebuildCap())
 		idx, _ = s.probe(key)
@@ -211,19 +180,15 @@ func (s *flatStore[K, V]) each(fn func(*entry[K, V]) bool) {
 
 func (s *flatStore[K, V]) compactions() uint64 { return s.compactCount.Load() }
 
-// shouldGrowBeforeInsert reports whether the next insert would push
-// the in-use fraction past the configured load factor. Triggered
-// before insert because we want to rebuild while we still have at
-// least one empty slot to terminate probes.
+// shouldGrowBeforeInsert reports whether the next insert would cross
+// the load factor; rebuild while at least one empty slot remains.
 func (s *flatStore[K, V]) shouldGrowBeforeInsert() bool {
 	inUse := s.occupied + s.tombstones
 	return inUse*flatStoreLoadFactorDen >= flatStoreLoadFactorNum*len(s.slots)
 }
 
-// shouldCompactAfterDelete reports whether the tombstone fraction
-// has crossed the threshold that justifies a rebuild on its own.
-// Without this check tombstone-only churn (steady-state insert/
-// delete on a saturated table) would never trigger compaction.
+// shouldCompactAfterDelete reports whether the tombstone fraction has
+// crossed the rebuild threshold (for tombstone-only steady-state churn).
 func (s *flatStore[K, V]) shouldCompactAfterDelete() bool {
 	if s.tombstones == 0 {
 		return false
@@ -231,10 +196,8 @@ func (s *flatStore[K, V]) shouldCompactAfterDelete() bool {
 	return s.tombstones*flatStoreTombFractionDen >= flatStoreTombFractionNum*len(s.slots)
 }
 
-// nextRebuildCap returns the slot count for the next rebuild. The
-// rebuild grows the table when the live (occupied) population is
-// itself above the load factor; otherwise it stays at the same cap
-// (collects tombstones in place). Always returns a power of two.
+// nextRebuildCap returns the next rebuild slot count: doubled when
+// occupied alone is above the load factor, same otherwise. Power of two.
 func (s *flatStore[K, V]) nextRebuildCap() int {
 	cur := len(s.slots)
 	if s.occupied*flatStoreLoadFactorDen >= flatStoreLoadFactorNum*cur {
@@ -243,10 +206,8 @@ func (s *flatStore[K, V]) nextRebuildCap() int {
 	return cur
 }
 
-// rebuild allocates a new slots array sized to newCap (must be a
-// power of two), re-inserts every occupied entry, and replaces the
-// store's slots in place. The compactions counter is incremented
-// regardless of whether the rebuild grew the table.
+// rebuild allocates a fresh power-of-two slots array of newCap and
+// re-inserts every occupied entry. compactCount is incremented.
 func (s *flatStore[K, V]) rebuild(newCap int) {
 	old := s.slots
 	s.slots = make([]flatSlot[K, V], newCap)

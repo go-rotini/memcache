@@ -1,33 +1,13 @@
-// Package wheel implements a hashed timing wheel suitable for
-// scheduling many timers with O(1) amortized add / cancel / expire.
-// It is the alternative TTL backend for the cache when
-// `memcache.WithTTLBuckets(...)` is enabled — high-volume TTL
-// workloads (millions of entries with TTLs) trade the per-shard
-// heap's exact-time ordering for the wheel's amortized constant-
-// time work per tick.
+// Package wheel implements a hashed timing wheel with O(1) amortized
+// add/cancel/expire. The cache uses it as an alternative TTL backend
+// behind [memcache.WithTTLBuckets].
 //
-// The wheel hosts a fixed number of `slots` arranged in a ring;
-// each tick advances the cursor by one slot. An entry whose expiry
-// lies in tick T mod slots lands on slot (T mod slots) with a
-// "revolutions remaining" counter for ticks beyond the first
-// rotation. AdvanceTo flushes every slot whose tick passes the
-// supplied now and returns the expired entries.
-//
-// Precision: an entry with TTL d expires at the next tick after d,
-// so worst-case error is one tick. Choose tick = JanitorInterval
-// (typically 30s) for diagnostics and TTL workloads where precision
-// finer than a tick doesn't matter.
-//
-// Concurrency: the wheel is NOT safe for concurrent use. Callers
-// (the cache shard) must hold the appropriate lock while calling
-// Add / Remove / AdvanceTo. The matching mutex is the natural
-// shard.mu.
+// Precision: an entry with TTL d expires at the next tick after d
+// (worst-case error: one tick). NOT safe for concurrent use.
 package wheel
 
-// Entry is the user-supplied opaque payload tracked by the wheel.
-// The wheel does not interpret it — Add returns a Handle the user
-// stores so subsequent Remove calls can find their slot in O(1)
-// without walking the wheel.
+// Entry is the user payload tracked by the wheel. The wheel writes the
+// owning slot back into the entry so Remove is O(1) without scanning.
 type Entry[T any] struct {
 	Payload     T
 	ExpireAtNs  int64
@@ -78,15 +58,10 @@ func (w *Wheel[T]) SlotCount() int { return w.slotCount }
 // TickNs returns the configured tick duration.
 func (w *Wheel[T]) TickNs() int64 { return w.tickNs }
 
-// Add schedules e to expire at e.ExpireAtNs. The same Entry pointer
-// is what callers pass to Remove later — the wheel writes the
-// owning slot and revolutions back into the entry so removal is
-// O(1). Expired entries (ExpireAtNs ≤ current cursor time) land on
-// the next-to-be-processed slot with revolutions=0 so the next
-// AdvanceTo surfaces them — placing them on the cursor's current
-// slot would mean they wait a full rotation before being noticed
-// (the cursor's slot was already processed by whichever AdvanceTo
-// landed there).
+// Add schedules e to expire at e.ExpireAtNs. Already-expired entries
+// land on the next-to-be-processed slot (NOT the cursor's current slot,
+// which was already processed) so the next AdvanceTo surfaces them
+// without waiting a full rotation.
 func (w *Wheel[T]) Add(e *Entry[T]) {
 	if e == nil {
 		return
@@ -96,7 +71,7 @@ func (w *Wheel[T]) Add(e *Entry[T]) {
 	if delta > 0 {
 		ticksAhead = delta / w.tickNs
 		if delta%w.tickNs != 0 {
-			ticksAhead++ // round up — entry expires NO LATER than the tick
+			ticksAhead++ // round up: entry expires NO LATER than the tick
 		}
 	}
 	if ticksAhead < 1 {

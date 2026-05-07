@@ -5,19 +5,12 @@ import (
 	"sync"
 )
 
-// tagIndex maps each tag to the set of keys carrying it. Lives at
-// the cache level (not per-shard) because a single InvalidateTag
-// must enumerate every key — possibly across many shards — before
-// touching any of them.
+// tagIndex maps each tag to the set of keys carrying it. Lives at the
+// cache level so a single InvalidateTag can enumerate every key.
 //
-// Lock-ordering rule (spec §19.2.1):
-//   - Insert/update path holds shard.mu THEN takes idx.mu.
-//   - InvalidateTag path takes idx.mu, snapshots the key set,
-//     RELEASES idx.mu, and only then acquires shard.mu (one shard
-//     at a time). It NEVER holds both simultaneously.
-//
-// This keeps both directions deadlock-free without forcing a global
-// lock order between shard mutexes and idx.mu.
+// Lock-ordering: insert/update holds shard.mu THEN takes idx.mu.
+// InvalidateTag takes idx.mu, snapshots the keys, RELEASES idx.mu, then
+// acquires shard.mu one shard at a time. NEVER holds both simultaneously.
 type tagIndex[K comparable] struct {
 	mu sync.RWMutex
 	// keysByTag is the inverted index used by InvalidateTag.
@@ -325,16 +318,12 @@ func (c *Cache[K, V]) retagLocked(key K, oldTags, newTags []string) {
 // [*CapacityError] wrapping [ErrTooManyTags] when either bound
 // would be violated; nil otherwise.
 //
-// The newDistinctTagsCount calculation is approximate — it walks
-// tags and checks the cache-level index for membership, accepting
-// a small race window where a concurrent Set might also be
-// introducing a new tag and both observers see "OK". The cap
-// remains a soft bound; absolute enforcement requires a stricter
-// (and much slower) cross-shard atomic check.
+// The newDistinctTagsCount calculation is approximate; it walks tags
+// and checks the cache-level index, accepting a small race where
+// concurrent Sets both observe "OK". The cap is a soft bound.
 func (c *Cache[K, V]) validateTagLimits(tags []string) error {
-	// Dedupe `tags` against itself once — used by both the per-
-	// entry cap and the cache-level cap so the two checks agree
-	// on what counts as a "distinct tag".
+	// Dedupe tags once; both the per-entry and cache-level caps use the
+	// same notion of "distinct tag".
 	var distinct []string
 	if len(tags) > 0 {
 		seen := make(map[string]struct{}, len(tags))

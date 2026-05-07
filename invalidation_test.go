@@ -91,8 +91,8 @@ func TestInvalidationSubscriber_GoroutineExitsOnClose(t *testing.T) {
 		WithMaxEntries(8),
 		WithInvalidationSubscriber[string](ch),
 	)
-	// Close should cause the goroutine to return — we verify by
-	// confirming Close itself returns within a reasonable budget.
+	// Close must cause the subscriber goroutine to return; verify
+	// by confirming Close returns within a reasonable budget.
 	done := make(chan error, 1)
 	go func() { done <- c.Close() }()
 	select {

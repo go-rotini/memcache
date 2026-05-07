@@ -54,12 +54,9 @@ func SetWeight(w int64) SetOption {
 	}
 }
 
-// SetTags attaches tags to the entry. Calling SetTags (even with no
-// arguments) is treated as the caller explicitly opting OUT of any
-// auto-tag derivation that would otherwise happen via [CacheTagger]
-// or template tags — `SetTags()` means "no tags," not "use defaults."
-// Pass tag names to attach them; `SetTags("a", "b")` overrides
-// `CacheTagger.CacheTags()` and any `cache:"...,tag=..."` template.
+// SetTags attaches tags to the entry. Calling SetTags with no arguments
+// explicitly opts out of [CacheTagger] / template auto-tag derivation.
+// SetTags("a", "b") overrides CacheTags() and any cache:"...,tag=..." template.
 func SetTags(tags ...string) SetOption {
 	return func(s *setConfig) {
 		s.tags = append(s.tags[:0], tags...)
@@ -74,10 +71,9 @@ func SetSliding(sliding bool) SetOption {
 	return func(s *setConfig) { s.sliding = sliding }
 }
 
-// SetExpireAt sets an absolute expiry time, taking precedence over
-// any TTL set by [SetTTL] or the cache default. The supplied time
-// is wall-clock — a backwards NTP jump may temporarily un-expire
-// the entry. Use [SetTTL] for monotonic-clock-safe expiry.
+// SetExpireAt sets an absolute wall-clock expiry. Takes precedence over
+// [SetTTL] and the cache default. NTP backsteps may temporarily
+// un-expire the entry; use [SetTTL] for monotonic-safe expiry.
 func SetExpireAt(t time.Time) SetOption {
 	return func(s *setConfig) {
 		s.expireAt = t

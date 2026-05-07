@@ -327,8 +327,7 @@ func TestComputeReentrancyPanic(t *testing.T) {
 
 func TestComputeReentrancyDeferredCleanup(t *testing.T) {
 	// After a Compute exits cleanly, subsequent Computes from the
-	// same goroutine MUST work — confirms the registry properly
-	// removes the goroutine on normal exit.
+	// same goroutine MUST work.
 	c, _ := New[string, int](WithMaxEntries(4))
 	defer c.Close()
 	for i := range 3 {
@@ -342,7 +341,7 @@ func TestComputeReentrancyDeferredCleanup(t *testing.T) {
 }
 
 func TestComputeReentrancyAcrossGoroutinesAllowed(t *testing.T) {
-	// Re-entrancy detection is per-goroutine — concurrent Computes
+	// Re-entrancy detection is per-goroutine; concurrent Computes
 	// from distinct goroutines must NOT trip the guard.
 	c, _ := New[string, int](WithMaxEntries(64))
 	defer c.Close()

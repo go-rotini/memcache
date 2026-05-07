@@ -29,30 +29,10 @@ type TieredStats struct {
 	Promotions uint64
 }
 
-// Tiered combines two [Cache] instances into a hierarchy. Reads
-// hit L1 first; on miss they fall through to L2 and on L2 hit the
-// value is promoted to L1 so subsequent reads bypass L2 entirely.
-// Writes are write-through: every Set lands in both caches.
-//
-// The L1/L2 split is the canonical "small fast in-memory cache +
-// larger warm pool" pattern. Typical CLI usage gives L1 a tight
-// entry budget and lets L2 carry the long-lived working set —
-// possibly backed by a disk-backed [Store] in a future revision.
-//
-// Tiered is safe for concurrent use; thread-safety follows from
-// the underlying [Cache] thread-safety. Both caches must be
-// non-nil and use the same K/V types (enforced statically by Go
-// generics).
-//
-// Surface: Tiered exposes the high-traffic methods ([Tiered.Get]/
-// [Tiered.GetCtx]/[Tiered.Set]/[Tiered.SetWithTTL]/
-// [Tiered.SetWithOptions]/[Tiered.Delete]/[Tiered.Has]/
-// [Tiered.InvalidateTag]/[Tiered.Sync]) directly. The remaining
-// surface ([Cache.Compute], [Cache.GetOrLoad], [Cache.Range],
-// [Cache.Save], [Cache.Subscribe], etc.) is reachable via
-// [Tiered.L1] / [Tiered.L2]; choose the tier that owns the
-// semantics you need (e.g., GetOrLoad is a per-Cache concept and
-// invokes the loader of whichever tier you call it on).
+// Tiered combines two [Cache] instances into an L1/L2 hierarchy. Reads
+// hit L1 first; L2 hits are promoted to L1. Writes are write-through.
+// Tiered exposes the high-traffic methods directly; reach the rest via
+// [Tiered.L1] / [Tiered.L2]. Both caches must be non-nil.
 type Tiered[K comparable, V any] struct {
 	l1 *Cache[K, V]
 	l2 *Cache[K, V]
@@ -65,12 +45,9 @@ type Tiered[K comparable, V any] struct {
 	closed atomic.Bool
 }
 
-// NewTiered constructs a [Tiered] cache from two [Cache] instances.
-// Both must be non-nil; passing a nil cache panics. The Tiered
-// wrapper does NOT take ownership of either cache for purposes of
-// re-configuration, but [Tiered.Close] DOES close both — callers
-// who need to keep one cache alive after Tiered.Close should not
-// share it with a Tiered.
+// NewTiered constructs a [Tiered] cache from two non-nil [Cache]
+// instances. [Tiered.Close] closes both; share an underlying cache only
+// if you do not need to outlive Tiered.Close.
 func NewTiered[K comparable, V any](l1, l2 *Cache[K, V]) *Tiered[K, V] {
 	if l1 == nil {
 		panic("memcache: NewTiered: l1 is nil")
@@ -81,17 +58,9 @@ func NewTiered[K comparable, V any](l1, l2 *Cache[K, V]) *Tiered[K, V] {
 	return &Tiered[K, V]{l1: l1, l2: l2}
 }
 
-// Get returns the cached value for key. Lookup order:
-//
-//  1. L1 is consulted via [Cache.Get]. On hit, return immediately.
-//  2. On L1 miss, L2 is consulted via [Cache.Get]. On hit, the
-//     value is written into L1 (best-effort — a failed L1 Set is
-//     silently swallowed; the L2 hit is still returned) and
-//     returned.
-//  3. Both miss → return the zero value with ok=false.
-//
-// Negative-cache and refresh-ahead semantics on either underlying
-// Cache are honored — those signals come through normal Get.
+// Get returns the cached value for key. Lookup order: L1, then L2 with
+// best-effort promotion to L1, then miss. A failed L1 promotion still
+// returns the L2 hit.
 func (t *Tiered[K, V]) Get(key K) (V, bool) {
 	var zero V
 	if t.closed.Load() {
@@ -192,11 +161,8 @@ func (t *Tiered[K, V]) SetWithTTL(key K, value V, ttl time.Duration) error {
 	return t.l2.SetWithTTL(key, value, ttl)
 }
 
-// SetWithOptions writes value to BOTH tiers with the supplied
-// per-call options. Both tiers receive the same option set, so
-// per-tier overrides (e.g., a different TTL on L2 than L1) are
-// not expressible — call into [Tiered.L1]/[Tiered.L2] directly
-// when you need them.
+// SetWithOptions writes value to both tiers with the same options. For
+// per-tier overrides, call into [Tiered.L1] / [Tiered.L2] directly.
 func (t *Tiered[K, V]) SetWithOptions(key K, value V, opts ...SetOption) error {
 	if t.closed.Load() {
 		return ErrClosed

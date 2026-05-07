@@ -36,20 +36,10 @@ type BulkLoader[K comparable, V any] interface {
 	LoadMulti(ctx context.Context, keys []K) (map[K]LoadResult[V], error)
 }
 
-// flightCall represents a single in-flight Loader invocation. The
-// first caller for a missing key creates the flight; subsequent
-// callers join by reading flight.done. When the loader goroutine
-// finishes, it stores val/ttl/err and closes done; every waiter
-// then reads its outcome under happens-before guarantees from the
-// channel close.
-//
-// Ctx-aggregation cancellation: every waiter (leader + followers)
-// holds a refcount. A waiter that exits via its own ctx.Done
-// decrements; when the count hits zero the loader's context is
-// canceled and the load returns with ctx.Canceled (assuming the
-// Loader implementation respects ctx). Successful completion via
-// flight.done does NOT decrement — the loader is already done so
-// there's nothing to cancel.
+// flightCall is a single in-flight Loader invocation. The first caller
+// creates it; followers join by reading flight.done. Each waiter holds
+// a refcount; a ctx-cancellation by all waiters cancels the loader ctx.
+// Successful completion via flight.done does not decrement.
 type flightCall[V any] struct {
 	// done is closed when val/ttl/err have been finalized and the
 	// shard's inflight entry has been removed.
@@ -73,10 +63,8 @@ type flightCall[V any] struct {
 	cancel func()
 }
 
-// newFlightCall returns a flightCall ready for waiters. cancel is
-// the loader's context-cancel function; the leader passes its
-// configured one in here. refs starts at 1 to account for the
-// leader.
+// newFlightCall returns a flightCall with refs=1 (the leader). cancel
+// is the loader's context-cancel function.
 func newFlightCall[V any](cancel func()) *flightCall[V] {
 	f := &flightCall[V]{
 		done:   make(chan struct{}),
@@ -86,17 +74,14 @@ func newFlightCall[V any](cancel func()) *flightCall[V] {
 	return f
 }
 
-// join increments the waiter refcount by 1. Followers call this
-// before they parking on flight.done.
+// join increments the waiter refcount by 1.
 func (f *flightCall[V]) join() {
 	f.refs.Add(1)
 }
 
-// cachedError is a per-shard "the loader broke" tombstone enabled
-// by [WithErrorTTL]. Distinct from the negative-cache tombstone
-// (which lives on the entries map with [flagNegative] set) because
-// the cached error needs to carry an actual error value back to
-// callers; the entry struct cannot, since its value field is V.
+// cachedError is a per-shard tombstone enabled by [WithErrorTTL]. Lives
+// off the entries map because it must carry an error value, which the
+// entry struct's V-typed value field cannot represent.
 type cachedError struct {
 	err      error
 	expireAt int64 // unix nanos

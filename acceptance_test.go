@@ -1,12 +1,5 @@
-// acceptance_test.go validates end-to-end scenarios that mirror
-// real CLI/daemon workflows. The suite is invoked separately from
-// the unit tests via `make test-acceptance` (Makefile filter
-// `-run TestAcceptance`).
-//
-// Each scenario is self-contained: it builds the cache, drives a
-// realistic sequence of operations, and asserts user-visible
-// behavior. No mocks or fakes beyond what production already
-// supplies (FakeClock for deterministic TTL).
+// acceptance_test.go validates end-to-end scenarios. Invoked via
+// `make test-acceptance` (Makefile filter `-run TestAcceptance`).
 
 package memcache
 
@@ -22,8 +15,6 @@ import (
 
 // TestAcceptanceREPLWarmRestart simulates a REPL exiting cleanly,
 // snapshotting its cache state, and re-launching with auto-load.
-// Spec §1: "second launch is fast because we wrote a snapshot
-// when we exited cleanly."
 func TestAcceptanceREPLWarmRestart(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "repl-cache.gob")
@@ -69,10 +60,7 @@ func TestAcceptanceREPLWarmRestart(t *testing.T) {
 }
 
 // TestAcceptanceTokenRefresh simulates an auth-token cache that
-// silently refreshes via WithRefreshAhead before the token
-// expires. The user-facing call NEVER sees a stale token; the
-// loader is invoked in the background while the cached token is
-// still served.
+// silently refreshes via WithRefreshAhead before the token expires.
 func TestAcceptanceTokenRefresh(t *testing.T) {
 	clk := NewFakeClock(time.Unix(0, 0))
 	tokenVersion := atomic.Int64{}
@@ -96,7 +84,7 @@ func TestAcceptanceTokenRefresh(t *testing.T) {
 		t.Fatalf("initial load = (%q, %v)", v, err)
 	}
 
-	// Advance to 60% of TTL — refresh-ahead should fire on Get.
+	// Advance to 60% of TTL: refresh-ahead should fire on Get.
 	clk.Advance(6 * time.Second)
 	tokenVersion.Store(2) // upstream rotated the token
 	if v, _ := c.Get("auth"); v != "token-v1" {
@@ -113,9 +101,6 @@ func TestAcceptanceTokenRefresh(t *testing.T) {
 	t.Errorf("refresh-ahead did not pick up the rotated token within timeout")
 }
 
-// TestAcceptanceFsnotifyInvalidation simulates a watch-mode build
-// tool that keys derived results by source-file path and uses tag
-// invalidation to drop everything derived from a changed file.
 func TestAcceptanceFsnotifyInvalidation(t *testing.T) {
 	c, _ := New[string, []byte](
 		WithMaxBytes(1<<20),
@@ -141,10 +126,8 @@ func TestAcceptanceFsnotifyInvalidation(t *testing.T) {
 	}
 }
 
-// TestAcceptanceStampede1000ConcurrentLoads is the package's
-// flagship stampede-protection guarantee: 1000 goroutines all
-// fetching the same missing key invoke the Loader exactly once.
-// Spec deliverable for Phase 6.
+// TestAcceptanceStampede1000ConcurrentLoads: 1000 goroutines all
+// fetching the same missing key must invoke the Loader exactly once.
 func TestAcceptanceStampede1000ConcurrentLoads(t *testing.T) {
 	hold := make(chan struct{})
 	calls := atomic.Int64{}
@@ -185,10 +168,8 @@ func TestAcceptanceStampede1000ConcurrentLoads(t *testing.T) {
 	}
 }
 
-// TestAcceptanceDaemonSnapshotRotation simulates a long-running
-// daemon that periodically writes a snapshot. The auto-save
-// goroutine must not leak resources or interfere with foreground
-// reads/writes.
+// TestAcceptanceDaemonSnapshotRotation: auto-save goroutine must
+// not leak resources or interfere with foreground reads/writes.
 func TestAcceptanceDaemonSnapshotRotation(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "daemon.gob")
@@ -212,7 +193,7 @@ func TestAcceptanceDaemonSnapshotRotation(t *testing.T) {
 		})
 	}
 
-	// Run for 200ms — plenty of time for several save rotations.
+	// Run for 200ms (plenty of time for several save rotations).
 	time.Sleep(200 * time.Millisecond)
 	stop.Store(true)
 	wg.Wait()
@@ -227,15 +208,8 @@ func TestAcceptanceDaemonSnapshotRotation(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer other.Close()
-	// We don't assert specific contents — auto-save snapshots a
-	// running cache and the contents at any rotation are
-	// timing-dependent. We assert only that the load succeeded
-	// without errors.
 }
 
-// TestAcceptanceNegativeCacheBlocksRepeatedLookups confirms the
-// negative-cache flow: ErrNotFound from the loader produces a
-// tombstone; subsequent gets short-circuit without re-invoking.
 func TestAcceptanceNegativeCacheBlocksRepeatedLookups(t *testing.T) {
 	calls := atomic.Int64{}
 	loader := LoaderFunc[string, int](func(_ context.Context, _ string) (int, time.Duration, error) {
@@ -260,9 +234,7 @@ func TestAcceptanceNegativeCacheBlocksRepeatedLookups(t *testing.T) {
 	}
 }
 
-// TestAcceptanceTieredWarmPool composes a tight L1 with a generous
-// L2 — the canonical "small in-process working set + larger warm
-// pool" pattern.
+// TestAcceptanceTieredWarmPool composes a tight L1 with a generous L2.
 func TestAcceptanceTieredWarmPool(t *testing.T) {
 	l1, _ := New[string, int](WithMaxEntries(4), WithShards(1))
 	l2, _ := New[string, int](WithMaxEntries(64))

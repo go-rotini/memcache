@@ -10,8 +10,7 @@ import (
 )
 
 // errEncryptShortCiphertext fires when an encrypted blob is shorter
-// than the AES-GCM nonce (12 bytes) — the format is malformed and
-// no key could decrypt it.
+// than the AES-GCM nonce (12 bytes); the format is malformed.
 var errEncryptShortCiphertext = errors.New("memcache: encrypted snapshot ciphertext shorter than nonce")
 
 // errEncryptKeyLength fires when [NewEncryptedCodec] is called with
@@ -19,17 +18,9 @@ var errEncryptShortCiphertext = errors.New("memcache: encrypted snapshot ciphert
 var errEncryptKeyLength = errors.New("memcache: encrypted codec key must be 32 bytes (AES-256)")
 
 // EncryptedCodec wraps a base [Codec] with AES-256-GCM authenticated
-// encryption. The wire format is `<12-byte nonce><gcm sealed
-// ciphertext>` — the nonce is fresh on every Marshal call and is
-// included in plaintext (per AES-GCM convention).
-//
-// Use this when snapshots cross a process or filesystem boundary
-// you do not control. The package does NOT manage key rotation;
-// callers supply a 32-byte key (AES-256) and rotate at their
-// discretion.
-//
-// Construct via [NewEncryptedCodec]; install via [WithCodec] or the
-// [WithEncryptedCodec] convenience.
+// encryption. Wire format: 12-byte nonce followed by GCM-sealed
+// ciphertext. Construct via [NewEncryptedCodec]; install via [WithCodec]
+// or [WithEncryptedCodec]. The package does not manage key rotation.
 type EncryptedCodec struct {
 	base Codec
 	gcm  cipher.AEAD

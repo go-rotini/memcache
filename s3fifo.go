@@ -101,9 +101,8 @@ func s3SplitBudget(budget int) (small, main int) {
 	return small, main
 }
 
-// SetBudget recomputes the Small/Main/Ghost sub-budgets to match a
-// new total. The policy does not preemptively evict — the cache will
-// drive subsequent calls to Victim if the new budget is smaller.
+// SetBudget recomputes Small/Main/Ghost sub-budgets. Does not preemptively
+// evict; the cache drives Victim calls.
 func (p *s3fifoPolicy[K, V]) SetBudget(budget int) {
 	small, main := s3SplitBudget(budget)
 	p.smallBudget = small
@@ -114,21 +113,15 @@ func (p *s3fifoPolicy[K, V]) SetBudget(budget int) {
 	}
 }
 
-// OnInsert places e into Main if its key is in the Ghost queue,
-// otherwise into Small. Fresh Small entries start at freq=0; Ghost-
-// rebirth entries start at freq=1 so they survive at least one Main
-// second-chance pass, which prevents the just-inserted entry from
-// being chosen as the Main victim by the same operation's post-insert
-// eviction loop (the entry sits at mainHead, and a freq=0 mainHead is
-// the immediate eviction target whenever Main is over budget — most
-// commonly because the same Victim call promoted Small entries to
-// Main, pushing it over).
+// OnInsert places e into Main if its key is in Ghost, otherwise Small.
+// Ghost-rebirth entries start at freq=1 so they survive at least one
+// Main second-chance pass and aren't picked as victim by the same
+// post-insert eviction loop.
 func (p *s3fifoPolicy[K, V]) OnInsert(e *entry[K, V]) {
 	n := &s3Node[K, V]{entry: e}
 	e.policyData = n
 	if g, ok := p.ghostSet[e.key]; ok {
-		// Promote on re-entry: was recently evicted, now back —
-		// place directly into Main and clear the Ghost record.
+		// Re-entry: was recently evicted; place into Main directly.
 		p.unlinkGhost(g)
 		n.inMain = true
 		n.freq.Store(1)
@@ -216,7 +209,7 @@ func (p *s3fifoPolicy[K, V]) Victim() *entry[K, V] {
 			p.unlinkMain(n)
 			return n.entry
 		}
-		// Neither queue is over budget — nothing to evict.
+		// Neither queue is over budget; nothing to evict.
 		return nil
 	}
 	// Defensive fallback: if we somehow looped without returning,
@@ -306,8 +299,7 @@ func (p *s3fifoPolicy[K, V]) pushMainTail(n *s3Node[K, V]) {
 }
 
 // unlinkSmall removes n from the Small queue. Safe to call on a node
-// whose list pointers are already nil — it just decrements smallSize
-// once and clears head/tail consistently.
+// with nil pointers (no-op).
 func (p *s3fifoPolicy[K, V]) unlinkSmall(n *s3Node[K, V]) {
 	switch {
 	case n.prev != nil:

@@ -14,8 +14,8 @@ func TestWithCollisionTrackingDefaultOffNoCounter(t *testing.T) {
 }
 
 func TestWithCollisionTrackingBumpsOnCollision(t *testing.T) {
-	// Custom hasher that maps every odd i to 1, every even i to 0
-	// — guaranteed collisions across many distinct keys.
+	// Custom hasher that maps every odd i to 1, every even i to 0:
+	// guaranteed collisions across many distinct keys.
 	hasher := WithHasher[int](func(k int) uint64 {
 		return uint64(k & 1)
 	})

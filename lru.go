@@ -1,12 +1,8 @@
 package memcache
 
-// lruPolicy is the classic doubly-linked-list + map LRU implementation
-// specialized for the package's entry struct. The list is intrusive —
-// pointers live on the entry's policyData field — so each access
-// avoids per-call allocation.
-//
-// lruPolicy is NOT safe for concurrent use; the shard's mutex
-// serializes all calls.
+// lruPolicy is a doubly-linked-list + map LRU. List nodes attach to
+// entry.policyData (intrusive) so accesses avoid allocation.
+// NOT safe for concurrent use.
 type lruPolicy[K comparable, V any] struct {
 	head *lruNode[K, V] // most recently used
 	tail *lruNode[K, V] // least recently used (next victim)
@@ -137,10 +133,7 @@ func (p *lruPolicy[K, V]) Snapshot() any {
 	return PolicyDetailLRU{Size: p.size}
 }
 
-// PromotionNeeded reports whether an access would change the LRU
-// position. The cheap check would be "is this entry already at the
-// head?" — but the head is a moving target under concurrent reads,
-// and the read-fast-path policy is to err on the side of returning
-// true (a write-lock retry is cheap; a missed promotion degrades
-// hit rate). LRU therefore always returns true.
+// PromotionNeeded always returns true: LRU's head is a moving target
+// under concurrent reads, and the read-fast-path policy errs on the
+// side of returning true.
 func (p *lruPolicy[K, V]) PromotionNeeded(*entry[K, V]) bool { return true }

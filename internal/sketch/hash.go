@@ -1,9 +1,5 @@
-// Package sketch implements probabilistic data structures used by the
-// memcache eviction and admission policies — count-min sketch (TinyLFU
-// admission), bloom filter (TinyLFU doorkeeper), and the package's
-// SipHash-2-4 implementation.
-//
-// The package is internal; nothing here is part of the public API.
+// Package sketch hosts probabilistic data structures (count-min sketch,
+// bloom filter) and SipHash-2-4 used by the cache. Internal only.
 package sketch
 
 import "encoding/binary"

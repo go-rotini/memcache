@@ -65,13 +65,13 @@ func TestTinyLFUEvictsColdNewcomer(t *testing.T) {
 	// budget=2 → window=1, main=1 (since budget/100=0 → max(1)).
 	p := newTinyLFU[string, int](2, noopHasher)
 
-	// Warm "hot" by repeated observation — populate sketch directly.
+	// Warm "hot" by repeated observation; populate sketch directly.
 	for range 8 {
 		p.sketch.Increment(p.hashKey("hot"))
 	}
 	hot := makeTinyLFUEntry("hot")
 	p.OnInsert(hot) // window
-	// Promote hot to main by triggering Victim (window over budget? no — only 1 entry).
+	// Promote hot to main by triggering Victim (window over budget? no, only 1 entry).
 	// Insert second entry to push window over.
 	cold := makeTinyLFUEntry("cold")
 	p.OnInsert(cold)
@@ -133,7 +133,7 @@ func TestTinyLFUBudgetSplit(t *testing.T) {
 	}
 	// Protected should be roughly 3-4× probationary (80/20 split).
 	if p.protectedBudget < 3*p.probationaryBudget {
-		t.Errorf("protected (%d) too small vs probationary (%d) — expected ~80/20 split",
+		t.Errorf("protected (%d) too small vs probationary (%d); expected ~80/20 split",
 			p.protectedBudget, p.probationaryBudget)
 	}
 }

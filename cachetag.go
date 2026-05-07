@@ -9,27 +9,20 @@ import (
 	"sync"
 )
 
-// cacheStructTag is the struct-tag key we read for snapshot
-// filtering. Format: `cache:"name,opt1,opt2,..."` matching the
-// spec's §13.2 shape.
+// cacheStructTag is the struct-tag key for snapshot filtering. Format:
+// `cache:"name,opt1,opt2,..."`.
 const cacheStructTag = "cache"
 
-// cacheTagOptions captures the parsed `cache:"..."` options that
-// affect a single struct field.
 type cacheTagOptions struct {
-	skip        bool   // field is `cache:"-"` — drop entirely
-	secret      bool   // field is marked `secret` — zero during snapshot
+	skip        bool   // cache:"-" drops the field
+	secret      bool   // zero during snapshot
 	omitempty   bool   // skip from snapshot when zero-valued
 	versioned   bool   // include in schema fingerprint
-	tagTemplate string // `tag=<template>` — auto-tag during Set
+	tagTemplate string // tag=<template> auto-tags during Set
 }
 
-// parseCacheTag extracts options from a struct-tag string.
-//
-// Tag values follow `name,opt1,opt2`. The first token is the
-// field's display name (`-` to skip the field entirely); each
-// subsequent token is an option keyword. Unknown tokens are
-// ignored so future spec additions don't break parsing.
+// parseCacheTag extracts options from a struct-tag string of the form
+// "name,opt1,opt2". Unknown tokens are ignored.
 func parseCacheTag(tag string) cacheTagOptions {
 	var opts cacheTagOptions
 	if tag == "" {
@@ -54,23 +47,17 @@ func parseCacheTag(tag string) cacheTagOptions {
 	return opts
 }
 
-// fieldFilter classifies what a particular field's index path needs
-// at snapshot encode time.
 type fieldFilter struct {
 	path      []int
-	zero      bool // skip || secret — always zero
+	zero      bool // skip || secret: always zero
 	omitempty bool // zero only when current value is the type's zero
 }
 
-// tagTemplateBinding pairs a template string with the index path of
-// the field whose value it interpolates.
 type tagTemplateBinding struct {
 	template string
-	fields   map[string][]int // {name → index path}
+	fields   map[string][]int // name -> index path
 }
 
-// cacheTypeMeta is the per-V-type metadata derived once and cached
-// for the lifetime of the process.
 type cacheTypeMeta struct {
 	hasFilters   bool
 	filters      []fieldFilter
@@ -81,13 +68,9 @@ type cacheTypeMeta struct {
 	hasOmitEmpty bool
 }
 
-// cacheTypeMetaCache memoizes [cacheTypeMeta] keyed on
-// reflect.Type.
+// cacheTypeMetaCache memoizes cacheTypeMeta by reflect.Type.
 var cacheTypeMetaCache sync.Map // map[reflect.Type]*cacheTypeMeta
 
-// metaFor returns the cached metadata for t, computing it on first
-// access. Non-struct types yield empty metadata; the cache hot-path
-// checks the bool flags and short-circuits.
 func metaFor(t reflect.Type) *cacheTypeMeta {
 	if t == nil {
 		return &cacheTypeMeta{}
@@ -108,12 +91,8 @@ func metaFor(t reflect.Type) *cacheTypeMeta {
 	return meta
 }
 
-// buildMeta walks a struct's fields, recursing into anonymous
-// embedded structs, and records each field's options.
 func buildMeta(t reflect.Type) *cacheTypeMeta {
 	meta := &cacheTypeMeta{}
-	// Track the canonical name → index path for fields whose names
-	// appear in any tag template.
 	fieldsByName := map[string][]int{}
 	walkStructFields(t, nil, func(path []int, name string, opts cacheTagOptions) {
 		indexCopy := append([]int(nil), path...)
@@ -137,8 +116,6 @@ func buildMeta(t reflect.Type) *cacheTypeMeta {
 			meta.hasTemplates = true
 		}
 	})
-	// Resolve template field references now that fieldsByName is
-	// fully populated.
 	for i := range meta.tagTemplates {
 		meta.tagTemplates[i].fields = fieldsByName
 	}
@@ -148,9 +125,6 @@ func buildMeta(t reflect.Type) *cacheTypeMeta {
 	return meta
 }
 
-// walkStructFields invokes visit for every field in t (including
-// promoted fields from anonymous struct embeds), passing the index
-// path, canonical field name, and the parsed options.
 func walkStructFields(t reflect.Type, prefix []int, visit func(path []int, name string, opts cacheTagOptions)) {
 	for i := range t.NumField() {
 		field := t.Field(i)
@@ -169,16 +143,13 @@ func walkStructFields(t reflect.Type, prefix []int, visit func(path []int, name 
 	}
 }
 
-// computeVersionHash produces a stable fingerprint of t's exported
-// schema: sorted "Name:Type" pairs, sha256-hashed and hex-encoded.
-// Two structs with the same versioned schema produce the same hash;
-// any rename or type change perturbs it.
+// computeVersionHash returns a stable fingerprint of t's exported schema:
+// sorted "Name:Type" pairs, sha256-hashed and hex-encoded.
 func computeVersionHash(t reflect.Type) string {
 	var lines []string
 	walkStructFields(t, nil, func(_ []int, name string, _ cacheTagOptions) {
 		lines = append(lines, name+":"+typeSignature(t, name))
 	})
-	// Sort for stable order independent of declaration order.
 	for i := 1; i < len(lines); i++ {
 		for j := i; j > 0 && lines[j-1] > lines[j]; j-- {
 			lines[j-1], lines[j] = lines[j], lines[j-1]
@@ -188,8 +159,6 @@ func computeVersionHash(t reflect.Type) string {
 	return hex.EncodeToString(h[:])
 }
 
-// typeSignature returns a stable string for the named field's type.
-// Anonymous types and unexported names fall back to t.Kind().
 func typeSignature(t reflect.Type, name string) string {
 	f, ok := t.FieldByName(name)
 	if !ok {
@@ -198,10 +167,8 @@ func typeSignature(t reflect.Type, name string) string {
 	return f.Type.String()
 }
 
-// applySnapshotFilter returns a copy of v with every secret/skip
-// field zeroed and every omitempty field zeroed when its current
-// value equals its type's zero. Returns the original v unchanged
-// when V has no filtered fields (the common case).
+// applySnapshotFilter returns a copy of v with secret/skip fields zeroed.
+// Returns v unchanged when V has no filtered fields.
 func applySnapshotFilter[V any](v V) V {
 	t := reflect.TypeOf(v)
 	if t == nil {
@@ -232,7 +199,6 @@ func applySnapshotFilter[V any](v V) V {
 	return out
 }
 
-// applyFilters mutates v in place per filters.
 func applyFilters(v reflect.Value, filters []fieldFilter) {
 	for _, f := range filters {
 		fv := v.FieldByIndex(f.path)
@@ -243,30 +209,17 @@ func applyFilters(v reflect.Value, filters []fieldFilter) {
 		case f.zero:
 			fv.Set(reflect.Zero(fv.Type()))
 		case f.omitempty:
-			if fv.IsZero() {
-				// Already zero; nothing to do (the codec will
-				// still emit the field, but we honor the
-				// declarative intent for forward codec compat).
-				continue
-			}
-			// Non-zero values are PRESERVED through the snapshot.
-			// omitempty only kicks in when emitting an empty
-			// field — for forward compatibility with codecs that
-			// can elide zero values from the wire format. Our
-			// gob codec can't elide, so omitempty here is mostly
-			// declarative: the field's contract is "I may not be
-			// preserved on every snapshot." Implementations that
-			// need definitive non-persistence should use `-`.
+			// omitempty is declarative; gob cannot elide zero values,
+			// so non-zero values are preserved through the snapshot.
+			// Use cache:"-" to guarantee non-persistence.
+			continue
 		}
 	}
 }
 
-// extractTemplateTags walks v's fields and returns one tag string
-// per `tag=<template>` declaration on the value's type. Templates
-// support `{FieldName}` placeholders that are interpolated against
-// the current value's field values via `fmt.Sprintf("%v", ...)`.
-//
-// Returns nil for non-struct V types or types with no templates.
+// extractTemplateTags returns one tag string per tag=<template>
+// declaration on V's type. Templates support {FieldName} placeholders.
+// Returns nil for non-struct V or types with no templates.
 func extractTemplateTags[V any](v V) []string {
 	t := reflect.TypeOf(v)
 	if t == nil {
@@ -293,9 +246,8 @@ func extractTemplateTags[V any](v V) []string {
 	return tags
 }
 
-// expandTemplate substitutes {FieldName} placeholders in template
-// with the field's current value. Unknown names render as the
-// literal placeholder (so typos don't silently produce blank tags).
+// expandTemplate substitutes {FieldName} placeholders in template.
+// Unknown names render as the literal placeholder for debuggability.
 func expandTemplate(template string, rv reflect.Value, fields map[string][]int) string {
 	var b strings.Builder
 	i := 0
@@ -309,7 +261,7 @@ func expandTemplate(template string, rv reflect.Value, fields map[string][]int) 
 		i += open + 1 // past the '{'
 		closeIdx := strings.IndexByte(template[i:], '}')
 		if closeIdx < 0 {
-			// Unterminated placeholder — emit verbatim.
+			// Unterminated placeholder; emit verbatim.
 			b.WriteByte('{')
 			b.WriteString(template[i:])
 			break
@@ -318,9 +270,6 @@ func expandTemplate(template string, rv reflect.Value, fields map[string][]int) 
 		i += closeIdx + 1 // past the '}'
 		path, ok := fields[name]
 		if !ok {
-			// Unknown field — render the literal placeholder for
-			// debuggability. Template authors will see "{Foo}" in
-			// their tag value rather than silent empty strings.
 			b.WriteByte('{')
 			b.WriteString(name)
 			b.WriteByte('}')
@@ -332,10 +281,8 @@ func expandTemplate(template string, rv reflect.Value, fields map[string][]int) 
 	return b.String()
 }
 
-// schemaVersion returns v's fingerprint when the type opts into
-// schema-versioning via the `versioned` tag, or "" otherwise. Used
-// by the snapshot subsystem to refuse loads where the persisted
-// fingerprint differs from the current schema's.
+// schemaVersion returns v's fingerprint when V opts into versioning via
+// the `versioned` tag, or "" otherwise.
 func schemaVersion[V any](v V) string {
 	t := reflect.TypeOf(v)
 	if t == nil {

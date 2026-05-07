@@ -50,7 +50,7 @@ func TestSubscribeKindFilter(t *testing.T) {
 	ch, cancel := c.Subscribe(8, EventEvict) // only evictions
 	defer cancel()
 
-	_ = c.Set("k", 1) // produces EventInsert — should NOT arrive
+	_ = c.Set("k", 1) // produces EventInsert; should NOT arrive
 	c.Delete("k")     // produces EventEvict (reason=deleted)
 
 	events := drainEvents(ch)
@@ -396,14 +396,8 @@ func TestNegativeTombstoneSuppressesEvictEvent(t *testing.T) {
 	}
 }
 
-// TestOnEvictCallbackCanReEnterCache verifies that an OnEvict
-// callback re-entering the cache for a Get on the same shard does
-// not deadlock. Before the post-unlock callback dispatch, this Get
-// would block on the still-held shard write lock.
-//
-// Uses Get (not Set) inside the callback so the callback doesn't
-// cascade into more evictions — the regression being exercised is
-// "shard lock still held when callback fires."
+// TestOnEvictCallbackCanReEnterCache: an OnEvict callback re-entering
+// the cache for a Get on the same shard must not deadlock.
 func TestOnEvictCallbackCanReEnterCache(t *testing.T) {
 	var c *Cache[string, int]
 	called := make(chan struct{}, 1)
@@ -451,11 +445,8 @@ func intToStr(n int) string {
 	return string(buf[pos:])
 }
 
-// TestInvalidateTagFiresOnEvict regression: explicit-Unlock sites in
-// tags.go (InvalidateTag/InvalidateTags/shrinkGroup) and
-// cache_store.go (rollbackInMemory) used to drop the deferred
-// pendingCallbacks slice on the floor by calling bare s.mu.Unlock()
-// after removeLocked. Verify the callbacks now fire end-to-end.
+// TestInvalidateTagFiresOnEvict is a regression for explicit-Unlock
+// sites that dropped pendingCallbacks after removeLocked.
 func TestInvalidateTagFiresOnEvict(t *testing.T) {
 	got := make(chan EvictionReason, 4)
 	c, _ := New[string, int](
@@ -528,12 +519,9 @@ func TestWithGroupShrinkFiresOnEvict(t *testing.T) {
 	}
 }
 
-// TestOnEvictCallbackCanReEnterCacheWithSet exercises the deeper
-// case the agent flagged: an OnEvict callback that re-enters via
-// Set on the SAME shard. Before the post-unlock callback dispatch,
-// this would deadlock on the still-held shard write lock. We bound
-// the callback's depth so a buggy implementation with cascading
-// evictions doesn't infinite-loop.
+// TestOnEvictCallbackCanReEnterCacheWithSet: an OnEvict callback
+// re-entering via Set on the SAME shard must not deadlock. Depth is
+// bounded so cascading evictions don't infinite-loop.
 func TestOnEvictCallbackCanReEnterCacheWithSet(t *testing.T) {
 	var c *Cache[string, int]
 	const maxDepth = 3
@@ -548,7 +536,7 @@ func TestOnEvictCallbackCanReEnterCacheWithSet(t *testing.T) {
 			if d > maxDepth {
 				return
 			}
-			// Re-enter Set on the same shard — must not deadlock.
+			// Re-enter Set on the same shard; must not deadlock.
 			_ = c.Set(itoaSimple(int(d)), int(d))
 			select {
 			case called <- struct{}{}:

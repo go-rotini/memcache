@@ -61,8 +61,6 @@ func TestCountMinSketchDistinctKeysIndependent(t *testing.T) {
 	seeds := []uint64{1, 2, 3, 4}
 	c := New(2048, seeds)
 
-	// Hammer key A; key B should remain near zero (with some collision
-	// noise but well below the saturation point).
 	const a, b = uint64(0xaaaa), uint64(0xbbbb)
 	for i := 0; i < 50; i++ {
 		c.Increment(a)
@@ -77,11 +75,8 @@ func TestCountMinSketchConservativeUpdate(t *testing.T) {
 	seeds := []uint64{1, 2, 3, 4}
 	c := New(64, seeds)
 
-	// Conservative update: only minimum-valued counters increment. We
-	// can't observe individual counters easily through the public API,
-	// but we can verify that incrementing a single key produces an
-	// estimate that grows at the increment rate (rather than slower or
-	// faster, which a non-conservative implementation might).
+	// Conservative update: incrementing a single key should produce an
+	// estimate that grows at the increment rate.
 	for i := 1; i <= 10; i++ {
 		c.Increment(1234)
 		got := c.Estimate(1234)

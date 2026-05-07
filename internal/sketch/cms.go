@@ -29,8 +29,8 @@ type CountMinSketch struct {
 func New(expected int, seeds []uint64) *CountMinSketch {
 	const depth = 4
 	if len(seeds) < depth {
-		// Caller misuse — return a sketch with self-derived seeds. Not
-		// HashDoS-resistant but functional for testing.
+		// Caller misuse: self-derive seeds. Not HashDoS-resistant but
+		// functional for testing.
 		base := uint64(0xa3f7c1d2e8b95406)
 		filled := make([]uint64, depth)
 		for i := range depth {

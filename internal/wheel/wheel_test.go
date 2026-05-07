@@ -27,14 +27,14 @@ func TestAddAndAdvanceExpires(t *testing.T) {
 	if got := w.Len(); got != 1 {
 		t.Fatalf("Len after Add = %d, want 1", got)
 	}
-	// Advance to 4s — entry not yet expired.
+	// Advance to 4s: entry not yet expired.
 	if exp := w.AdvanceTo(4 * tick); len(exp) != 0 {
 		t.Errorf("AdvanceTo(4s) returned %d entries, want 0", len(exp))
 	}
 	if got := w.Len(); got != 1 {
 		t.Errorf("Len mid-flight = %d, want 1", got)
 	}
-	// Advance to 5s — entry expires.
+	// Advance to 5s: entry expires.
 	exp := w.AdvanceTo(5 * tick)
 	if len(exp) != 1 || exp[0].Payload != "k" {
 		t.Errorf("AdvanceTo(5s) returned %v, want [k]", exp)
@@ -66,14 +66,14 @@ func TestMultiRevolution(t *testing.T) {
 	if e.revolutions != 2 {
 		t.Errorf("revolutions = %d, want 2", e.revolutions)
 	}
-	// Advance 4 ticks (one full rev) — entry survives, revolutions decremented.
+	// Advance 4 ticks (one full rev): entry survives, revolutions decremented.
 	if exp := w.AdvanceTo(4 * tick); len(exp) != 0 {
 		t.Errorf("after 1 rev expected no expirations, got %d", len(exp))
 	}
 	if e.revolutions != 1 {
 		t.Errorf("after 1 rev revolutions = %d, want 1", e.revolutions)
 	}
-	// Advance 8 more ticks — should expire.
+	// Advance 8 more ticks: should expire.
 	exp := w.AdvanceTo(12 * tick)
 	if len(exp) != 1 {
 		t.Errorf("AdvanceTo(12s) = %d entries, want 1", len(exp))
@@ -87,7 +87,7 @@ func TestAdvancePastFullRevolution(t *testing.T) {
 	e2 := &Entry[string]{Payload: "later", ExpireAtNs: 14 * tick}
 	w.Add(e1)
 	w.Add(e2)
-	// Skip 14 ticks — three full revs + 2 more — both expire.
+	// Skip 14 ticks (three full revs + 2 more); both expire.
 	exp := w.AdvanceTo(14 * tick)
 	if len(exp) != 2 {
 		t.Errorf("expected 2 expirations, got %d", len(exp))
@@ -107,14 +107,8 @@ func TestAddInThePast(t *testing.T) {
 	}
 }
 
-// TestAdvanceSlotAwareDecrement is a regression test for the
-// over-decrement in AdvanceTo. Previously the formula applied a
-// blanket `extraRev` decrement to every slot regardless of whether
-// the cursor's partial sweep actually crossed that slot, so an
-// entry sitting in a slot the partial didn't reach would be evicted
-// one revolution too early. The fix splits the advance into
-// "full revolutions" (decrement everyone) plus a partial slot-by-
-// slot scan.
+// TestAdvanceSlotAwareDecrement is a regression test for AdvanceTo
+// over-decrementing entries in slots the partial sweep didn't cross.
 func TestAdvanceSlotAwareDecrement(t *testing.T) {
 	// 4-slot wheel. Two entries: e1 in a slot the partial sweep
 	// will cross, e2 in a slot it will NOT cross. Both have the
@@ -131,7 +125,7 @@ func TestAdvanceSlotAwareDecrement(t *testing.T) {
 			e1.revolutions, e2.revolutions)
 	}
 	// Advance 10 ticks: 2 full revs + 2-tick partial. The partial
-	// crosses slots 1 and 2 — so e1 in slot 2 sees an extra
+	// crosses slots 1 and 2, so e1 in slot 2 sees an extra
 	// crossing (3 total) and expires; e2 in slot 3 sees only the
 	// 2 full-rev crossings and survives with rev=0.
 	exp := w.AdvanceTo(10 * tick)
@@ -184,8 +178,7 @@ func TestRevolutionRoundsUp(t *testing.T) {
 	w := New[string](4, tick, origin)
 	e := &Entry[string]{Payload: "k", ExpireAtNs: tick + tick/2}
 	w.Add(e)
-	// Advance one tick — entry should NOT have expired (it lives
-	// in slot 2, cursor is at 1).
+	// Advance one tick: entry should NOT have expired (slot 2, cursor at 1).
 	if exp := w.AdvanceTo(tick); len(exp) != 0 {
 		t.Errorf("AdvanceTo(1 tick) = %d, want 0 (rounding)", len(exp))
 	}

@@ -5,14 +5,9 @@ import (
 	"sync/atomic"
 )
 
-// shard is one of the cache's hash-routed partitions. Each shard owns
-// its own storage, eviction policy, and sync.Pool of entries;
-// cross-shard coordination is the cache-level concern (tags,
-// snapshots, stats).
-//
-// Concurrency: shard.mu protects all mutable state. The hot path
-// takes a single Lock or RLock — there are no nested shard locks
-// taken anywhere in the package.
+// shard is one of the cache's hash-routed partitions. shard.mu protects
+// all mutable state; the hot path takes a single Lock/RLock and the
+// package never nests shard locks.
 type shard[K comparable, V any] struct {
 	mu sync.RWMutex
 	// storage is the entry-table abstraction. Default is a
@@ -23,10 +18,8 @@ type shard[K comparable, V any] struct {
 	policy  evictionPolicy[K, V]
 	pool    *entryPool[K, V]
 
-	// ttl tracks pending expirations. Concrete type depends on
-	// [WithTTLBuckets] — the heap-backed backend is the default;
-	// the wheel-backed backend is opt-in via WithTTLBuckets.
-	// Always non-nil after newShard.
+	// ttl tracks pending expirations; heap-backed by default, wheel-backed
+	// opt-in via [WithTTLBuckets]. Always non-nil after newShard.
 	ttl ttlBackend[K, V]
 
 	// janitor coordinates the per-shard expiry sweep goroutine.
@@ -64,11 +57,8 @@ type shard[K comparable, V any] struct {
 	// nil when async writes are off.
 	pending map[K]pendingOp[K, V]
 
-	// read is the lock-free read snapshot of this shard's storage,
-	// published behind an atomic pointer. nil when [WithLockFreeRead]
-	// is off; non-nil (possibly empty) when the option is on. The
-	// pointer is replaced wholesale on promotion — the underlying
-	// readMap is never mutated after construction.
+	// read is the lock-free read snapshot, replaced wholesale on
+	// promotion; the underlying readMap is immutable.
 	read atomic.Pointer[readMap[K, V]]
 
 	// readMisses counts how many times reads observed a miss in
@@ -76,13 +66,9 @@ type shard[K comparable, V any] struct {
 	// last promotion. Used to drive lazy snapshot rebuilding.
 	readMisses atomic.Int64
 
-	// pendingCallbacks are user-callback closures (OnEvict /
-	// OnExpire / publish-event / publishInvalidation) deferred
-	// from removeLocked so they fire AFTER the shard lock is
-	// released — preventing deadlock when a callback re-enters the
-	// cache for any key that hashes to the same shard. Accessed
-	// under shard.mu by the caller; flushed after unlock by
-	// [Cache.flushAndUnlockLocked].
+	// pendingCallbacks queues user-callback closures (OnEvict, OnExpire,
+	// events, invalidation) deferred from removeLocked; they fire after
+	// the shard lock is released to prevent re-entry deadlock.
 	pendingCallbacks []func()
 }
 

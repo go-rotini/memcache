@@ -190,9 +190,8 @@ func TestExpiredEntryEvictedOnGet(t *testing.T) {
 }
 
 func TestCapacityEvictsViaPolicy(t *testing.T) {
-	// Single shard so we can predict eviction precisely. The
-	// per-shard budget includes a 10% slop for hash-skew tolerance,
-	// so insert enough entries to comfortably exceed it.
+	// Single shard so we can predict eviction. Per-shard budget
+	// includes a 10% slop, so insert enough to exceed it.
 	c, err := New[string, int](WithMaxEntries(4), WithShards(1))
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -780,8 +779,7 @@ func TestDeletePrefixOnStringKeys(t *testing.T) {
 }
 
 func TestDeletePrefixUnsupportedKeyType(t *testing.T) {
-	// Int keys neither implement Prefixer nor are string —
-	// DeletePrefix is a no-op.
+	// Int keys are not Prefixer or string; DeletePrefix is a no-op.
 	c, _ := New[int, string](WithMaxEntries(4))
 	defer c.Close()
 	_ = c.Set(1, "x")
@@ -800,7 +798,6 @@ func TestDeleteWhere(t *testing.T) {
 		_ = c.Set(itoaSimple(i), i)
 	}
 	n := c.DeleteWhere(func(_ string, v int) bool { return v%2 == 0 })
-	// Removes 0, 2, 4 → 3 entries.
 	if n != 3 {
 		t.Errorf("DeleteWhere removed %d, want 3", n)
 	}

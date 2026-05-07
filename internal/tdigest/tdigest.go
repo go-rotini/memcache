@@ -1,20 +1,8 @@
 // Package tdigest hosts the latency-quantile estimator used by
-// [memcache.Stats.LoadLatencyP50] / P99 / LoadLatency.
-//
-// The package is named "tdigest" to match the [spec §16.1] file
-// layout, but the actual implementation is a fixed-bucket log-spaced
-// histogram. The observable contract — Mean / P50 / P99 — matches
-// what a t-digest exposes; the simpler internals trade a bit of
-// quantile precision for a lock-free hot path and an order of
-// magnitude less code. Quantiles are accurate to roughly half a
-// bucket width, which means ±50% of the bucket value at the
-// quantile of interest. For load-latency telemetry on a CLI cache,
-// that resolution is more than adequate.
-//
-// The histogram covers 100ns through 5s in 24 logarithmic buckets.
-// Latencies outside that range are clamped to the extremes (so a
-// pathological multi-second load doesn't disappear from the count;
-// it simply pegs the top bucket).
+// [memcache.Stats.LoadLatencyP50] / P99 / LoadLatency. Despite the name,
+// the implementation is a fixed-bucket log-spaced histogram (24 buckets
+// covering 100ns-5s). Quantiles are accurate to roughly half a bucket
+// width. Out-of-range values clamp to the extremes.
 package tdigest
 
 import (
@@ -26,14 +14,9 @@ import (
 // fixed so [Histogram] needs no allocation per Record call.
 const numBuckets = 24
 
-// boundsNs lists the inclusive upper bound (in nanoseconds) for
-// each bucket. Bucket i covers (boundsNs[i-1], boundsNs[i]];
-// bucket 0 covers [0, boundsNs[0]].
-//
-// The schedule is roughly 1, 2, 5 × {100ns, 1µs, 10µs, 100µs, 1ms,
-// 10ms, 100ms, 1s} — eight decades, three buckets per decade. This
-// matches the resolution typical of Prometheus latency histograms
-// and is plenty for the cache's "is the loader fast?" diagnostic.
+// boundsNs is the inclusive upper-bound (ns) for each bucket; schedule
+// is roughly 1, 2, 5 times {100ns, 1us, 10us, 100us, 1ms, 10ms, 100ms,
+// 1s}: 8 decades, 3 buckets per decade.
 var boundsNs = [numBuckets]int64{
 	100, 200, 500, // 100ns, 200ns, 500ns
 	1_000, 2_000, 5_000, // 1µs, 2µs, 5µs
@@ -131,9 +114,7 @@ func (h *Histogram) quantile(total uint64, pct int) time.Duration {
 }
 
 // bucketFor binary-searches boundsNs for the smallest bucket whose
-// upper bound is ≥ ns. Returns the last bucket for any ns past the
-// histogram's range (so 10s lands in the 5s bucket — the count is
-// preserved even if the precision is lost).
+// upper bound is >= ns. ns past the top range pegs the last bucket.
 func bucketFor(ns int64) int {
 	lo, hi := 0, numBuckets-1
 	for lo < hi {

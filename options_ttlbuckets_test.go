@@ -118,7 +118,7 @@ func TestWithTTLBucketsUpdateRescheduleS(t *testing.T) {
 	)
 	defer c.Close()
 	_ = c.SetWithTTL("k", 1, time.Hour)
-	// Re-set with a longer TTL — wheel re-tracks.
+	// Re-set with a longer TTL; wheel re-tracks.
 	_ = c.SetWithTTL("k", 2, 24*time.Hour)
 	clk.Advance(2 * time.Hour)
 	v, ok := c.Get("k")

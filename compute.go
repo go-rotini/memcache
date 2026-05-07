@@ -11,35 +11,15 @@ import (
 )
 
 var (
-	// errNilComputeFn is returned (or wrapped) when a caller passes
-	// a nil function to one of the Compute family methods. Treated
-	// as a programming error.
-	errNilComputeFn = errors.New("memcache: nil compute function")
-
-	// errUnknownComputeAction is returned when a Compute callback
-	// returns a [ComputeAction] outside the defined set.
+	errNilComputeFn         = errors.New("memcache: nil compute function")
 	errUnknownComputeAction = errors.New("memcache: unknown ComputeAction")
 )
 
-// activeCompute is a process-wide registry of goroutines currently
-// inside a Compute callback. Maps `goroutineID -> struct{}`. The
-// re-entrancy detector consults this on every Compute entry — if
-// the current goroutine is already in the map, the callback has
-// re-entered the cache and we panic with [ErrComputeReentrant]
-// rather than deadlocking on the shard mutex.
-//
-// The cost is one `runtime.Stack` parse per Compute call (to
-// extract the goroutine ID). Acceptable per spec §19.2.6 given
-// how nasty the deadlock would otherwise be to debug.
+// activeCompute tracks goroutines inside a Compute callback so the
+// re-entrancy detector can panic with [ErrComputeReentrant] instead of
+// deadlocking on the shard mutex.
 var activeCompute sync.Map
 
-// goroutineID returns the calling goroutine's ID by parsing
-// `runtime.Stack`'s "goroutine N [...]:" prefix. Allocates a small
-// scratch buffer; cost is dominated by stack-trace formatting.
-//
-// Returns 0 if parsing fails (defensive — the package would still
-// detect re-entrancy at the next Compute frame, just with
-// different IDs).
 func goroutineID() uint64 {
 	var buf [64]byte
 	n := runtime.Stack(buf[:], false)
@@ -60,14 +40,9 @@ func goroutineID() uint64 {
 	return id
 }
 
-// reentryGuard registers the current goroutine as "in compute" and
-// returns an unregister closure for the deferred cleanup. The
-// caller MUST `defer` the returned function; otherwise nested
-// Computes leak guard slots.
-//
-// Panics with [ErrComputeReentrant] when the current goroutine is
-// already in the registry — i.e., a Compute callback called back
-// into Compute on the cache.
+// reentryGuard registers the current goroutine as in-compute. Caller
+// MUST defer the returned cleanup. Panics with [ErrComputeReentrant]
+// when a Compute callback re-enters Compute on the cache.
 func reentryGuard() func() {
 	gid := goroutineID()
 	if gid == 0 {
@@ -79,28 +54,16 @@ func reentryGuard() func() {
 	return func() { activeCompute.Delete(gid) }
 }
 
-// Compute atomically applies fn to the entry for key. fn receives
-// the current value (or the zero V when absent) and a presence
-// boolean; it returns the new value, an action describing what to
-// do with that value, and an optional error.
+// Compute atomically applies fn to the entry for key. fn receives the
+// current value (zero V when absent) and a presence bool; it returns the
+// new value, a [ComputeAction], and an optional error.
 //
-// Action handling:
-//   - [ComputeStore]  — store the returned value with the cache's
-//     default TTL (sliding flag inherited from the cache config).
-//   - [ComputeDelete] — remove the entry, recording the eviction
-//     under [EvictReasonComputed].
-//   - [ComputeNoOp]   — leave the entry as it was; the returned
-//     value is discarded.
+// Actions: [ComputeStore] stores with default TTL, [ComputeDelete]
+// removes (under [EvictReasonComputed]), [ComputeNoOp] discards the
+// returned value.
 //
-// fn runs under the shard write lock. It MUST NOT call back into
-// the cache for the same key (deadlock) and SHOULD be fast — any
-// time spent in fn blocks every other Compute/Set/Delete on the
-// same shard. Calls into the cache for keys hashing to a different
-// shard are safe; calls for keys that hash to the same shard
-// deadlock the same way.
-//
-// Compute is the canonical atomic update primitive; the other
-// Compute* methods and the numeric helpers are sugar over it.
+// fn runs under the shard write lock and MUST NOT call into the cache
+// for any key on the same shard.
 func (c *Cache[K, V]) Compute(
 	key K,
 	fn func(cur V, ok bool) (V, ComputeAction, error),
@@ -142,12 +105,8 @@ func (c *Cache[K, V]) Compute(
 			c.cfg.slidingTTL, int64(c.cfg.defaultTTL), nil)
 		return newValue, nil
 	case ComputeDelete:
-		// Only fire the Computed eviction when the entry was
-		// logically present from `fn`'s perspective. An entry that
-		// was already TTL-expired or a negative-cache tombstone
-		// should not surface as a user-driven Compute deletion —
-		// expired entries are reaped under EvictReasonExpired
-		// elsewhere; negative tombstones are internal bookkeeping.
+		// Only fire EvictReasonComputed when fn saw the entry as
+		// present; expired/negative entries are not user-driven deletes.
 		if !present {
 			return zero, nil
 		}
@@ -165,15 +124,10 @@ func (c *Cache[K, V]) Compute(
 	}
 }
 
-// ComputeIfAbsent invokes fn only when the key is absent (or has
-// expired). On a hit, the existing value is returned with
-// computed=false and no fn call is made. On a miss, fn produces the
-// new value and a TTL; storing is atomic with respect to other
-// writers on the same key.
-//
-// A fn-returned TTL of 0 means "use the cache's [WithDefaultTTL]";
-// negative TTLs surface as [ErrInvalidTTL]. fn returning an error
-// is propagated as-is (no entry is stored).
+// ComputeIfAbsent invokes fn only when the key is absent or expired. On
+// a hit, the existing value is returned with computed=false. fn's TTL
+// of 0 means use [WithDefaultTTL]; a negative TTL returns [ErrInvalidTTL].
+// fn errors are propagated and no entry is stored.
 func (c *Cache[K, V]) ComputeIfAbsent(
 	key K, fn func() (V, time.Duration, error),
 ) (value V, computed bool, err error) {
@@ -215,14 +169,8 @@ func (c *Cache[K, V]) ComputeIfAbsent(
 	return v, true, nil
 }
 
-// ComputeIfPresent invokes fn only when the key is present (and
-// fresh). fn returns the new value plus a [ComputeAction]; the
-// caller can store, delete, or no-op via the action discriminator.
-// Returns the post-update value (or the zero V on Delete/no-entry)
-// and any error fn produced.
-//
-// On miss, ComputeIfPresent returns ([zero V], nil) — not an
-// error — matching the spirit of [Cache.SetIfPresent].
+// ComputeIfPresent invokes fn only when the key is present and fresh.
+// On miss, returns (zero, nil) without error.
 func (c *Cache[K, V]) ComputeIfPresent(
 	key K, fn func(cur V) (V, ComputeAction, error),
 ) (V, error) {
@@ -270,9 +218,8 @@ func (c *Cache[K, V]) ComputeIfPresent(
 	}
 }
 
-// Update is shorthand for [Cache.ComputeIfPresent] that always
-// stores fn's result. Returns the new value and nil on success;
-// returns ([zero V], [ErrNotFound]) when the entry is absent.
+// Update is shorthand for [Cache.ComputeIfPresent] that always stores
+// fn's result. Returns (zero, [ErrNotFound]) when the entry is absent.
 func (c *Cache[K, V]) Update(key K, fn func(cur V) V) (V, error) {
 	var zero V
 	if fn == nil {
@@ -302,13 +249,9 @@ func (c *Cache[K, V]) Update(key K, fn func(cur V) V) (V, error) {
 	return newValue, nil
 }
 
-// CompareAndSwap atomically replaces the value for key with new only
-// when the current value equals old. Returns true when the swap
-// happened.
-//
-// Equality uses [reflect.DeepEqual], so non-comparable V types (slices,
-// maps) are supported but at higher cost. For comparable V the
-// comparison reduces to a `==` check internally.
+// CompareAndSwap atomically replaces the value for key with newValue
+// when the current value equals old, using [reflect.DeepEqual] for
+// comparison. Returns true when the swap happened.
 func (c *Cache[K, V]) CompareAndSwap(key K, old, newValue V) bool {
 	if c.closed.Load() {
 		return false
@@ -336,13 +279,8 @@ func (c *Cache[K, V]) CompareAndSwap(key K, old, newValue V) bool {
 }
 
 // IncrementBy atomically adds delta to the integer value at key. If
-// the entry is absent, it is created with value `0 + delta`. Returns
-// the post-increment value.
-//
-// IncrementBy is a top-level function rather than a method because
-// Go generics do not allow per-method type-parameter constraints
-// beyond those of the receiver: the cache's V is `any`, so the
-// Number constraint must live at the function level.
+// absent, the entry is created with value 0+delta. Returns the
+// post-increment value.
 func IncrementBy[K comparable, V Number](
 	c *Cache[K, V], key K, delta V,
 ) (V, error) {
@@ -360,20 +298,14 @@ func Increment[K comparable, V Number](c *Cache[K, V], key K) (V, error) {
 	return IncrementBy(c, key, 1)
 }
 
-// Decrement is IncrementBy(c, key, -1).
-//
-// For unsigned V types (`uint`, `uint8`, …), wraparound at zero is
-// the documented Go integer behavior; callers that need saturation
-// should use [Cache.Compute] directly.
+// Decrement is IncrementBy(c, key, -1). For unsigned V, zero wraps per
+// Go integer rules; use [Cache.Compute] for saturation.
 func Decrement[K comparable, V Number](c *Cache[K, V], key K) (V, error) {
 	return IncrementBy(c, key, decrementDelta[V]())
 }
 
-// decrementDelta returns -1 typed as V. Implemented as a tiny helper
-// because the literal `-1` fails to type-check under unsigned
-// instantiations of V; we instead compute it as `0 - 1` so the
-// Go compiler resolves the unsigned wraparound at instantiation
-// time.
+// decrementDelta returns -1 typed as V; computed as 0-1 so the literal
+// type-checks under unsigned V.
 func decrementDelta[V Number]() V {
 	var one V = 1
 	return 0 - one

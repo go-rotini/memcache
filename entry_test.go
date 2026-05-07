@@ -69,7 +69,7 @@ func TestEntryTouchAccessSlidingCoalesces(t *testing.T) {
 		slidingTTL: slide,
 	}
 	t0 := time.Now().UnixNano()
-	e.touchAccess(t0) // first touch — always shifts
+	e.touchAccess(t0) // first touch always shifts
 
 	// Within slide/4 (15s): no shift.
 	if shifted := e.touchAccess(t0 + slide/8); shifted {

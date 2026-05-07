@@ -81,7 +81,7 @@ func TestSaveFileAtomicityLeavesNoTmp(t *testing.T) {
 	if err := c.SaveFile(path); err != nil {
 		t.Fatal(err)
 	}
-	// Directory must contain the snapshot ONLY — no leftover .tmp file.
+	// Directory must contain the snapshot ONLY (no leftover .tmp).
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		t.Fatal(err)

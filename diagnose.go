@@ -7,14 +7,8 @@ import (
 	"time"
 )
 
-// Items returns a snapshot of every live entry in the cache,
-// including each entry's metadata. The returned slice is freshly
-// allocated and may be mutated by the caller. Iteration order is
-// shard-by-shard and within-shard map-iteration order — neither is
-// stable.
-//
-// Cost: O(n) time and allocation. Use [Cache.Range] for non-
-// allocating iteration when only the (key, value) pair is needed.
+// Items returns a snapshot of every live entry plus metadata. Iteration
+// order is shard-by-shard, then map order; neither is stable. O(n).
 func (c *Cache[K, V]) Items() []KeyedItem[K, V] {
 	if c.closed.Load() {
 		return nil
@@ -40,9 +34,8 @@ func (c *Cache[K, V]) Items() []KeyedItem[K, V] {
 	return out
 }
 
-// ItemMetadata returns the metadata of the entry at key without
-// copying its value. The boolean reports presence; an absent or
-// negative-tombstone entry returns (zero Metadata, false).
+// ItemMetadata returns the entry's metadata without copying its value.
+// Absent or negative-tombstone entries return (zero, false).
 func (c *Cache[K, V]) ItemMetadata(key K) (Metadata, bool) {
 	if c.closed.Load() {
 		return Metadata{}, false
@@ -58,17 +51,10 @@ func (c *Cache[K, V]) ItemMetadata(key K) (Metadata, bool) {
 	return e.metadata(), true
 }
 
-// Hottest returns the n entries with the highest hit counts in
-// descending order. n=0 returns every entry. Implementation cost
-// is O(N log min(n, N)) for cache size N.
-//
-// "Hit count" is the per-entry hits counter — a coarse but cheap
-// proxy for popularity. Frequency-aware policies (LFU, S3-FIFO,
-// TinyLFU) maintain their own internal popularity state that is
-// NOT directly exposed here; if you need the policy's exact view
-// of "hot", consult the policy's internal state through a
-// dedicated test build (the public API surface keeps this lossy
-// abstraction stable).
+// Hottest returns the n entries with the highest hit counts, descending.
+// n=0 returns every entry. Hit count is the per-entry hits counter, a
+// coarse proxy for popularity; frequency-aware policy state is not
+// exposed here.
 func (c *Cache[K, V]) Hottest(n int) []KeyedItem[K, V] {
 	all := c.Items()
 	sort.Slice(all, func(i, j int) bool {
@@ -77,9 +63,8 @@ func (c *Cache[K, V]) Hottest(n int) []KeyedItem[K, V] {
 	return topN(all, n)
 }
 
-// Coldest is the inverse of [Cache.Hottest] — entries with the
-// lowest hit counts come first. Useful for "what's about to fall
-// out?" diagnostics under hit-count-based eviction.
+// Coldest is the inverse of [Cache.Hottest]; entries with the lowest hit
+// counts come first.
 func (c *Cache[K, V]) Coldest(n int) []KeyedItem[K, V] {
 	all := c.Items()
 	sort.Slice(all, func(i, j int) bool {
@@ -114,14 +99,8 @@ func (c *Cache[K, V]) SoonestExpiring(n int) []KeyedItem[K, V] {
 	return topN(out, n)
 }
 
-// Histogram returns a coarse multi-dimensional summary of the
-// cache's contents bucketed by age, weight, and hit count. Useful
-// for `:cache hist` REPL commands.
-//
-// Bucket bounds (matching the [Histogram] doc):
-//   - Age: 1s, 10s, 1m, 10m, 1h, 1d, 7d, +∞
-//   - Weight: 1, 16, 256, 4Ki, 64Ki, 1Mi, 16Mi, +∞
-//   - Hits: 0, 1, 2, 4, 16, 64, 256, +∞
+// Histogram returns a coarse summary bucketed by age, weight, and hit
+// count. See [Histogram] for bucket bounds.
 func (c *Cache[K, V]) Histogram() Histogram {
 	var h Histogram
 	if c.closed.Load() {
@@ -146,9 +125,8 @@ func (c *Cache[K, V]) Histogram() Histogram {
 	return h
 }
 
-// Dump writes a human-readable summary of every entry to w. Output
-// is intended for debugging only — its format is NOT stable across
-// releases. One line per entry, plus a header summary.
+// Dump writes a human-readable summary to w. The format is for
+// debugging only and is NOT stable across releases.
 func (c *Cache[K, V]) Dump(w io.Writer) error {
 	st := c.Stats()
 	if _, err := fmt.Fprintf(w,
@@ -174,10 +152,8 @@ func (c *Cache[K, V]) Dump(w io.Writer) error {
 	return nil
 }
 
-// item returns a value-bearing Item snapshot. Caller must hold the
-// shard read lock for the entry. We add this here (rather than in
-// entry.go) because it's only used by diagnostic methods —
-// keeping it in the diagnostic file documents the boundary.
+// item returns a value-bearing Item snapshot. Caller MUST hold the
+// shard read lock for the entry.
 func (e *entry[K, V]) item() Item[V] {
 	m := e.metadata()
 	return Item[V]{
@@ -192,9 +168,6 @@ func (e *entry[K, V]) item() Item[V] {
 	}
 }
 
-// topN truncates a slice to the first n elements. n=0 returns the
-// whole slice (caller asked for "everything"). The trailing
-// underscore avoids shadowing builtin `cap`.
 func topN[T any](s []T, n int) []T {
 	if n <= 0 || n >= len(s) {
 		return s

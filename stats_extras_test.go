@@ -1,8 +1,4 @@
-// stats_extras_test.go covers the spec-§12.1 counters wired in
-// Tier 1 of the v0.1 roadmap (RefreshAhead, StaleWhileRevalidate,
-// NegativeHits, TagInvalidations, Resizes, LoadTimeouts,
-// LoadRateLimited, LoadCachedError, Uptime, LastSnapshotAt,
-// LastResetAt, PolicyName, TagsTracked).
+// stats_extras_test.go covers the spec §12.1 counters.
 
 package memcache
 

@@ -33,7 +33,7 @@ func TestCacheTTLerPointerReceiverOverridesDefault(t *testing.T) {
 	}
 	d, ok := c.TTL("k")
 	if !ok || d != 10*time.Second {
-		t.Errorf("TTL = (%v, %v), want (10s, true) — CacheTTL should override default",
+		t.Errorf("TTL = (%v, %v), want (10s, true); CacheTTL should override default",
 			d, ok)
 	}
 }
@@ -66,7 +66,7 @@ func TestCacheTTLerNegativeFallsBackToDefault(t *testing.T) {
 	_ = c.Set("k", ttlValue{ttl: -1}) // sentinel: "use cache default"
 	d, _ := c.TTL("k")
 	if d != 7*time.Second {
-		t.Errorf("TTL = %v, want 7s (negative CacheTTL → fallback)", d)
+		t.Errorf("TTL = %v, want 7s (negative CacheTTL: fallback)", d)
 	}
 }
 
@@ -79,7 +79,7 @@ func TestCacheTTLerZeroMeansNoExpiry(t *testing.T) {
 	_ = c.Set("k", ttlValue{ttl: 0})
 	d, ok := c.TTL("k")
 	if !ok || d != 0 {
-		t.Errorf("TTL = (%v, %v), want (0, true) — zero CacheTTL means no expiry", d, ok)
+		t.Errorf("TTL = (%v, %v), want (0, true); zero CacheTTL means no expiry", d, ok)
 	}
 }
 
@@ -236,8 +236,7 @@ func TestSnapshotUnmarshalerErrorPropagates(t *testing.T) {
 }
 
 // snapPointerEntity uses a *snapPointerEntity-receiver form for
-// SnapshotMarshal — the test verifies pointer-receiver Marshal
-// works when V is the value type.
+// SnapshotMarshal.
 type snapPointerEntity struct {
 	N int
 }
@@ -342,11 +341,8 @@ func TestCacheableUmbrellaIntegration(t *testing.T) {
 		t.Errorf("Tags = %v, want [full]", got)
 	}
 
-	// Snapshot round-trip uses custom Marshal/Unmarshal. Both
-	// caches share the same FakeClock so the snapshot's recorded
-	// expireAt is interpreted in the same time frame on Load —
-	// otherwise the dst cache (real clock) would treat the
-	// snapshot's "30s past Unix epoch" expireAt as long-expired.
+	// Both caches share the same FakeClock so the snapshot's
+	// expireAt is interpreted consistently on Load.
 	var buf bytes.Buffer
 	if err := c.Save(&buf); err != nil {
 		t.Fatal(err)
@@ -411,7 +407,7 @@ func TestCacheTagVersioned_RejectsSchemaDrift(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	// Load into a cache parameterized on the v2 schema — version
+	// Load into a cache parameterized on the v2 schema; version
 	// fingerprint should disagree.
 	dst, _ := New[string, versionedSchemaV2](WithMaxEntries(8))
 	defer dst.Close()
@@ -463,12 +459,9 @@ func TestCacheTagTemplate_AutoTagsOnSet(t *testing.T) {
 	}
 }
 
-// TestSetTagsEmptyDisablesAutoTags regression: SetTags() with no
-// arguments must mean "explicitly no tags" — overriding any
-// CacheTagger auto-tag derivation. Before the setConfig.hasTags
-// flag was added, an empty SetTags() left sc.tags == nil and
-// SetWithOptions fell through to deriveAutoTags(), silently
-// re-enabling the tagger.
+// TestSetTagsEmptyDisablesAutoTags is a regression: SetTags() with
+// no arguments MUST mean "explicitly no tags", overriding any
+// CacheTagger auto-tag derivation.
 func TestSetTagsEmptyDisablesAutoTags(t *testing.T) {
 	c, _ := New[string, taggedValue](WithMaxEntries(4))
 	defer c.Close()

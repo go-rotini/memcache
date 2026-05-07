@@ -92,10 +92,8 @@ type config struct {
 	autoLoadPath   string
 	autoLoadIgnore bool
 
-	// snapshotMetadata is an arbitrary key/value bag persisted
-	// alongside the snapshot header (spec §9.10). Useful for
-	// auditing — e.g. embedding the binary's git SHA so callers
-	// can detect cross-version snapshots before loading.
+	// snapshotMetadata is persisted alongside the snapshot header for
+	// auditing (e.g. embedding the binary's git SHA).
 	snapshotMetadata map[string]string
 
 	// tracer is the optional [Tracer] for span emission on
@@ -216,10 +214,10 @@ type config struct {
 	ttlBuckets              int
 	ttlBucketsTickPerBucket int
 
-	// flatStorage opts each shard into [flatStore] — a flat
-	// hash-probed table with linear probing and tombstone-driven
-	// compactions — instead of the default `map[K]*entry[K, V]`.
-	// Toggled by [WithFlatStorage].
+	// flatStorage opts each shard into [flatStore] (a flat hash-probed
+	// table with linear probing and tombstone-driven compactions)
+	// instead of the default map[K]*entry[K, V]. Toggled by
+	// [WithFlatStorage].
 	flatStorage bool
 
 	// store is a type-erased [Store] supplied by [WithStore]. When
@@ -238,18 +236,13 @@ type config struct {
 	// value) holds.
 	asyncWrites bool
 
-	// lockFreeRead is set by [WithLockFreeRead]. When true each
-	// shard publishes an immutable map snapshot (atomically
-	// updated) that the Get fast path consults without taking the
-	// shard lock; misses fall through to the existing locked path.
-	// Trades pool-recycling for read throughput — entries that
-	// were ever in a snapshot remain GC-managed instead of going
-	// back to the per-shard sync.Pool.
+	// lockFreeRead is set by [WithLockFreeRead]. When true, each shard
+	// publishes an atomic map snapshot consulted without lock; entries
+	// ever published into a snapshot remain GC-managed instead of
+	// returning to sync.Pool.
 	lockFreeRead bool
 }
 
-// defaultConfig returns the package's baseline configuration. It is
-// applied before any user options.
 func defaultConfig() *config {
 	return &config{
 		policy:          PolicyS3FIFO,
@@ -264,8 +257,6 @@ func defaultConfig() *config {
 	}
 }
 
-// defaultShardCount returns the default shard count for the host:
-// next-power-of-two(GOMAXPROCS * 4), capped at 1024.
 func defaultShardCount() int {
 	n := max(runtime.GOMAXPROCS(0)*4, 1)
 	const maxShards = 1024
@@ -275,8 +266,6 @@ func defaultShardCount() int {
 	return nextPowerOfTwo(n)
 }
 
-// nextPowerOfTwo returns the smallest power of two >= n. For n <= 1 it
-// returns 1.
 func nextPowerOfTwo(n int) int {
 	if n <= 1 {
 		return 1
@@ -306,21 +295,15 @@ func WithDefaultTTL(d time.Duration) Option {
 	return func(c *config) { c.defaultTTL = d }
 }
 
-// WithSlidingTTL toggles sliding-TTL behavior on the cache's default
-// TTL. When true, every Get refreshes the entry's expiry to
-// `now + slidingTTL`.
+// WithSlidingTTL toggles sliding-TTL behavior on the cache's default TTL.
+// When true, every Get refreshes the entry's expiry to now+slidingTTL.
 func WithSlidingTTL(b bool) Option {
 	return func(c *config) { c.slidingTTL = b }
 }
 
-// WithTTLJitter sets the jitter window applied to TTL expirations.
-// The actual expiry of a TTL'd entry is `ttl + uniform(-j, +j)`. Use
-// to break up cohort expirations and avoid stampedes.
-//
-// When this option is not configured, the cache applies a default
-// jitter equal to 5% of the resolved TTL on each insert. Pass a
-// non-positive duration to disable jitter entirely (the explicit
-// zero overrides the 5% default).
+// WithTTLJitter sets the jitter window applied to TTL expirations: actual
+// expiry is ttl + uniform(-j, +j). Default is 5% of the resolved TTL; an
+// explicit zero disables jitter entirely.
 func WithTTLJitter(j time.Duration) Option {
 	return func(c *config) {
 		c.ttlJitter = j
@@ -401,34 +384,25 @@ func WithLogger(l *slog.Logger) Option {
 	}
 }
 
-// WithStatsEnabled toggles statistics collection. Default on.
-// Disabling removes a small amount of atomic-add overhead from the hot
-// path.
+// WithStatsEnabled toggles statistics collection. Default on; disabling
+// removes a small amount of atomic-add overhead from the hot path.
 func WithStatsEnabled(b bool) Option {
 	return func(c *config) { c.statsEnabled = b }
 }
 
 // WithCollisionTracking enables hash-collision counting in
-// [Stats.HashCollisions]. When two distinct keys produce the same
-// hasher output (shard-routing hash), the second one's insert
-// increments the counter. Off by default — useful when diagnosing
-// hot keys, weak custom hashers passed via [WithHasher], or
-// pathological key distributions.
-//
-// The check is per-shard and adds one map lookup + one map write
-// per insert; turn off in production unless you're actively
-// investigating a distribution problem.
+// [Stats.HashCollisions]. Off by default; turn on only when diagnosing
+// hot keys or weak custom hashers, since it adds map lookup+write per
+// insert.
 func WithCollisionTracking(b bool) Option {
 	return func(c *config) { c.collisionTracking = b }
 }
 
-// WithTTLBuckets enables a hashed timing wheel as the per-shard
-// TTL backend, replacing the default min-heap. The wheel has
-// `slots` buckets, with a per-tick wall duration of roughly
-// `janitorInterval / tickPerBucket` (defaults to one tick per
-// janitor interval when tickPerBucket ≤ 0). Ideal for caches with
-// large numbers of TTL'd entries where the heap's O(log n) insert/
-// remove dominates; for typical CLI workloads the heap is fine.
+// WithTTLBuckets enables a hashed timing wheel as the per-shard TTL
+// backend, replacing the default min-heap. The wheel has slots buckets
+// with per-tick duration ~janitorInterval/tickPerBucket (one tick per
+// janitor interval when tickPerBucket <= 0). Useful for very large
+// numbers of TTL'd entries where the heap's O(log n) cost dominates.
 func WithTTLBuckets(slots, tickPerBucket int) Option {
 	return func(c *config) {
 		c.ttlBuckets = slots
@@ -436,135 +410,57 @@ func WithTTLBuckets(slots, tickPerBucket int) Option {
 	}
 }
 
-// WithLockFreeRead enables a `sync.Map`-style read fast path: each
-// shard publishes an immutable snapshot of its entries via an
-// atomic pointer, and [Cache.Get] consults that snapshot without
-// taking any shard lock. Misses fall through to the existing
-// locked path; the snapshot is rebuilt periodically when reads
-// observe enough drift between the snapshot and the live shard
-// state.
-//
-// Performance: read-only workloads see Get latency drop into the
-// same range as `sync.Map.Load` (a few nanoseconds per call vs the
-// default ~58 ns/op). Write-heavy workloads see a small overhead
-// from snapshot bookkeeping.
-//
-// Trade-off: entries that have ever been published into a read
-// snapshot are NOT returned to the per-shard sync.Pool — they
-// remain GC-managed so concurrent readers holding the snapshot's
-// entry pointers can dereference them safely. For caches with
-// high churn this can mean modestly increased GC pressure; for
-// read-mostly caches the throughput win dominates.
-//
-// EXPERIMENTAL in v0; will likely become the default in v1 once
-// the throughput target row is validated across more workloads.
+// WithLockFreeRead enables a sync.Map-style read fast path: each shard
+// publishes an atomic snapshot consulted without lock. Misses fall
+// through to the locked path; entries published into a snapshot are NOT
+// returned to the sync.Pool. Gated to S3-FIFO with no [WithExpireFunc].
+// EXPERIMENTAL.
 func WithLockFreeRead() Option {
 	return func(c *config) { c.lockFreeRead = true }
 }
 
-// WithAsyncWrites decouples [Cache.Set] / [Cache.Delete] from the
-// storage update so the caller sees a fast return at the cost of
-// deferred visibility into long-tail effects (eviction, [Store]
-// write-through, group enforcement). The cache enqueues each
-// operation in a per-shard pending map and drains the pending state
-// from a single per-cache apply goroutine.
-//
-// Visibility contract: a Set followed by a Get on the same key
-// returns the new value, and a Delete followed by a Get returns a
-// miss — the read paths consult the pending map before the
-// storage. Beyond that single-key after-write read, async writes
-// trade strict ordering for throughput:
-//
-//   - Eviction-policy state (LRU position, S3-FIFO frequency, etc.)
-//     and the expiry heap are updated only when the apply goroutine
-//     processes the queued op.
-//   - Hit counters and [WithRefreshAhead] do not fire for reads
-//     served from pending — those promote on apply.
-//   - When [WithStore] is also configured, Store.Set errors during
-//     apply are LOGGED but cannot be returned to the caller (the
-//     caller has already moved on). Synchronous durability requires
-//     leaving WithAsyncWrites disabled.
-//   - [Cache.Compute] and the rest of the Compute family stay
-//     synchronous regardless: they need a transactional view of the
-//     entry and cannot run via the queue.
-//   - [Cache.Sync] blocks until pending is empty; tests that need
-//     to observe the steady state should call it.
-//   - [Cache.Close] drains pending before stopping the apply
-//     goroutine.
-//
-// EXPERIMENTAL in v0; the surface may tighten in v1 once the
-// Caffeine/otter-style throughput targets are validated.
+// WithAsyncWrites decouples [Cache.Set] / [Cache.Delete] from the storage
+// update; ops enqueue into a per-shard pending map drained by a per-cache
+// apply goroutine. Visibility: a Set followed by Get returns the new
+// value (read paths consult pending before storage). Eviction state,
+// hit counters, refresh-ahead, and Store write-through are deferred to
+// apply time; Store.Set errors during apply are logged not returned.
+// [Cache.Compute] stays synchronous. [Cache.Sync] blocks until pending
+// is empty; [Cache.Close] drains pending. EXPERIMENTAL.
 func WithAsyncWrites() Option {
 	return func(c *config) { c.asyncWrites = true }
 }
 
-// WithStore wires a user-supplied [Store] in behind the cache as the
-// source of truth. The cache's in-memory state becomes a write-
-// through hot subset bounded by the configured eviction policy:
-//
-//   - Reads check the in-memory shard first; on miss they fall
-//     through to the Store. A Store hit is promoted into the
-//     in-memory cache so subsequent reads stay fast.
-//   - Writes go to both — the in-memory entry is created/updated
-//     and the Store sees a Set with the same TTL. A Store error
-//     surfaces back to the caller; the in-memory entry is rolled
-//     back to keep the two sides consistent.
-//   - Deletes go to both. A Store error is logged and the in-
-//     memory delete still completes.
-//
-// The cache does NOT close the Store on [Cache.Close] — the Store's
-// lifecycle is the caller's responsibility. Iteration helpers
-// ([Cache.Range], [Cache.Keys], [Cache.Items]) operate only on the
-// in-memory portion; use [Store.Iterate] directly to walk the full
-// dataset.
-//
-// The Store interface is generic — passing a [Store] whose K/V
-// don't match the cache's parameters is a [ConfigError] at New
-// time.
+// WithStore wires a user-supplied [Store] behind the cache as the source
+// of truth. Reads check in-memory first then fall through to Store with
+// promotion; writes go through to Store and roll the in-memory entry
+// back on Store error; deletes go through and the in-memory delete
+// completes regardless of Store error. The cache does NOT close the
+// Store on [Cache.Close]. Iteration helpers ([Cache.Range],
+// [Cache.Keys]) walk only the in-memory portion. A Store whose K/V do
+// not match the cache parameters is a [ConfigError] at [New].
 func WithStore[K comparable, V any](store Store[K, V]) Option {
 	return func(c *config) { c.store = store }
 }
 
-// WithFlatStorage opts each shard into a flat hash-probed storage
-// layout instead of the default Go map. The flat layout uses linear
-// probing with tombstone-driven compactions; per-entry overhead is
-// lower than the map's bucket-and-overflow structure and probes
-// keep cache lines hot, which can improve throughput on workloads
-// with small-to-mid sized values and modest churn.
-//
-// Trade-offs:
-//   - Lookups, inserts, and deletes are O(1) amortized but pay a
-//     slot-scan cost when clusters are dense.
-//   - Deletes leave tombstones until the next compaction; sustained
-//     churn-heavy workloads will see periodic rebuilds.
-//   - The number of compactions performed across all shards is
-//     reported as [Stats.Compactions]; a persistently-rising
-//     counter under steady state indicates the workload is
-//     compaction-dominated and the default map storage may serve
-//     it better.
-//
-// EXPERIMENTAL in v0; enable only when benchmarks for your workload
-// show a win.
+// WithFlatStorage opts each shard into a flat hash-probed storage layout
+// (linear probing + tombstone-driven compactions) instead of the default
+// Go map. [Stats.Compactions] reports total rebuilds across shards.
+// EXPERIMENTAL.
 func WithFlatStorage() Option {
 	return func(c *config) { c.flatStorage = true }
 }
 
-// WithShardedStats requests per-CPU sharded counters for the
-// hot-path Hits/Misses fields. Reduces cache-line contention on
-// >32-core machines at the cost of slightly more memory and a
-// fan-in cost on every [Cache.Stats] read. The remaining stats
-// counters stay as plain atomics — they update on insert/evict
-// rather than every Get and so don't pay the same penalty.
-// Default: off.
+// WithShardedStats enables per-CPU sharded counters for Hits/Misses,
+// reducing cache-line contention on >32-core machines at the cost of
+// slight memory and a fan-in cost on every [Cache.Stats] read. Default off.
 func WithShardedStats(b bool) Option {
 	return func(c *config) { c.shardedStats = b }
 }
 
-// WithWeigher attaches a function that returns the "weight" of a
-// value. Used together with [WithMaxBytes] for byte-bounded caches.
-// The function is type-asserted at cache construction time; a
-// weigher whose value type does not match V is rejected by [New]
-// as a [*ConfigError].
+// WithWeigher attaches a [Weigher] used together with [WithMaxBytes] for
+// byte-bounded caches. A weigher whose type does not match V is rejected
+// by [New] as a [*ConfigError].
 func WithWeigher[V any](fn Weigher[V]) Option {
 	return func(c *config) {
 		if fn != nil {
@@ -606,30 +502,18 @@ func WithBulkLoader[K comparable, V any](l BulkLoader[K, V]) Option {
 	}
 }
 
-// WithLoaderRateLimit bounds the number of Loader invocations per
-// second across the cache. Excess callers receive
-// [ErrLoaderRateLimited] rather than blocking; their context is
-// not consulted (the limiter rejects synchronously).
-//
-// A non-positive value disables rate limiting. The limiter is a
-// simple steady-rate token bucket sized at perSecond tokens with
-// refill rate perSecond/second; it does not allow bursts above its
-// capacity.
+// WithLoaderRateLimit bounds Loader invocations per second across the
+// cache. Excess callers receive [ErrLoaderRateLimited] (no blocking).
+// A non-positive value disables rate limiting.
 func WithLoaderRateLimit(perSecond int) Option {
 	return func(c *config) { c.loaderRatePerSecond = perSecond }
 }
 
-// WithGroup defines a capacity-bounded tag group. After a Set
-// whose tags include `name`, the cache enforces that no more than
-// `capacity` entries simultaneously carry that tag — surplus
-// entries are evicted oldest-first (by insertion time) under
-// [EvictReasonTag].
-//
-// Multiple WithGroup options may be supplied (one per group); the
-// last call for a given name wins.
-//
-// A non-positive capacity removes any prior registration for that
-// name.
+// WithGroup defines a capacity-bounded tag group. After a Set whose tags
+// include name, the cache evicts oldest-first under [EvictReasonTag] if
+// more than capacity entries carry that tag. Multiple WithGroup calls
+// register independent groups; last call wins per name. Non-positive
+// capacity removes a prior registration.
 func WithGroup(name string, capacity int) Option {
 	return func(c *config) {
 		if c.groups == nil {
@@ -643,13 +527,9 @@ func WithGroup(name string, capacity int) Option {
 	}
 }
 
-// WithMaxTagsPerEntry caps the number of tags carried by any
-// single entry. [Cache.SetWithTags] / [SetTags] / [CacheTagger]
-// inputs that exceed the limit cause the affected Set call to
-// return [*CapacityError] wrapping [ErrTooManyTags] without
-// inserting the entry.
-//
-// 0 (the default) disables the per-entry cap.
+// WithMaxTagsPerEntry caps the number of tags on any single entry.
+// Inputs exceeding the cap return [*CapacityError] wrapping
+// [ErrTooManyTags] without inserting. 0 disables the cap.
 func WithMaxTagsPerEntry(n int) Option {
 	return func(c *config) {
 		if n >= 0 {
@@ -658,13 +538,10 @@ func WithMaxTagsPerEntry(n int) Option {
 	}
 }
 
-// WithMaxTagsTotal caps the number of distinct tags the cache's
-// inverted index may carry across all entries. When a Set would
-// introduce a new tag past the limit, the call returns
-// [*CapacityError] wrapping [ErrTooManyTags] without inserting.
-// Existing entries on already-known tags are unaffected.
-//
-// 0 disables the cache-wide cap.
+// WithMaxTagsTotal caps the number of distinct tags the cache's inverted
+// index may carry. A Set introducing a new tag past the cap returns
+// [*CapacityError] wrapping [ErrTooManyTags] without inserting. 0
+// disables the cap.
 func WithMaxTagsTotal(n int) Option {
 	return func(c *config) {
 		if n >= 0 {
@@ -673,87 +550,53 @@ func WithMaxTagsTotal(n int) Option {
 	}
 }
 
-// WithMaxConcurrentLoads caps the number of in-flight Loader calls
-// across the cache. When the cap is reached, the next caller that
-// becomes a flight leader blocks acquiring a slot.
-//
-// Slot-wait behavior:
-//   - The leader's wait is bounded by [WithLoaderTimeout] (and any
-//     deadline derived from it). On timeout the leader returns
-//     [ErrLoaderTooManyInFlight].
-//   - Followers attaching to an in-flight leader's request via
-//     singleflight wait on the flight's completion; their own
-//     ctx cancellation returns ctx.Err immediately and decrements
-//     the flight's waiter refcount.
-//   - When ALL waiters have canceled their contexts, the leader's
-//     loader ctx is canceled too; the slot-wait then returns
-//     [ErrLoaderTooManyInFlight] for the leader.
-//
-// A non-positive value disables the cap.
+// WithMaxConcurrentLoads caps in-flight Loader calls across the cache.
+// Leaders blocked on a slot return [ErrLoaderTooManyInFlight] on timeout
+// (bounded by [WithLoaderTimeout]). When all waiters cancel, the
+// leader's ctx is canceled. A non-positive value disables the cap.
 func WithMaxConcurrentLoads(n int) Option {
 	return func(c *config) { c.maxConcurrentLoads = n }
 }
 
-// WithNegativeCache enables caching of "not found" results. When a
-// Loader returns [ErrNotFound], the cache stores a tombstone with
-// the supplied TTL; subsequent Get/GetOrLoad calls return
-// [ErrNotFound] without re-invoking the Loader.
-//
-// negativeTTL <= 0 disables negative caching entirely; the cache
-// behaves as if the option had not been set.
+// WithNegativeCache caches "not found" results. When a Loader returns
+// [ErrNotFound], the cache stores a tombstone with the supplied TTL and
+// subsequent calls return [ErrNotFound] without re-invoking the Loader.
+// negativeTTL <= 0 disables negative caching.
 func WithNegativeCache(negativeTTL time.Duration) Option {
 	return func(c *config) { c.negativeTTL = negativeTTL }
 }
 
-// WithErrorTTL caches Loader errors (other than [ErrNotFound]) for
-// the given duration. Subsequent [Cache.GetOrLoad] calls within
-// the window return the cached error without re-invoking the
-// Loader. Distinct from [WithNegativeCache]: that option caches
-// "key does not exist"; this one caches "the loader broke".
+// WithErrorTTL caches Loader errors (other than [ErrNotFound]) for d.
+// Subsequent [Cache.GetOrLoad] calls within the window return the cached
+// error without re-invoking the Loader.
 func WithErrorTTL(d time.Duration) Option {
 	return func(c *config) { c.errorTTL = d }
 }
 
 // WithLoaderTimeout sets the per-call deadline applied to Loader
-// contexts when the caller does not supply one. Recommended in
-// production to prevent a runaway Loader from monopolizing
-// singleflight slots.
+// contexts when the caller does not supply one.
 func WithLoaderTimeout(d time.Duration) Option {
 	return func(c *config) { c.loaderTimeout = d }
 }
 
-// WithRefreshAhead enables refresh-ahead: when an entry's age
-// exceeds refreshAt × its TTL, the next [Cache.Get] triggers an
-// asynchronous Loader call to refresh the entry. The cached value
-// continues to be served until the reload completes. refreshAt
-// must be in (0, 1); values outside the range disable refresh-ahead.
+// WithRefreshAhead enables refresh-ahead: when an entry's age exceeds
+// refreshAt*TTL, the next [Cache.Get] triggers an asynchronous Loader
+// call. refreshAt must be in (0, 1); other values disable.
 func WithRefreshAhead(refreshAt float64) Option {
 	return func(c *config) { c.refreshAheadAt = refreshAt }
 }
 
-// WithStaleWhileRevalidate enables stale-while-revalidate: when an
-// entry has expired but its expireAt was less than staleFor ago,
-// the next [Cache.Get] returns the stale value AND triggers a
-// background Loader call to refresh it. Inspired by RFC 5861.
-//
+// WithStaleWhileRevalidate enables stale-while-revalidate: when an entry
+// has expired but its expireAt was less than staleFor ago, the next
+// [Cache.Get] returns the stale value and triggers a background refresh.
 // staleFor <= 0 disables SWR.
 func WithStaleWhileRevalidate(staleFor time.Duration) Option {
 	return func(c *config) { c.swrStaleFor = staleFor }
 }
 
-// WithExpvar registers the cache's Stats under the given name in
-// stdlib `expvar`. The published variable is a JSON-shaped object
-// keyed on the snake-case stat names (`hits`, `misses`, …,
-// `entries`, `bytes`, `capacity`, `hit_rate_permille`).
-//
-// Useful for `/debug/vars` integrations: drop the option in,
-// expose `expvar.Handler()` from your HTTP server, and the
-// cache's counters are visible immediately.
-//
-// If a variable with the same name has already been published in
-// this process the call is silently a no-op (avoiding the panic
-// stdlib's `expvar.Publish` would otherwise raise on duplicate
-// registration).
+// WithExpvar registers the cache's Stats under name in stdlib expvar as
+// a JSON object keyed on snake-case stat names. A duplicate registration
+// is silently a no-op.
 func WithExpvar(name string) Option {
 	return func(c *config) {
 		if name != "" {
@@ -762,10 +605,8 @@ func WithExpvar(name string) Option {
 	}
 }
 
-// WithTracer attaches a [Tracer] for span emission on cache
-// operations. Spans are emitted around `Get`, `Set`, the loader,
-// eviction, and snapshot save/load paths. See the [Tracer] doc
-// for the catalog of span names.
+// WithTracer attaches a [Tracer] for span emission. See [Tracer] for the
+// catalog of span names.
 func WithTracer(t Tracer) Option {
 	return func(c *config) {
 		if t != nil {
@@ -774,16 +615,10 @@ func WithTracer(t Tracer) Option {
 	}
 }
 
-// WithSnapshotMetadata embeds a key/value map in the snapshot
-// header. The metadata is exposed by [InspectSnapshot] so callers
-// can audit a snapshot's environment of origin (e.g., embed
-// `app_version` and refuse to load snapshots from incompatible
-// builds). Up to 65535 keys; each key and value are length-
-// prefixed `uint32` strings. The map is copied on the option call
-// so subsequent mutation by the caller does not affect future
-// saves.
-//
-// Calling this option more than once replaces the metadata wholesale.
+// WithSnapshotMetadata embeds a key/value map in the snapshot header,
+// exposed by [InspectSnapshot]. Up to 65535 keys; the map is cloned on
+// each option call. Calling this option more than once replaces the
+// metadata wholesale.
 func WithSnapshotMetadata(meta map[string]string) Option {
 	return func(c *config) {
 		if meta == nil {
@@ -794,24 +629,17 @@ func WithSnapshotMetadata(meta map[string]string) Option {
 	}
 }
 
-// WithMaxSnapshotBytes caps the size of snapshots accepted by
-// [Cache.Load] and [Cache.LoadFile]. A non-positive value falls
-// back to the package default (256 MiB). Use this to harden the
-// cache against corrupt or hostile snapshot files that would
-// otherwise OOM the process during Load.
+// WithMaxSnapshotBytes caps snapshots accepted by [Cache.Load] /
+// [Cache.LoadFile]. A non-positive value falls back to the default
+// (256 MiB).
 func WithMaxSnapshotBytes(n int64) Option {
 	return func(c *config) { c.maxSnapshotBytes = n }
 }
 
-// WithAutoSave instructs the cache to persist a snapshot to path
-// every interval. Saving is performed by a per-cache goroutine
-// started during construction; [Cache.Close] writes a final
-// snapshot before tearing the goroutine down. Errors during
-// auto-save are logged via the configured slog.Logger and do not
-// fail subsequent saves.
-//
-// A non-positive interval disables the periodic save (useful when
-// pairing only WithAutoLoad with a manual SaveFile on shutdown).
+// WithAutoSave persists a snapshot to path every interval via a per-cache
+// goroutine. [Cache.Close] writes a final snapshot before tearing it
+// down. Errors are logged. A non-positive interval disables the periodic
+// save.
 func WithAutoSave(path string, interval time.Duration) Option {
 	return func(c *config) {
 		c.autoSavePath = path
@@ -819,19 +647,15 @@ func WithAutoSave(path string, interval time.Duration) Option {
 	}
 }
 
-// WithAutoLoad attempts to populate the cache from a snapshot at
-// path during [New]. A missing file is treated as "no snapshot to
-// load" (not an error). Any other error during load fails
-// construction unless [WithAutoLoadIgnoreErrors] is also set.
+// WithAutoLoad populates the cache from a snapshot at path during [New].
+// A missing file is not an error; any other load error fails [New]
+// unless [WithAutoLoadIgnoreErrors] is also set.
 func WithAutoLoad(path string) Option {
 	return func(c *config) { c.autoLoadPath = path }
 }
 
-// WithAutoLoadIgnoreErrors makes [WithAutoLoad] swallow load
-// errors and log them through the configured slog.Logger instead
-// of aborting [New]. Recommended for CLIs where a corrupt or
-// version-mismatched snapshot should fall back to an empty cache
-// rather than refuse to start.
+// WithAutoLoadIgnoreErrors makes [WithAutoLoad] log and swallow load
+// errors instead of aborting [New].
 func WithAutoLoadIgnoreErrors(b bool) Option {
 	return func(c *config) { c.autoLoadIgnore = b }
 }
@@ -847,16 +671,10 @@ func WithEventsBuffer(n int) Option {
 	}
 }
 
-// WithOnHit registers a synchronous callback invoked on every Get
-// hit. The callback runs under the shard write lock; slow
-// callbacks block the Get path, and re-entering the cache for any
-// key that hashes to the same shard deadlocks. For asynchronous
-// notification use [Cache.Subscribe] instead.
-//
-// Note that [WithOnEvict]/[WithOnExpire] callbacks fire AFTER the
-// shard lock is released (via the deferred-callback queue), but
-// OnHit/OnMiss run inline because the per-Get cost of routing
-// through that queue would dominate the hot path.
+// WithOnHit registers a synchronous callback invoked on every Get hit.
+// The callback runs under the shard lock; slow callbacks block the Get
+// path and re-entering the cache for a same-shard key deadlocks. Use
+// [Cache.Subscribe] for asynchronous notification.
 func WithOnHit[K comparable, V any](fn func(key K, value V)) Option {
 	return func(c *config) {
 		if fn != nil {
@@ -865,9 +683,9 @@ func WithOnHit[K comparable, V any](fn func(key K, value V)) Option {
 	}
 }
 
-// WithOnMiss registers a synchronous callback invoked on every Get
-// miss (including expired and negative-tombstone hits). Runs under
-// the shard write lock — same caveats as [WithOnHit] apply.
+// WithOnMiss registers a synchronous callback invoked on every Get miss
+// (including expired and negative-tombstone hits). Same caveats as
+// [WithOnHit] apply.
 func WithOnMiss[K comparable](fn func(key K)) Option {
 	return func(c *config) {
 		if fn != nil {
@@ -876,15 +694,10 @@ func WithOnMiss[K comparable](fn func(key K)) Option {
 	}
 }
 
-// WithOnEvict registers a callback invoked when an entry is
-// removed for any reason OTHER than TTL expiry. The callback
-// receives the key, a stable copy of the value, and the reason.
-//
-// The callback fires AFTER the shard lock that owned the
-// removal has been released — re-entering the cache from inside
-// the callback (Get/Set/Delete on any key) is safe. Multiple
-// removals from the same locked section batch their callbacks;
-// they run in unspecified order after the lock is released.
+// WithOnEvict registers a callback invoked when an entry is removed for
+// any reason OTHER than TTL expiry. The callback fires AFTER the shard
+// lock is released, so re-entering the cache from the callback is safe.
+// Multiple removals from one locked section batch their callbacks.
 func WithOnEvict[K comparable, V any](fn func(key K, value V, reason EvictionReason)) Option {
 	return func(c *config) {
 		if fn != nil {
@@ -893,15 +706,9 @@ func WithOnEvict[K comparable, V any](fn func(key K, value V, reason EvictionRea
 	}
 }
 
-// WithOnExpire registers a callback invoked when an entry is
-// removed because its TTL has elapsed (lazy or janitor path) or
-// because [WithExpireFunc] returned true. Distinct from
-// [WithOnEvict] so callers can react differently to natural
-// expiration vs capacity-driven eviction.
-//
-// Like [WithOnEvict], the callback fires after the shard lock
-// that owned the removal has been released — re-entry into the
-// cache is safe.
+// WithOnExpire registers a callback invoked when an entry is removed by
+// TTL expiry or because [WithExpireFunc] returned true. The callback
+// fires AFTER the shard lock is released, so re-entry is safe.
 func WithOnExpire[K comparable, V any](fn func(key K, value V)) Option {
 	return func(c *config) {
 		if fn != nil {
@@ -910,10 +717,8 @@ func WithOnExpire[K comparable, V any](fn func(key K, value V)) Option {
 	}
 }
 
-// WithOnLoad registers a synchronous callback invoked after every
-// Loader completion (success or failure). The callback receives
-// the key, the loaded value (or zero V on error), the TTL the
-// Loader returned (or 0), and the error.
+// WithOnLoad registers a synchronous callback invoked after every Loader
+// completion (success or failure).
 func WithOnLoad[K comparable, V any](fn func(key K, value V, ttl time.Duration, err error)) Option {
 	return func(c *config) {
 		if fn != nil {
@@ -922,31 +727,13 @@ func WithOnLoad[K comparable, V any](fn func(key K, value V, ttl time.Duration, 
 	}
 }
 
-// WithExpireFunc registers a per-entry expiry predicate. On each
-// Get and during each janitor sweep, fn is called with the entry's
-// metadata; returning true causes the cache to treat the entry as
-// expired regardless of its TTL. Removals driven by this predicate
-// are recorded under [EvictReasonExpireFunc] (distinct from
-// [EvictReasonExpired] which covers TTL-only expiry).
-//
-// Use cases include "expire when an external resource changes" —
-// e.g., file mtime checks, schema-version comparison, etag mismatch.
-//
-// Performance contract: fn must be fast, non-blocking, and side-
-// effect-free. It is called under the shard's read lock on the
-// Get path and the write lock during sweeps; a slow fn directly
-// blocks the entire shard. Unlike [WithOnEvict] / [WithOnExpire],
-// expireFunc is NOT routed through [WithCallbackTimeout] — there
-// is no watchdog, since the predicate's return value is on the
-// hot path.
-//
-// A panicking fn is recovered: the entry is treated as fresh
-// (defensive default — better to keep stale data than lose it)
-// and a warning is logged through the configured slog.Logger.
-//
-// fn is type-asserted at cache construction time; passing a
-// predicate whose type parameters do not match the cache's K/V
-// types results in a [*ConfigError].
+// WithExpireFunc registers a per-entry expiry predicate. fn is called
+// on every Get and janitor sweep with the entry's metadata; true marks
+// it expired regardless of TTL. Removals via fn are recorded under
+// [EvictReasonExpireFunc]. fn MUST be fast and side-effect-free; it is
+// called under shard locks and is NOT routed through
+// [WithCallbackTimeout]. A panicking fn is recovered and the entry is
+// treated as fresh.
 func WithExpireFunc[K comparable, V any](fn func(key K, value V, meta Metadata) bool) Option {
 	return func(c *config) {
 		if fn != nil {

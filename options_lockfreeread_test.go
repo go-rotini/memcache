@@ -308,7 +308,7 @@ func TestLockFreeReadConcurrentGetSetUnderRace(t *testing.T) {
 	wg.Wait()
 	close(stop)
 	if hits.Load() == 0 {
-		t.Error("no reader hits — something is very wrong")
+		t.Error("no reader hits; something is very wrong")
 	}
 }
 
