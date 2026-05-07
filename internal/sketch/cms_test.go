@@ -71,6 +71,29 @@ func TestCountMinSketchDistinctKeysIndependent(t *testing.T) {
 	}
 }
 
+func TestCountMinSketchAutoSeedsWhenInsufficient(t *testing.T) {
+	c := New(64, nil)
+	if c.Depth() != 4 {
+		t.Errorf("Depth = %d, want 4", c.Depth())
+	}
+	c.Increment(123)
+	if got := c.Estimate(123); got != 1 {
+		t.Errorf("auto-seeded sketch should still record increments; got %d", got)
+	}
+	c2 := New(64, []uint64{1, 2})
+	c2.Increment(7)
+	if got := c2.Estimate(7); got != 1 {
+		t.Errorf("two-seed input should be padded; got %d", got)
+	}
+}
+
+func TestCountMinSketchDepth(t *testing.T) {
+	c := New(64, []uint64{1, 2, 3, 4})
+	if got := c.Depth(); got != 4 {
+		t.Errorf("Depth = %d, want 4", got)
+	}
+}
+
 func TestCountMinSketchConservativeUpdate(t *testing.T) {
 	seeds := []uint64{1, 2, 3, 4}
 	c := New(64, seeds)

@@ -54,6 +54,19 @@ func TestBloomTestAndSet(t *testing.T) {
 	}
 }
 
+func TestBloomAutoSeedsWhenInsufficient(t *testing.T) {
+	b := NewBloom(1024, nil)
+	b.Set(7)
+	if !b.Test(7) {
+		t.Fatal("auto-seeded bloom must still record sets")
+	}
+	b2 := NewBloom(1024, []uint64{1, 2})
+	b2.Set(99)
+	if !b2.Test(99) {
+		t.Fatal("two-seed input must be padded; Set/Test should still work")
+	}
+}
+
 func TestBloomBitCountIsPowerOfTwo(t *testing.T) {
 	seeds := []uint64{1, 2, 3, 4}
 	for _, expected := range []int{1, 10, 100, 1000} {

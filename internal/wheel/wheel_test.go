@@ -160,6 +160,28 @@ func TestResetClears(t *testing.T) {
 	}
 }
 
+func TestNewClampsInvalidArgs(t *testing.T) {
+	w := New[string](0, 0, origin)
+	if w.SlotCount() != 1 {
+		t.Errorf("SlotCount with slotCount=0 fallback = %d, want 1", w.SlotCount())
+	}
+	if w.TickNs() != 1 {
+		t.Errorf("TickNs with tickNs=0 fallback = %d, want 1", w.TickNs())
+	}
+	w2 := New[string](-5, -10, origin)
+	if w2.SlotCount() != 1 || w2.TickNs() != 1 {
+		t.Errorf("negative inputs not clamped: SlotCount=%d TickNs=%d",
+			w2.SlotCount(), w2.TickNs())
+	}
+}
+
+func TestTickNsReturnsConfigured(t *testing.T) {
+	w := New[string](8, 250, origin)
+	if got := w.TickNs(); got != 250 {
+		t.Errorf("TickNs = %d, want 250", got)
+	}
+}
+
 func TestExpirationOrderWithinSlot(t *testing.T) {
 	// Entries that hash to the same slot expire together.
 	w := New[string](4, tick, origin)
