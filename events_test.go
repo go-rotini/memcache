@@ -395,3 +395,58 @@ func TestNegativeTombstoneSuppressesEvictEvent(t *testing.T) {
 		t.Errorf("expected no Evict/Expire events for negative tombstone; got %+v", events)
 	}
 }
+
+// TestOnEvictCallbackCanReEnterCache verifies that an OnEvict
+// callback re-entering the cache for a Get on the same shard does
+// not deadlock. Before the post-unlock callback dispatch, this Get
+// would block on the still-held shard write lock.
+//
+// Uses Get (not Set) inside the callback so the callback doesn't
+// cascade into more evictions — the regression being exercised is
+// "shard lock still held when callback fires."
+func TestOnEvictCallbackCanReEnterCache(t *testing.T) {
+	var c *Cache[string, int]
+	called := make(chan struct{}, 1)
+	c, _ = New[string, int](
+		WithMaxEntries(2),
+		WithShards(1),
+		WithPolicy(PolicyLRU),
+		WithOnEvict[string, int](func(string, int, EvictionReason) {
+			_, _ = c.Get("a")
+			select {
+			case called <- struct{}{}:
+			default:
+			}
+		}),
+	)
+	defer c.Close()
+
+	// MaxEntries(2) with 1 shard yields a per-shard budget of
+	// 2 + 10% slop. Insert enough to push past the slop and
+	// trigger an eviction.
+	for i := 0; i < 8; i++ {
+		_ = c.Set("k"+intToStr(i), i)
+	}
+
+	select {
+	case <-called:
+	case <-time.After(time.Second):
+		t.Fatal("OnEvict callback didn't fire (or deadlocked) within 1s")
+	}
+}
+
+// intToStr is a tiny strconv-free helper so the regression test
+// stays orthogonal to the strconv import set.
+func intToStr(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	var buf [20]byte
+	pos := len(buf)
+	for n > 0 {
+		pos--
+		buf[pos] = byte('0' + n%10)
+		n /= 10
+	}
+	return string(buf[pos:])
+}

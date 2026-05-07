@@ -75,6 +75,15 @@ type shard[K comparable, V any] struct {
 	// the snapshot but a hit (or amended state) in dirty since the
 	// last promotion. Used to drive lazy snapshot rebuilding.
 	readMisses atomic.Int64
+
+	// pendingCallbacks are user-callback closures (OnEvict /
+	// OnExpire / publish-event / publishInvalidation) deferred
+	// from removeLocked so they fire AFTER the shard lock is
+	// released — preventing deadlock when a callback re-enters the
+	// cache for any key that hashes to the same shard. Accessed
+	// under shard.mu by the caller; flushed after unlock by
+	// [Cache.flushPendingCallbacksLocked].
+	pendingCallbacks []func()
 }
 
 // newShard constructs a shard with the given policy, budget, TTL

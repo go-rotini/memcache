@@ -2,6 +2,7 @@ package memcache
 
 import (
 	"bufio"
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -74,10 +75,12 @@ type entrySnapshot[K comparable, V any] struct {
 // Save acquires each shard's read lock in turn — concurrent reads
 // are unaffected, but writers to a shard being snapshotted block
 // until that shard's pass completes.
-func (c *Cache[K, V]) Save(w io.Writer) error {
+func (c *Cache[K, V]) Save(w io.Writer) (err error) {
 	if c.closed.Load() {
 		return ErrClosed
 	}
+	_, span := c.tracer.Start(context.Background(), "memcache.snapshot.save")
+	defer func() { span.End(err) }()
 	return c.saveTo(w)
 }
 
@@ -123,11 +126,14 @@ func (c *Cache[K, V]) SaveFile(path string) error {
 // saveFileTo is the closed-check-free SaveFile implementation.
 // Close calls this directly so the final auto-save runs even
 // though `closed` has already been flipped.
-func (c *Cache[K, V]) saveFileTo(path string) error {
+func (c *Cache[K, V]) saveFileTo(path string) (err error) {
+	_, span := c.tracer.Start(context.Background(), "memcache.snapshot.save",
+		Attr{Key: "path", Value: path})
+	defer func() { span.End(err) }()
 	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".memcache-*.tmp")
-	if err != nil {
-		return &SnapshotError{Op: "save", Path: path, Message: "create temp", Err: err}
+	tmp, terr := os.CreateTemp(dir, ".memcache-*.tmp")
+	if terr != nil {
+		return &SnapshotError{Op: "save", Path: path, Message: "create temp", Err: terr}
 	}
 	tmpPath := tmp.Name()
 	cleanup := func() { _ = os.Remove(tmpPath) }
@@ -167,7 +173,9 @@ func (c *Cache[K, V]) saveFileTo(path string) error {
 // loaded state; callers concerned about atomicity should use
 // [Cache.Merge] in concert with their own rollback strategy, or
 // load into a fresh cache via [Cache.Clone] semantics.
-func (c *Cache[K, V]) Load(r io.Reader) (int, error) {
+func (c *Cache[K, V]) Load(r io.Reader) (n int, err error) {
+	_, span := c.tracer.Start(context.Background(), "memcache.snapshot.load")
+	defer func() { span.End(err) }()
 	return c.loadInto(r, true)
 }
 
@@ -256,13 +264,16 @@ func (c *Cache[K, V]) loadInto(r io.Reader, reset bool) (int, error) {
 
 // LoadFile loads a snapshot from path. Convenience wrapper around
 // [Cache.Load] that handles file open/close.
-func (c *Cache[K, V]) LoadFile(path string) (int, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return 0, &SnapshotError{Op: "load", Path: path, Message: "open", Err: err}
+func (c *Cache[K, V]) LoadFile(path string) (n int, err error) {
+	_, span := c.tracer.Start(context.Background(), "memcache.snapshot.load",
+		Attr{Key: "path", Value: path})
+	defer func() { span.End(err) }()
+	f, oerr := os.Open(path)
+	if oerr != nil {
+		return 0, &SnapshotError{Op: "load", Path: path, Message: "open", Err: oerr}
 	}
 	defer f.Close()
-	return c.Load(f)
+	return c.loadInto(f, true)
 }
 
 // InspectSnapshot reads only the header of a snapshot file and
@@ -327,7 +338,7 @@ func (c *Cache[K, V]) snapshotEntries() []entrySnapshot[K, V] {
 func (c *Cache[K, V]) applySnapshot(snap entrySnapshot[K, V]) {
 	s := c.shardFor(snap.key)
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	defer c.unlockShard(s)
 
 	if existing, ok := s.storage.get(snap.key); ok {
 		// Overwrite path (Merge semantics, or Load-after-non-empty

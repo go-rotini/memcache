@@ -117,7 +117,7 @@ func (c *Cache[K, V]) Compute(
 	s := c.shardFor(key)
 	now := c.cfg.clock.Now().UnixNano()
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	defer c.unlockShard(s)
 
 	var current V
 	var present bool
@@ -180,7 +180,7 @@ func (c *Cache[K, V]) ComputeIfAbsent(
 	s := c.shardFor(key)
 	now := c.cfg.clock.Now().UnixNano()
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	defer c.unlockShard(s)
 
 	if e, ok := s.storage.get(key); ok && !c.entryExpiredLocked(e, now) && !e.flags.has(flagNegative) {
 		return e.loadValue(), false, nil
@@ -229,7 +229,7 @@ func (c *Cache[K, V]) ComputeIfPresent(
 	s := c.shardFor(key)
 	now := c.cfg.clock.Now().UnixNano()
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	defer c.unlockShard(s)
 
 	e, ok := s.storage.get(key)
 	if !ok || c.entryExpiredLocked(e, now) || e.flags.has(flagNegative) {
@@ -276,7 +276,7 @@ func (c *Cache[K, V]) Update(key K, fn func(cur V) V) (V, error) {
 	s := c.shardFor(key)
 	now := c.cfg.clock.Now().UnixNano()
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	defer c.unlockShard(s)
 
 	e, ok := s.storage.get(key)
 	if !ok || c.entryExpiredLocked(e, now) || e.flags.has(flagNegative) {
@@ -307,7 +307,7 @@ func (c *Cache[K, V]) CompareAndSwap(key K, old, newValue V) bool {
 	s := c.shardFor(key)
 	now := c.cfg.clock.Now().UnixNano()
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	defer c.unlockShard(s)
 
 	e, ok := s.storage.get(key)
 	if !ok || c.entryExpiredLocked(e, now) || e.flags.has(flagNegative) {

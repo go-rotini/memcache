@@ -1,7 +1,9 @@
 package memcache
 
 import (
+	"context"
 	"sync/atomic"
+	"time"
 )
 
 // TieredStats reports observability for a [Tiered] cache split
@@ -41,6 +43,16 @@ type TieredStats struct {
 // the underlying [Cache] thread-safety. Both caches must be
 // non-nil and use the same K/V types (enforced statically by Go
 // generics).
+//
+// Surface: Tiered exposes the high-traffic methods ([Tiered.Get]/
+// [Tiered.GetCtx]/[Tiered.Set]/[Tiered.SetWithTTL]/
+// [Tiered.SetWithOptions]/[Tiered.Delete]/[Tiered.Has]/
+// [Tiered.InvalidateTag]/[Tiered.Sync]) directly. The remaining
+// surface ([Cache.Compute], [Cache.GetOrLoad], [Cache.Range],
+// [Cache.Save], [Cache.Subscribe], etc.) is reachable via
+// [Tiered.L1] / [Tiered.L2]; choose the tier that owns the
+// semantics you need (e.g., GetOrLoad is a per-Cache concept and
+// invokes the loader of whichever tier you call it on).
 type Tiered[K comparable, V any] struct {
 	l1 *Cache[K, V]
 	l2 *Cache[K, V]
@@ -135,6 +147,109 @@ func (t *Tiered[K, V]) Has(key K) bool {
 		return false
 	}
 	return t.l1.Has(key) || t.l2.Has(key)
+}
+
+// GetCtx is the context-aware variant of [Tiered.Get]. The ctx is
+// threaded through to each tier's [Cache.GetCtx]; either tier's
+// [WithStore] read-through honors cancellation. The boolean
+// reports whether either tier had the entry; the error surfaces
+// any underlying ctx or Store failure.
+func (t *Tiered[K, V]) GetCtx(ctx context.Context, key K) (V, bool, error) {
+	var zero V
+	if t.closed.Load() {
+		return zero, false, ErrClosed
+	}
+	if v, ok, err := t.l1.GetCtx(ctx, key); err != nil || ok {
+		if ok {
+			t.l1Hits.Add(1)
+		}
+		return v, ok, err
+	}
+	v, ok, err := t.l2.GetCtx(ctx, key)
+	if err != nil {
+		return zero, false, err
+	}
+	if !ok {
+		t.misses.Add(1)
+		return zero, false, nil
+	}
+	t.l2Hits.Add(1)
+	if perr := t.l1.SetCtx(ctx, key, v); perr == nil {
+		t.promotions.Add(1)
+	}
+	return v, true, nil
+}
+
+// SetWithTTL writes value to BOTH tiers with the given TTL.
+// Returns the first error encountered.
+func (t *Tiered[K, V]) SetWithTTL(key K, value V, ttl time.Duration) error {
+	if t.closed.Load() {
+		return ErrClosed
+	}
+	if err := t.l1.SetWithTTL(key, value, ttl); err != nil {
+		return err
+	}
+	return t.l2.SetWithTTL(key, value, ttl)
+}
+
+// SetWithOptions writes value to BOTH tiers with the supplied
+// per-call options. Both tiers receive the same option set, so
+// per-tier overrides (e.g., a different TTL on L2 than L1) are
+// not expressible — call into [Tiered.L1]/[Tiered.L2] directly
+// when you need them.
+func (t *Tiered[K, V]) SetWithOptions(key K, value V, opts ...SetOption) error {
+	if t.closed.Load() {
+		return ErrClosed
+	}
+	if err := t.l1.SetWithOptions(key, value, opts...); err != nil {
+		return err
+	}
+	return t.l2.SetWithOptions(key, value, opts...)
+}
+
+// InvalidateTag removes every entry tagged with t from BOTH tiers.
+// Returns the total number of entries removed across both tiers.
+// Negative-cache tombstones and invalidated read-snapshot entries
+// are not counted by either tier's InvalidateTag.
+func (t *Tiered[K, V]) InvalidateTag(tag string) int {
+	if t.closed.Load() {
+		return 0
+	}
+	return t.l1.InvalidateTag(tag) + t.l2.InvalidateTag(tag)
+}
+
+// InvalidateTags removes every entry tagged with at least one of
+// tags from BOTH tiers. Returns the total removed across both.
+func (t *Tiered[K, V]) InvalidateTags(tags ...string) int {
+	if t.closed.Load() {
+		return 0
+	}
+	return t.l1.InvalidateTags(tags...) + t.l2.InvalidateTags(tags...)
+}
+
+// Sync waits for any background work in BOTH tiers (tag-cleanup
+// drainer, async-writes apply goroutine) to drain. Useful in tests
+// before reading state that depends on completed writes.
+func (t *Tiered[K, V]) Sync(ctx context.Context) error {
+	if t.closed.Load() {
+		return ErrClosed
+	}
+	if err := t.l1.Sync(ctx); err != nil {
+		return err
+	}
+	return t.l2.Sync(ctx)
+}
+
+// Len returns the number of entries in L2. Because writes are
+// write-through, L1 ⊆ L2 in steady state, so reporting L2's Len
+// is the most accurate "how many distinct keys does this tiered
+// cache hold" measurement. Use [Tiered.L1]/[Tiered.L2] and their
+// own Len() if you need per-tier counts.
+func (t *Tiered[K, V]) Len() int {
+	if t.closed.Load() {
+		return 0
+	}
+	return t.l2.Len()
 }
 
 // Stats returns the combined observability snapshot.

@@ -1,8 +1,10 @@
 package memcache
 
 import (
+	"context"
 	"errors"
 	"testing"
+	"time"
 )
 
 // newTieredPair builds a fresh L1+L2 pair sized so behaviors are
@@ -227,5 +229,101 @@ func TestTieredSetPropagatesL1Error(t *testing.T) {
 	var ce *CapacityError
 	if !errors.As(err, &ce) {
 		t.Errorf("Set should propagate L1's CapacityError; got %v", err)
+	}
+}
+
+func TestTieredSetWithTTLWritesBoth(t *testing.T) {
+	clk := NewFakeClock(time.Unix(0, 0))
+	l1, _ := New[string, int](WithMaxEntries(8), WithClock(clk))
+	l2, _ := New[string, int](WithMaxEntries(64), WithClock(clk))
+	tc := NewTiered(l1, l2)
+	defer tc.Close()
+
+	if err := tc.SetWithTTL("k", 1, time.Minute); err != nil {
+		t.Fatalf("SetWithTTL: %v", err)
+	}
+	if !l1.Has("k") || !l2.Has("k") {
+		t.Error("SetWithTTL should write to both tiers")
+	}
+	clk.Advance(2 * time.Minute)
+	if l1.Has("k") || l2.Has("k") {
+		t.Error("SetWithTTL TTL should expire entries in both tiers")
+	}
+}
+
+func TestTieredSetWithOptionsWritesBoth(t *testing.T) {
+	tc, l1, l2 := newTieredPair(t)
+	defer tc.Close()
+
+	if err := tc.SetWithOptions("k", 1, SetTags("group-a")); err != nil {
+		t.Fatalf("SetWithOptions: %v", err)
+	}
+	// Tags should be present in both tiers.
+	if l1.InvalidateTag("group-a") != 1 {
+		t.Error("L1 missing the tag")
+	}
+	if l2.InvalidateTag("group-a") != 1 {
+		t.Error("L2 missing the tag")
+	}
+}
+
+func TestTieredInvalidateTagSpansBoth(t *testing.T) {
+	tc, _, _ := newTieredPair(t)
+	defer tc.Close()
+
+	_ = tc.SetWithOptions("a", 1, SetTags("g"))
+	_ = tc.SetWithOptions("b", 2, SetTags("g"))
+
+	// Each entry exists in BOTH tiers, so InvalidateTag should
+	// remove 4 entries total (2 keys × 2 tiers).
+	if removed := tc.InvalidateTag("g"); removed != 4 {
+		t.Errorf("InvalidateTag('g') = %d, want 4 (2 keys × 2 tiers)", removed)
+	}
+	if tc.Has("a") || tc.Has("b") {
+		t.Error("entries still present after tag invalidation")
+	}
+}
+
+func TestTieredSyncDrainsBoth(t *testing.T) {
+	tc, l1, l2 := newTieredPair(t)
+	defer tc.Close()
+
+	_ = tc.Set("k", 1)
+	if err := tc.Sync(context.Background()); err != nil {
+		t.Errorf("Sync: %v", err)
+	}
+	// Sanity: synchronous Set should be observable post-Sync.
+	if !l1.Has("k") || !l2.Has("k") {
+		t.Error("Set not visible after Sync")
+	}
+}
+
+func TestTieredGetCtxRoutesThroughTiers(t *testing.T) {
+	tc, _, l2 := newTieredPair(t)
+	defer tc.Close()
+
+	// Pre-populate L2 only (bypass Tiered.Set so L1 stays empty).
+	_ = l2.Set("k", 99)
+	v, ok, err := tc.GetCtx(context.Background(), "k")
+	if err != nil || !ok || v != 99 {
+		t.Errorf("GetCtx = (%d, %v, %v), want (99, true, nil)", v, ok, err)
+	}
+	stats := tc.Stats()
+	if stats.L2Hits != 1 {
+		t.Errorf("L2Hits = %d, want 1", stats.L2Hits)
+	}
+}
+
+func TestTieredLenReportsL2(t *testing.T) {
+	tc, l1, _ := newTieredPair(t)
+	defer tc.Close()
+
+	for i, k := range []string{"a", "b", "c", "d", "e"} {
+		_ = tc.Set(k, i)
+	}
+	// L1 budget is 4; L2 holds all 5.
+	got := tc.Len()
+	if got != 5 {
+		t.Errorf("Tiered.Len = %d, want 5 (L2 size); L1.Len = %d", got, l1.Len())
 	}
 }

@@ -872,10 +872,15 @@ func WithOnMiss[K comparable](fn func(key K)) Option {
 	}
 }
 
-// WithOnEvict registers a synchronous callback invoked when an
-// entry is removed for any reason OTHER than TTL expiry. The
-// callback receives the key, the (now-pool-bound) value, and the
-// reason. Runs under the shard write lock.
+// WithOnEvict registers a callback invoked when an entry is
+// removed for any reason OTHER than TTL expiry. The callback
+// receives the key, a stable copy of the value, and the reason.
+//
+// The callback fires AFTER the shard lock that owned the
+// removal has been released — re-entering the cache from inside
+// the callback (Get/Set/Delete on any key) is safe. Multiple
+// removals from the same locked section batch their callbacks;
+// they run in unspecified order after the lock is released.
 func WithOnEvict[K comparable, V any](fn func(key K, value V, reason EvictionReason)) Option {
 	return func(c *config) {
 		if fn != nil {
@@ -884,11 +889,15 @@ func WithOnEvict[K comparable, V any](fn func(key K, value V, reason EvictionRea
 	}
 }
 
-// WithOnExpire registers a synchronous callback invoked when an
-// entry is removed because its TTL has elapsed (lazy or janitor
-// path) or because [WithExpireFunc] returned true. Distinct from
+// WithOnExpire registers a callback invoked when an entry is
+// removed because its TTL has elapsed (lazy or janitor path) or
+// because [WithExpireFunc] returned true. Distinct from
 // [WithOnEvict] so callers can react differently to natural
 // expiration vs capacity-driven eviction.
+//
+// Like [WithOnEvict], the callback fires after the shard lock
+// that owned the removal has been released — re-entry into the
+// cache is safe.
 func WithOnExpire[K comparable, V any](fn func(key K, value V)) Option {
 	return func(c *config) {
 		if fn != nil {

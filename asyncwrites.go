@@ -221,7 +221,7 @@ func (c *Cache[K, V]) drainShard(s *shard[K, V]) int {
 			}
 		}
 	}
-	s.mu.Unlock()
+	c.flushPendingCallbacks(s)
 
 	// Phase 2 (off-shard-lock): propagate each op to the
 	// configured Store + enforce group budgets. Failing fast on

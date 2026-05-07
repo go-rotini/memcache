@@ -9,11 +9,21 @@ import "context"
 // SDK. Adapters in the README show how to wire common tracers
 // (OTel, OpenCensus, custom) behind this interface.
 //
-// Span names emitted by the package: `memcache.get`, `memcache.set`,
-// `memcache.load`, `memcache.evict`, `memcache.snapshot.save`,
-// `memcache.snapshot.load`. Attribute keys include `key` (when
-// safely stringable), `hit` (bool), `reason` (eviction reason),
-// and `error` (when the span ended with an error).
+// Spans emitted by the package today:
+//   - `memcache.load` — fires when [Cache.GetOrLoad] runs the
+//     configured Loader. Attributes: `key` (the load key). The
+//     span ends with an error attribute when the loader fails.
+//   - `memcache.snapshot.save` — fires when [Cache.Save] /
+//     [Cache.SaveFile] persist the cache. Attributes: `path`
+//     when SaveFile is used.
+//   - `memcache.snapshot.load` — fires when [Cache.Load] /
+//     [Cache.LoadFile] reads a snapshot. Attributes: `path`
+//     when LoadFile is used.
+//
+// `Get`/`Set`/`Delete` do NOT emit spans by design: per-call
+// tracing on a 60-ns Get path would dominate the cost. Hook
+// observability ([WithOnHit]/[WithOnMiss]/[WithOnEvict]/
+// [WithOnExpire]) covers per-call signals at lower overhead.
 //
 // Implementations are responsible for thread safety. Slow
 // implementations slow the cache; for high-throughput workloads

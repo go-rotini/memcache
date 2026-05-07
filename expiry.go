@@ -91,16 +91,21 @@ func (c *Cache[K, V]) startJanitorLocked(s *shard[K, V]) {
 	if !s.janitor.running.CompareAndSwap(false, true) {
 		return
 	}
-	s.janitor.stop = make(chan struct{})
-	s.janitor.tick = make(chan struct{}, 1)
+	stop := make(chan struct{})
+	tick := make(chan struct{}, 1)
+	s.janitor.stop = stop
+	s.janitor.tick = tick
 	fire := func() {
 		select {
-		case s.janitor.tick <- struct{}{}:
+		case tick <- struct{}{}:
 		default:
 		}
 	}
 	s.janitor.timer = c.cfg.clock.AfterFunc(c.cfg.janitorInterval, fire)
-	go c.runJanitor(s)
+	// Pass channels by value so runJanitor doesn't read s.janitor
+	// fields concurrently with a future startJanitorLocked that
+	// might rewrite them on restart.
+	go c.runJanitor(s, stop, tick)
 }
 
 // stopJanitor signals the janitor to exit. Idempotent — calling on
@@ -129,9 +134,7 @@ const janitorIdleShutdownTicks = 5
 // insert can launch a fresh janitor via [Cache.startJanitorLocked].
 //
 // Exits early when stop is closed (Cache.Close).
-func (c *Cache[K, V]) runJanitor(s *shard[K, V]) {
-	stop := s.janitor.stop
-	tick := s.janitor.tick
+func (c *Cache[K, V]) runJanitor(s *shard[K, V], stop, tick <-chan struct{}) {
 	idle := 0
 	for {
 		select {
@@ -142,7 +145,7 @@ func (c *Cache[K, V]) runJanitor(s *shard[K, V]) {
 			now := c.cfg.clock.Now().UnixNano()
 			removed := c.sweepExpiredLocked(s, now)
 			heapEmpty := s.ttl.Len() == 0
-			s.mu.Unlock()
+			c.flushPendingCallbacks(s)
 
 			if removed == 0 && heapEmpty {
 				idle++
