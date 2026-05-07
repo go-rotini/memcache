@@ -16,8 +16,9 @@
 //
 // Numbers are platform-dependent; the assertions in the
 // TestPerfTargetsBaseline test below confirm we're within an order
-// of magnitude of the spec targets, which is the strict guarantee
-// — exact numbers belong in testdata/benchmarks/ baseline CSVs.
+// of magnitude of the spec targets, which is the strict guarantee.
+// Capture exact numbers via `make test-bench` if you need to
+// compare across platforms or versions.
 
 package memcache
 

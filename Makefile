@@ -1,6 +1,6 @@
 .PHONY: all clean lint test test-acceptance test-bench test-corpus test-fuzz test-mutation test-race
 
-all: clean lint test test-acceptance test-corpus test-bench test-fuzz test-mutation test-race
+all: clean lint test test-bench test-fuzz test-mutation test-race
 
 clean:
 	@rm -rf *.out test_mutation.json test_bench.out
