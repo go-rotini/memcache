@@ -2,7 +2,7 @@
 
 A bounded, generic, thread-safe in-memory cache for long-running Go programs (REPLs, daemons, watch-mode CLIs).
 
-Used as the default caching package for [rotini](https://github.com/go-rotini/rotini).
+This package is used as the default in-memory cache package for [rotini](https://github.com/go-rotini/rotini).
 
 ## Features
 
@@ -29,7 +29,7 @@ Used as the default caching package for [rotini](https://github.com/go-rotini/ro
 go get github.com/go-rotini/memcache
 ```
 
-Requires Go 1.23 or later (Go 1.26 recommended).
+Requires Go 1.26 or later.
 
 ## Quick Start
 
@@ -128,20 +128,20 @@ token, err := cache.GetOrLoad(ctx, "token")
 
 ## Documentation
 
-Full API reference: [pkg.go.dev/github.com/go-rotini/memcache](https://pkg.go.dev/github.com/go-rotini/memcache)
+Full API reference is available on [pkg.go.dev](https://pkg.go.dev/github.com/go-rotini/memcache).
 
 ## Contributing
 
-See [CONTRIBUTING.md](CONTRIBUTING.md).
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines on how to contribute to this project.
 
 ## Code of Conduct
 
-See [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+This project follows a code of conduct to ensure a welcoming community. See [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
 
 ## Security
 
-See [SECURITY.md](SECURITY.md).
+To report a vulnerability, see [SECURITY.md](SECURITY.md).
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
