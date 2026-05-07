@@ -29,10 +29,10 @@ test-corpus:
 	@go tool cover -func=test_corpus.out
 
 test-fuzz:
-	@go test -fuzz=FuzzCacheOps -fuzztime=60s ./...
-	@go test -fuzz=FuzzSnapshot -fuzztime=60s ./...
-	@go test -fuzz=FuzzLoader -fuzztime=60s ./...
-	@go test -fuzz=FuzzKeyHash -fuzztime=30s ./...
+	@go test -fuzz=FuzzCacheOps -fuzztime=60s -run=^$$ .
+	@go test -fuzz=FuzzSnapshot -fuzztime=60s -run=^$$ .
+	@go test -fuzz=FuzzLoader -fuzztime=60s -run=^$$ .
+	@go test -fuzz=FuzzKeyHash -fuzztime=30s -run=^$$ .
 
 test-mutation:
 	@go tool github.com/go-gremlins/gremlins/cmd/gremlins unleash --config .gremlins.yaml

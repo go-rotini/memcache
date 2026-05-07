@@ -177,11 +177,15 @@ func (p *s3fifoPolicy[K, V]) OnRemove(e *entry[K, V]) {
 // budget, so internal rotations that don't yield an eviction simply
 // continue the loop here.
 func (p *s3fifoPolicy[K, V]) Victim() *entry[K, V] {
-	// Up to (smallSize + mainSize + 1) iterations bounds the
-	// promotion/demotion cycles; in practice each call returns
-	// quickly. The outer loop guards against pathological cases
-	// where every Small head promotes to Main.
-	for range p.smallSize + p.mainSize + 1 {
+	// Bound the loop by the worst-case rotation count: each Main
+	// entry can require up to (s3FreqMax + 1) decrement-and-rotate
+	// passes before its freq reaches zero, and Small can promote
+	// every entry into Main once. A tighter bound (smallSize+mainSize+1)
+	// can exit early with both queues still over budget when freqs
+	// are saturated, which previously fell through to the defensive
+	// fallback and evicted the wrong queue.
+	maxRotations := (p.smallSize+p.mainSize)*(int(s3FreqMax)+1) + 1
+	for range maxRotations {
 		if p.smallSize > p.smallBudget && p.smallHead != nil {
 			n := p.smallHead
 			if n.freq.Load() >= 1 {
@@ -213,7 +217,15 @@ func (p *s3fifoPolicy[K, V]) Victim() *entry[K, V] {
 		return nil
 	}
 	// Defensive fallback: if we somehow looped without returning,
-	// pick whichever queue has an entry (oldest from Small first).
+	// pick from whichever queue is actually over budget. Evicting
+	// from an at-budget Small (the default before this fix) can
+	// drop a freshly inserted entry while the over-budget Main is
+	// the real culprit.
+	if p.mainSize > p.mainBudget && p.mainHead != nil {
+		n := p.mainHead
+		p.unlinkMain(n)
+		return n.entry
+	}
 	if p.smallHead != nil {
 		n := p.smallHead
 		p.unlinkSmall(n)

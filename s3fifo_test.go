@@ -296,3 +296,59 @@ func TestS3FIFOVictimMainSecondChance(t *testing.T) {
 		v.policyData = nil
 	}
 }
+
+// TestS3FIFO_SetMustNotEvictItself is a minimized regression for the
+// fuzz failure originally surfaced by FuzzCacheOps seed
+// testdata/fuzz/FuzzCacheOps/a822e908b2cd2d00:
+//
+//	fuzz_test.go:45: Set(48, 90) -> Get = (0, false)
+//
+// With WithMaxEntries(8) + WithShards(1) the per-shard budget is 9
+// (8 plus the 10% slop in perShardBudget). S3-FIFO splits that into
+// smallBudget=1 / mainBudget=8. After the trace below the Main queue
+// holds 9 entries with mostly-saturated frequencies; the final Set
+// lands the new key in Small. evictWhileOverBudgetLocked then calls
+// Victim, whose rotation loop must give Main enough decrement-and-
+// rotate passes to drive a head's freq to zero. Pre-fix the loop
+// bound (smallSize+mainSize+1) ran out first and the defensive
+// fallback evicted smallHead - i.e. the entry Set had just inserted.
+//
+// Encoding mirrors fuzz_test.go: 0=Set+Get, 1=Get, 6=SetIfAbsent,
+// 7=DeleteIf(true). val=byte(2*step).
+func TestS3FIFO_SetMustNotEvictItself(t *testing.T) {
+	c, err := New[byte, byte](WithMaxEntries(8), WithShards(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	type op struct{ kind, key, val byte }
+	ops := []op{
+		{0, 49, 2}, {0, 50, 4}, {0, 55, 6}, {0, 56, 8}, {0, 57, 10},
+		{0, 65, 12}, {6, 66, 14}, {0, 67, 16}, {0, 89, 18}, {6, 90, 20},
+		{0, 57, 22}, {0, 65, 24}, {0, 66, 26}, {0, 48, 28}, {0, 49, 30},
+		{0, 50, 32}, {6, 55, 34}, {1, 48, 36}, {0, 50, 40}, {6, 88, 42},
+		{0, 56, 44}, {0, 97, 46}, {0, 66, 54}, {0, 49, 56}, {0, 55, 58},
+		{0, 67, 60}, {6, 56, 62}, {0, 90, 64}, {0, 55, 68}, {0, 57, 70},
+		{0, 67, 72}, {0, 49, 74}, {0, 88, 78}, {0, 48, 82}, {7, 48, 84},
+		{0, 56, 86}, {0, 50, 88}, {0, 48, 90},
+	}
+	for i, o := range ops {
+		switch o.kind {
+		case 0: // Set then immediate Get round-trip
+			if err := c.Set(o.key, o.val); err != nil {
+				t.Fatalf("step %d Set(%d,%d): %v", i, o.key, o.val, err)
+			}
+			if got, ok := c.Get(o.key); !ok || got != o.val {
+				t.Fatalf("step %d: Set(%d, %d) -> Get = (%d, %v)",
+					i, o.key, o.val, got, ok)
+			}
+		case 1:
+			_, _ = c.Get(o.key)
+		case 6:
+			_, _ = c.SetIfAbsent(o.key, o.val)
+		case 7:
+			_ = c.DeleteIf(o.key, func(byte) bool { return true })
+		}
+	}
+}
