@@ -462,3 +462,26 @@ func TestCacheTagTemplate_AutoTagsOnSet(t *testing.T) {
 		t.Errorf("InvalidateTag(user-42) = %d, want 1", dropped)
 	}
 }
+
+// TestSetTagsEmptyDisablesAutoTags regression: SetTags() with no
+// arguments must mean "explicitly no tags" — overriding any
+// CacheTagger auto-tag derivation. Before the setConfig.hasTags
+// flag was added, an empty SetTags() left sc.tags == nil and
+// SetWithOptions fell through to deriveAutoTags(), silently
+// re-enabling the tagger.
+func TestSetTagsEmptyDisablesAutoTags(t *testing.T) {
+	c, _ := New[string, taggedValue](WithMaxEntries(4))
+	defer c.Close()
+	_ = c.SetWithOptions("k",
+		taggedValue{tags: []string{"auto-a", "auto-b"}},
+		SetTags(), // explicit "no tags"
+	)
+	got := c.Tags("k")
+	if got != nil {
+		t.Errorf("SetTags() with no args should suppress auto-tags; got %v", got)
+	}
+	// Confirm the auto-tags are NOT in the index either.
+	if n := c.InvalidateTag("auto-a"); n != 0 {
+		t.Errorf("InvalidateTag(auto-a) = %d, want 0", n)
+	}
+}

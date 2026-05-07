@@ -34,17 +34,21 @@ invalidation, snapshot persistence, and tiered composition.
 - **Negative caching**: `WithNegativeCache(ttl)` converts loader
   `ErrNotFound` into a tombstone for the configured duration.
 - **Tag-based invalidation**: `SetWithTags`, `Tags`, `InvalidateTag`,
-  `InvalidateAnyTag`, `InvalidateAllTags`. Tag indexes survive
-  Save/Load and are rebuilt eagerly during the load.
-- **Groups & bulk ops**: `WithGroup(name, budget)` enforces per-group
-  budgets independent of the cache-wide budget. `GetMulti`, `SetMulti`,
-  `DeleteMulti` for batched amortized-lock operations.
+  `InvalidateTags`. Tag indexes survive Save/Load and are rebuilt
+  during load.
+- **Groups & bulk ops**: `WithGroup(name, capacity)` enforces per-group
+  capacity bounds independent of the cache-wide bound. `GetMulti`,
+  `SetMulti`, `DeleteMulti`, `GetMultiOrLoad` for batched ops.
 - **Stats, events, hooks**: `Stats()` returns per-cache counters
-  (Hits, Misses, Evictions, Inserts, Updates, LoadCalls, EventsDropped,
-  L2Hits when tiered). `Subscribe(buffer, kinds...)` returns a
-  channel that fans out `EventInsert | EventUpdate | EventEvict |
-  EventExpire | EventDelete | EventClear`. `WithOnEvict(...)`,
-  `WithOnInsert(...)`, `WithOnEvent(...)` for synchronous hooks.
+  (Hits, Misses, Evictions, Inserts, Updates, LoadsTotal,
+  LoadCoalesced, EventsDropped, …). `Subscribe(buffer, kinds...)`
+  returns a channel that fans out `EventInsert | EventUpdate |
+  EventEvict | EventExpire | EventLoad | EventLoadError |
+  EventLoadTimeout | EventLoadRateLimited | EventInvalidateTag |
+  EventResize | EventSnapshot`. `WithOnHit`, `WithOnMiss`,
+  `WithOnEvict`, `WithOnExpire`, `WithOnLoad` for
+  synchronous hooks. `Tiered` exposes `TieredStats` (per-tier
+  Stats + L1Hits / L2Hits / Misses / Promotions).
 - **Snapshot & restore**: `Save(io.Writer)` / `Load(io.Reader)`
   with the v2 framed format (RTNI magic + version + codec + name
   + metadata + per-entry records + CRC32-Castagnoli trailer).
@@ -160,10 +164,11 @@ path enabled). `WithLockFreeRead()` reduces Get from ~58 ns/op to
 ~21 ns/op when stats are disabled — the structural improvement
 the gate intended to drive.
 - **Concurrency limits**: `WithMaxConcurrentLoads(n)` semaphore;
-  `WithLoadRateLimit(rps, burst)` token bucket.
+  `WithLoaderRateLimit(perSecond)` token bucket;
+  `WithLoaderTimeout(d)` per-call deadline.
 - **Determinism for tests**: `WithClock(Clock)` + `NewFakeClock(...)`
   for deterministic TTL exercises without `time.Sleep`.
-- **Test scaffolding**: 13 godoc `Example` tests, 7 acceptance
+- **Test scaffolding**: 14 godoc `Example` tests, 7 acceptance
   scenarios (REPL warm restart, token refresh, fsnotify-style
   invalidation, 1000-goroutine stampede, daemon snapshot rotation,
   negative cache, tiered warm pool), 9 benchmarks, 4 fuzz targets,

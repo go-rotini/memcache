@@ -408,3 +408,42 @@ func TestTagsConcurrencyStress(t *testing.T) {
 	stop.Store(true)
 	wg.Wait()
 }
+
+// TestValidateTagLimitsDeduplicatesPerEntryCount regression: the
+// per-entry tag cap and the cache-wide tag cap must agree on what
+// counts as "distinct." A caller passing the same tag multiple
+// times should not bust the per-entry cap.
+func TestValidateTagLimitsDeduplicatesPerEntryCount(t *testing.T) {
+	c, _ := New[string, int](
+		WithMaxEntries(8),
+		WithMaxTagsPerEntry(1),
+	)
+	defer c.Close()
+	if err := c.SetWithTags("k", 1, "g", "g", "g"); err != nil {
+		t.Fatalf("SetWithTags with 3 duplicates of one tag = %v, want nil", err)
+	}
+	if got := c.Tags("k"); len(got) != 3 {
+		// Note: dedupe applies only to the limit check; the entry
+		// retains the raw tag list as supplied by the caller.
+		// This test documents that distinction.
+		t.Logf("Tags(k) = %v (raw, not deduped — only the limit checks are deduped)", got)
+	}
+}
+
+func TestValidateTagLimitsDeduplicatesAcrossTotal(t *testing.T) {
+	c, _ := New[string, int](
+		WithMaxEntries(8),
+		WithMaxTagsTotal(2),
+	)
+	defer c.Close()
+	// First entry establishes "tag-a".
+	if err := c.SetWithTags("k1", 1, "tag-a"); err != nil {
+		t.Fatalf("SetWithTags(tag-a) = %v", err)
+	}
+	// Three duplicates of a NEW tag should count as 1 new tag,
+	// not 3, against the cache-wide limit of 2.
+	if err := c.SetWithTags("k2", 2, "tag-b", "tag-b", "tag-b"); err != nil {
+		t.Errorf("SetWithTags with 3 duplicates of one new tag = %v, want nil "+
+			"(should count as +1 against MaxTagsTotal=2)", err)
+	}
+}

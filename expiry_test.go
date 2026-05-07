@@ -364,3 +364,46 @@ func TestJanitorConcurrentSetGet(t *testing.T) {
 	close(stop)
 	wg.Wait()
 }
+
+// TestExpireFuncHonoredBySetIfAbsent regression: SetIfAbsent and
+// PeekOrAdd previously checked entry.expired(now) (TTL only),
+// bypassing WithExpireFunc. A custom expire predicate's "this
+// entry is stale" verdict was silently ignored on those paths.
+func TestExpireFuncHonoredBySetIfAbsent(t *testing.T) {
+	c, _ := New[string, int](
+		WithMaxEntries(8),
+		WithExpireFunc(func(string, int, Metadata) bool { return true }),
+	)
+	defer c.Close()
+	_ = c.Set("k", 1)
+	// ExpireFunc returns true → entry is expired by user policy
+	// → SetIfAbsent should INSERT (overwrite the stale entry).
+	stored, err := c.SetIfAbsent("k", 2)
+	if err != nil {
+		t.Fatalf("SetIfAbsent: %v", err)
+	}
+	if !stored {
+		t.Error("SetIfAbsent should insert when ExpireFunc says existing entry is expired")
+	}
+}
+
+func TestExpireFuncHonoredByPeekOrAdd(t *testing.T) {
+	c, _ := New[string, int](
+		WithMaxEntries(8),
+		WithExpireFunc(func(string, int, Metadata) bool { return true }),
+	)
+	defer c.Close()
+	_ = c.Set("k", 1)
+	// ExpireFunc says expired → PeekOrAdd should NOT return the
+	// stale value; it should add the new one.
+	got, loaded, err := c.PeekOrAdd("k", 99)
+	if err != nil {
+		t.Fatalf("PeekOrAdd: %v", err)
+	}
+	if loaded {
+		t.Error("PeekOrAdd should treat ExpireFunc-expired entry as absent")
+	}
+	if got != 99 {
+		t.Errorf("PeekOrAdd value = %d, want 99 (the freshly inserted value)", got)
+	}
+}

@@ -2195,7 +2195,7 @@ func (c *Cache[K, V]) SetIfAbsent(key K, value V) (bool, error) {
 	now := c.cfg.clock.Now().UnixNano()
 	s.mu.Lock()
 	defer c.unlockShard(s)
-	if existing, ok := s.storage.get(key); ok && !existing.expired(now) && !existing.flags.has(flagNegative) {
+	if existing, ok := s.storage.get(key); ok && !c.entryExpiredLocked(existing, now) && !existing.flags.has(flagNegative) {
 		return false, nil
 	}
 	c.upsertLocked(s, key, value, weight,
@@ -2325,7 +2325,7 @@ func (c *Cache[K, V]) PeekOrAdd(key K, value V) (V, bool, error) {
 	now := c.cfg.clock.Now().UnixNano()
 	s.mu.Lock()
 	defer c.unlockShard(s)
-	if existing, ok := s.storage.get(key); ok && !existing.expired(now) && !existing.flags.has(flagNegative) {
+	if existing, ok := s.storage.get(key); ok && !c.entryExpiredLocked(existing, now) && !existing.flags.has(flagNegative) {
 		// Peek semantics: do NOT call OnAccess and do not bump hits.
 		return c.returnValue(existing.loadValue()), true, nil
 	}

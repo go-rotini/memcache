@@ -68,6 +68,6 @@
 //	if errors.Is(err, memcache.ErrNotFound) { ... }
 //	if errors.Is(err, memcache.ErrClosed) { ... }
 //
-// See [SyntaxError], [CapacityError], [LoadError], [SnapshotError], and the
-// full error type list in errors.go.
+// See [ConfigError], [CapacityError], [LoadError], [SnapshotError],
+// [CodecError], and the full error type list in errors.go.
 package memcache
