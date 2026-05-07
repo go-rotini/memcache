@@ -290,7 +290,7 @@ func TestMustReturnsCache(t *testing.T) {
 func TestWithWeigherCountsBytes(t *testing.T) {
 	c, err := New[string, string](
 		WithMaxBytes(100),
-		WithWeigher[string](StringWeigher()),
+		WithWeigher(StringWeigher()),
 	)
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -626,7 +626,7 @@ func TestSetWithOptionsExpireAt(t *testing.T) {
 func TestSetWithOptionsExplicitWeight(t *testing.T) {
 	c, _ := New[string, []byte](
 		WithMaxBytes(1024),
-		WithWeigher[[]byte](BytesWeigher()),
+		WithWeigher(BytesWeigher()),
 	)
 	defer c.Close()
 	// Explicit weight ignores Weigher: store a 5-byte slice as weight=99.

@@ -248,7 +248,7 @@ func TestNewRejectsTypeMismatchedWeigher(t *testing.T) {
 	// Weigher[int] paired with V=string is a type mismatch.
 	_, err := New[string, string](
 		WithMaxBytes(1024),
-		WithWeigher[int](func(int) int64 { return 1 }),
+		WithWeigher(func(int) int64 { return 1 }),
 	)
 	var ce *ConfigError
 	if !asError(err, &ce) || ce.Field != "Weigher" {

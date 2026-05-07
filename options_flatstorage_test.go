@@ -118,7 +118,7 @@ func TestFlatStorageStatsCompactionsRisesAfterChurn(t *testing.T) {
 	}
 
 	// Insert enough to trigger at least one grow.
-	for i := 0; i < 256; i++ {
+	for i := range 256 {
 		_ = c.Set(fmt.Sprintf("k%d", i), i)
 	}
 	if got := c.Stats().Compactions; got == 0 {
@@ -128,7 +128,7 @@ func TestFlatStorageStatsCompactionsRisesAfterChurn(t *testing.T) {
 	// Re-insert/delete pattern to trigger a tombstone-driven
 	// compaction.
 	prev := c.Stats().Compactions
-	for i := 0; i < 256; i++ {
+	for i := range 256 {
 		_ = c.Delete(fmt.Sprintf("k%d", i))
 	}
 	if got := c.Stats().Compactions; got <= prev {
@@ -144,10 +144,10 @@ func TestFlatStorageStatsCompactionsZeroForMapStorage(t *testing.T) {
 	)
 	defer c.Close()
 
-	for i := 0; i < 256; i++ {
+	for i := range 256 {
 		_ = c.Set(fmt.Sprintf("k%d", i), i)
 	}
-	for i := 0; i < 256; i++ {
+	for i := range 256 {
 		_ = c.Delete(fmt.Sprintf("k%d", i))
 	}
 	if got := c.Stats().Compactions; got != 0 {
@@ -165,7 +165,7 @@ func TestFlatStorageRespectsMaxEntries(t *testing.T) {
 	)
 	defer c.Close()
 
-	for i := 0; i < 256; i++ {
+	for i := range 256 {
 		_ = c.Set(fmt.Sprintf("k%d", i), i)
 	}
 	// LRU with a 32-entry budget should stay near the budget; the
@@ -183,7 +183,7 @@ func TestFlatStorageSnapshotRoundTrip(t *testing.T) {
 	)
 	defer c.Close()
 
-	for i := 0; i < 16; i++ {
+	for i := range 16 {
 		_ = c.Set(fmt.Sprintf("k%d", i), i)
 	}
 
@@ -201,7 +201,7 @@ func TestFlatStorageSnapshotRoundTrip(t *testing.T) {
 	if _, err := c2.Load(&buf); err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	for i := 0; i < 16; i++ {
+	for i := range 16 {
 		k := fmt.Sprintf("k%d", i)
 		if got, ok := c2.Get(k); !ok || got != i {
 			t.Errorf("after Load: Get(%s) = (%d, %v), want (%d, true)", k, got, ok, i)
@@ -222,10 +222,10 @@ func TestFlatStorageConcurrentSetGet(t *testing.T) {
 
 	var wg sync.WaitGroup
 	wg.Add(goroutines)
-	for g := 0; g < goroutines; g++ {
+	for g := range goroutines {
 		go func() {
 			defer wg.Done()
-			for i := 0; i < opsPerG; i++ {
+			for i := range opsPerG {
 				k := fmt.Sprintf("g%d-k%d", g, i)
 				_ = c.Set(k, g*1000+i)
 				if got, ok := c.Get(k); !ok || got != g*1000+i {

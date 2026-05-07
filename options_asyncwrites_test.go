@@ -51,7 +51,7 @@ func TestAsyncWritesCoalescesRepeatedSetsOnSameKey(t *testing.T) {
 	)
 	defer c.Close()
 
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		_ = c.Set("k", i)
 	}
 	if got, ok := c.Get("k"); !ok || got != 99 {
@@ -67,7 +67,7 @@ func TestAsyncWritesSyncDrainsPending(t *testing.T) {
 	)
 	defer c.Close()
 
-	for i := 0; i < 32; i++ {
+	for i := range 32 {
 		_ = c.Set(fmt.Sprintf("k%d", i), i)
 	}
 	if err := c.Sync(context.Background()); err != nil {
@@ -77,7 +77,7 @@ func TestAsyncWritesSyncDrainsPending(t *testing.T) {
 		t.Errorf("asyncBacklog after Sync = %d, want 0", got)
 	}
 	// After Sync, every entry should be in storage (not pending).
-	for i := 0; i < 32; i++ {
+	for i := range 32 {
 		k := fmt.Sprintf("k%d", i)
 		s := c.shardFor(k)
 		s.mu.RLock()
@@ -99,7 +99,7 @@ func TestAsyncWritesCloseDrainsPending(t *testing.T) {
 		WithShards(2),
 		WithAsyncWrites(),
 	)
-	for i := 0; i < 32; i++ {
+	for i := range 32 {
 		_ = c.Set(fmt.Sprintf("k%d", i), i)
 	}
 	if err := c.Close(); err != nil {
@@ -140,10 +140,10 @@ func TestAsyncWritesSetWithTTLHonorsTTLAfterApply(t *testing.T) {
 
 func TestAsyncWritesPropagatesToStore(t *testing.T) {
 	inner := NewMemoryStore[string, int](nil)
-	store := newTrackingStore[string, int](inner)
+	store := newTrackingStore(inner)
 	c, _ := New[string, int](
 		WithMaxEntries(64),
-		WithStore[string, int](store),
+		WithStore(store),
 		WithAsyncWrites(),
 	)
 	defer c.Close()
@@ -166,14 +166,14 @@ func TestAsyncWritesStoreErrorDoesNotBlockCaller(t *testing.T) {
 	// With async writes on, a Store failure during apply must not
 	// propagate back to the caller; it is logged.
 	inner := NewMemoryStore[string, int](nil)
-	store := newTrackingStore[string, int](inner)
+	store := newTrackingStore(inner)
 
 	failure := errors.New("simulated store failure")
 	store.failNextSet.Store(&failure)
 
 	c, _ := New[string, int](
 		WithMaxEntries(64),
-		WithStore[string, int](store),
+		WithStore(store),
 		WithAsyncWrites(),
 	)
 	defer c.Close()
@@ -248,10 +248,10 @@ func TestAsyncWritesConcurrentSetGetUnderRace(t *testing.T) {
 
 	var wg sync.WaitGroup
 	wg.Add(goroutines)
-	for g := 0; g < goroutines; g++ {
+	for g := range goroutines {
 		go func() {
 			defer wg.Done()
-			for i := 0; i < opsPerG; i++ {
+			for i := range opsPerG {
 				k := fmt.Sprintf("g%d-k%d", g, i)
 				_ = c.Set(k, g*1000+i)
 				if got, ok := c.Get(k); !ok || got != g*1000+i {

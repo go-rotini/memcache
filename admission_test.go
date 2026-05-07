@@ -15,7 +15,7 @@ func TestAdmitAlways(t *testing.T) {
 }
 
 func TestDoorkeeperRejectsFirstSeen(t *testing.T) {
-	d := NewDoorkeeper[string](64, defaultHasher[string]())
+	d := NewDoorkeeper(64, defaultHasher[string]())
 	if d.Admit("k") {
 		t.Error("first Admit should be false (key not yet observed)")
 	}
@@ -26,7 +26,7 @@ func TestDoorkeeperRejectsFirstSeen(t *testing.T) {
 }
 
 func TestDoorkeeperResetClears(t *testing.T) {
-	d := NewDoorkeeper[string](64, defaultHasher[string]())
+	d := NewDoorkeeper(64, defaultHasher[string]())
 	d.Observe("k")
 	if !d.Admit("k") {
 		t.Fatal("Admit before Reset should succeed")
@@ -98,7 +98,7 @@ func TestWithAdmissionPolicy_CustomRejectAll(t *testing.T) {
 	policy := &rejectAll[string]{}
 	c, _ := New[string, int](
 		WithMaxEntries(8),
-		WithAdmissionPolicy[string](policy),
+		WithAdmissionPolicy(policy),
 	)
 	defer c.Close()
 

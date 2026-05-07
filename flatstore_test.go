@@ -11,7 +11,7 @@ func stubHasher(s string) uint64 {
 	const fnvPrime = 1099511628211
 	const fnvOffset = 14695981039346656037
 	h := uint64(fnvOffset)
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		h ^= uint64(s[i])
 		h *= fnvPrime
 	}
@@ -173,7 +173,7 @@ func TestFlatStoreEachSkipsTombstones(t *testing.T) {
 
 func TestFlatStoreClearAllResetsState(t *testing.T) {
 	fs := newFlatStore[string, int](stubHasher, 16)
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		k := fmt.Sprintf("k%d", i)
 		fs.set(k, mkEntry(k, i))
 	}
@@ -199,7 +199,7 @@ func TestFlatStoreGrowsWhenLoadFactorExceeded(t *testing.T) {
 	startCap := len(fs.slots)
 	startCompactions := fs.compactions()
 
-	for i := 0; i < 14; i++ {
+	for i := range 14 {
 		k := fmt.Sprintf("key-%d", i)
 		fs.set(k, mkEntry(k, i))
 	}
@@ -211,7 +211,7 @@ func TestFlatStoreGrowsWhenLoadFactorExceeded(t *testing.T) {
 	}
 
 	// All 14 keys must still be reachable.
-	for i := 0; i < 14; i++ {
+	for i := range 14 {
 		k := fmt.Sprintf("key-%d", i)
 		if got, ok := fs.get(k); !ok || got.loadValue() != i {
 			t.Errorf("key %q lost across grow: got=%+v ok=%v", k, got, ok)
@@ -222,14 +222,14 @@ func TestFlatStoreGrowsWhenLoadFactorExceeded(t *testing.T) {
 func TestFlatStoreCompactsAfterTombstoneAccumulation(t *testing.T) {
 	fs := newFlatStore[string, int](stubHasher, 16)
 	// Insert enough to get past the half-cap threshold.
-	for i := 0; i < 10; i++ {
+	for i := range 10 {
 		k := fmt.Sprintf("key-%d", i)
 		fs.set(k, mkEntry(k, i))
 	}
 	startCompactions := fs.compactions()
 
 	// Delete 8 to push tombstone fraction past 50% of cap.
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		fs.del(fmt.Sprintf("key-%d", i))
 	}
 
@@ -252,7 +252,7 @@ func TestFlatStoreCompactsAfterTombstoneAccumulation(t *testing.T) {
 
 func TestFlatStoreCompactionsIsIdempotentAfterClear(t *testing.T) {
 	fs := newFlatStore[string, int](stubHasher, 16)
-	for i := 0; i < 12; i++ {
+	for i := range 12 {
 		k := fmt.Sprintf("key-%d", i)
 		fs.set(k, mkEntry(k, i))
 	}
@@ -350,12 +350,12 @@ func TestFlatStoreCollidingKeysCoexist(t *testing.T) {
 	collide := func(string) uint64 { return 7 }
 	fs := newFlatStore[string, int](collide, 16)
 
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		k := fmt.Sprintf("k%d", i)
 		fs.set(k, mkEntry(k, i))
 	}
 
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		k := fmt.Sprintf("k%d", i)
 		got, ok := fs.get(k)
 		if !ok {

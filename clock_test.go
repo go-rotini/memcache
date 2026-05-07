@@ -133,12 +133,12 @@ func TestFakeClockConcurrent(t *testing.T) {
 	c := NewFakeClock(time.Unix(0, 0))
 	done := make(chan struct{})
 	go func() {
-		for i := 0; i < 100; i++ {
+		for range 100 {
 			_ = c.Now()
 		}
 		close(done)
 	}()
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		c.Advance(time.Millisecond)
 	}
 	<-done

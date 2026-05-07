@@ -43,7 +43,7 @@ func TestSipHash24DistinctKeys(t *testing.T) {
 }
 
 func TestMixUint64Avalanche(t *testing.T) {
-	for i := uint64(0); i < 100; i++ {
+	for i := range uint64(100) {
 		a := MixUint64(i)
 		b := MixUint64(i + 1)
 		// Hamming distance between a and b should be > 8 (out of 64).

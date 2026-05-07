@@ -46,7 +46,7 @@ func TestGetOrLoadFastHit(t *testing.T) {
 	loader := &countingLoader{value: 1}
 	c, _ := New[string, int](
 		WithMaxEntries(8),
-		WithLoader[string, int](loader),
+		WithLoader(loader),
 	)
 	defer c.Close()
 	_ = c.Set("k", 99) // pre-populate; loader should NOT fire
@@ -63,7 +63,7 @@ func TestGetOrLoadInvokesLoader(t *testing.T) {
 	loader := &countingLoader{value: 42}
 	c, _ := New[string, int](
 		WithMaxEntries(8),
-		WithLoader[string, int](loader),
+		WithLoader(loader),
 	)
 	defer c.Close()
 	v, err := c.GetOrLoad(context.Background(), "k")
@@ -111,7 +111,7 @@ func TestStampede1000Goroutines(t *testing.T) {
 	loader := &countingLoader{value: 42, holdCh: hold}
 	c, _ := New[string, int](
 		WithMaxEntries(8),
-		WithLoader[string, int](loader),
+		WithLoader(loader),
 	)
 	defer c.Close()
 
@@ -164,7 +164,7 @@ func TestCtxAggregationCancelsLoaderWhenAllCancel(t *testing.T) {
 	})
 	c, _ := New[string, int](
 		WithMaxEntries(4),
-		WithLoader[string, int](loader),
+		WithLoader(loader),
 	)
 	defer c.Close()
 
@@ -220,7 +220,7 @@ func TestCtxPartialCancelKeepsLoaderRunning(t *testing.T) {
 	})
 	c, _ := New[string, int](
 		WithMaxEntries(4),
-		WithLoader[string, int](loader),
+		WithLoader(loader),
 	)
 	defer c.Close()
 
@@ -252,7 +252,7 @@ func TestGetOrLoadCtxCancelDoesNotAbortLoader(t *testing.T) {
 	loader := &countingLoader{value: 1, holdCh: hold}
 	c, _ := New[string, int](
 		WithMaxEntries(4),
-		WithLoader[string, int](loader),
+		WithLoader(loader),
 	)
 	defer c.Close()
 
@@ -290,7 +290,7 @@ func TestGetOrLoadLoaderTimeout(t *testing.T) {
 	}
 	c, _ := New[string, int](
 		WithMaxEntries(4),
-		WithLoader[string, int](loader),
+		WithLoader(loader),
 		WithLoaderTimeout(10*time.Millisecond),
 	)
 	defer c.Close()
@@ -304,7 +304,7 @@ func TestGetOrLoadNegativeCache(t *testing.T) {
 	loader := &countingLoader{err: ErrNotFound}
 	c, _ := New[string, int](
 		WithMaxEntries(4),
-		WithLoader[string, int](loader),
+		WithLoader(loader),
 		WithNegativeCache(time.Hour),
 	)
 	defer c.Close()
@@ -332,7 +332,7 @@ func TestGetOrLoadErrorTTL(t *testing.T) {
 	loader := &countingLoader{err: boom}
 	c, _ := New[string, int](
 		WithMaxEntries(4),
-		WithLoader[string, int](loader),
+		WithLoader(loader),
 		WithErrorTTL(time.Hour),
 	)
 	defer c.Close()
@@ -360,7 +360,7 @@ func TestGetOrLoadErrorTTLDoesNotCacheNotFound(t *testing.T) {
 	loader := &countingLoader{err: ErrNotFound}
 	c, _ := New[string, int](
 		WithMaxEntries(4),
-		WithLoader[string, int](loader),
+		WithLoader(loader),
 		WithErrorTTL(time.Hour), // no WithNegativeCache
 	)
 	defer c.Close()
@@ -380,7 +380,7 @@ func TestRefresh(t *testing.T) {
 	})
 	c, _ := New[string, int](
 		WithMaxEntries(4),
-		WithLoader[string, int](loader),
+		WithLoader(loader),
 	)
 	defer c.Close()
 
@@ -421,7 +421,7 @@ func TestRefreshAll(t *testing.T) {
 	})
 	c, _ := New[string, int](
 		WithMaxEntries(8),
-		WithLoader[string, int](loader),
+		WithLoader(loader),
 	)
 	defer c.Close()
 
@@ -455,7 +455,7 @@ func TestRefreshAhead(t *testing.T) {
 	c, _ := New[string, int](
 		WithMaxEntries(4),
 		WithClock(clk),
-		WithLoader[string, int](loader),
+		WithLoader(loader),
 		WithRefreshAhead(0.5), // refresh after 50% of TTL
 		WithJanitorInterval(time.Hour),
 	)
@@ -493,7 +493,7 @@ func TestStaleWhileRevalidate(t *testing.T) {
 	c, _ := New[string, int](
 		WithMaxEntries(4),
 		WithClock(clk),
-		WithLoader[string, int](loader),
+		WithLoader(loader),
 		WithStaleWhileRevalidate(time.Hour),
 		WithJanitorInterval(time.Hour),
 	)
@@ -526,7 +526,7 @@ func TestSWRBeyondStaleForNotServed(t *testing.T) {
 	c, _ := New[string, int](
 		WithMaxEntries(4),
 		WithClock(clk),
-		WithLoader[string, int](loader),
+		WithLoader(loader),
 		WithStaleWhileRevalidate(50*time.Millisecond),
 		WithJanitorInterval(time.Hour),
 	)
@@ -549,7 +549,7 @@ func TestNegativeCacheRespected(t *testing.T) {
 	loader := &countingLoader{err: ErrNotFound}
 	c2, _ := New[string, int](
 		WithMaxEntries(4),
-		WithLoader[string, int](loader),
+		WithLoader(loader),
 		WithNegativeCache(time.Hour),
 	)
 	defer c2.Close()
@@ -585,7 +585,7 @@ func TestGetMultiOrLoadHitsBypassLoader(t *testing.T) {
 	})
 	c, _ := New[string, int](
 		WithMaxEntries(8),
-		WithBulkLoader[string, int](bl),
+		WithBulkLoader(bl),
 	)
 	defer c.Close()
 	_ = c.Set("alice", 1)
@@ -617,7 +617,7 @@ func TestGetMultiOrLoadCoalescesMisses(t *testing.T) {
 	})
 	c, _ := New[string, int](
 		WithMaxEntries(8),
-		WithBulkLoader[string, int](bl),
+		WithBulkLoader(bl),
 	)
 	defer c.Close()
 	got, err := c.GetMultiOrLoad(context.Background(), []string{"alice", "bob", "carol"})
@@ -646,7 +646,7 @@ func TestGetMultiOrLoadFallsBackToSingleLoader(t *testing.T) {
 	// No WithBulkLoader → fall through to per-key Loader.
 	c, _ := New[string, int](
 		WithMaxEntries(8),
-		WithLoader[string, int](loader),
+		WithLoader(loader),
 	)
 	defer c.Close()
 	got, err := c.GetMultiOrLoad(context.Background(), []string{"alice", "bob"})
@@ -689,7 +689,7 @@ func TestLoaderRateLimitRejects(t *testing.T) {
 	c, _ := New[string, int](
 		WithMaxEntries(64),
 		WithClock(clk),
-		WithLoader[string, int](loader),
+		WithLoader(loader),
 		WithLoaderRateLimit(2), // 2 tokens/sec, bucket cap 2
 	)
 	defer c.Close()
@@ -715,7 +715,7 @@ func TestLoaderRateLimitRefillsOverTime(t *testing.T) {
 	c, _ := New[string, int](
 		WithMaxEntries(64),
 		WithClock(clk),
-		WithLoader[string, int](loader),
+		WithLoader(loader),
 		WithLoaderRateLimit(1),
 	)
 	defer c.Close()
@@ -745,7 +745,7 @@ func TestMaxConcurrentLoadsCaps(t *testing.T) {
 	})
 	c, _ := New[string, int](
 		WithMaxEntries(64),
-		WithLoader[string, int](loader),
+		WithLoader(loader),
 		WithMaxConcurrentLoads(2),
 		WithLoaderTimeout(50*time.Millisecond),
 	)
@@ -776,7 +776,7 @@ func TestLoaderFuncAdapter(t *testing.T) {
 	}
 	c, _ := New[string, int](
 		WithMaxEntries(4),
-		WithLoader[string, int](fn),
+		WithLoader(fn),
 	)
 	defer c.Close()
 	v, err := c.GetOrLoad(context.Background(), "hello")

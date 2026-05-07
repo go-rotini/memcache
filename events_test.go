@@ -184,7 +184,7 @@ func TestEventOnLoadSuccess(t *testing.T) {
 	loader := LoaderFunc[string, int](func(_ context.Context, _ string) (int, time.Duration, error) {
 		return 42, 0, nil
 	})
-	c, _ := New[string, int](WithMaxEntries(4), WithLoader[string, int](loader))
+	c, _ := New[string, int](WithMaxEntries(4), WithLoader(loader))
 	defer c.Close()
 	ch, cancel := c.Subscribe(4, EventLoad, EventLoadError)
 	defer cancel()
@@ -201,7 +201,7 @@ func TestEventOnLoadError(t *testing.T) {
 	loader := LoaderFunc[string, int](func(_ context.Context, _ string) (int, time.Duration, error) {
 		return 0, 0, boom
 	})
-	c, _ := New[string, int](WithMaxEntries(4), WithLoader[string, int](loader))
+	c, _ := New[string, int](WithMaxEntries(4), WithLoader(loader))
 	defer c.Close()
 	ch, cancel := c.Subscribe(4, EventLoadError)
 	defer cancel()
@@ -223,7 +223,7 @@ func TestEventOnLoadTimeout(t *testing.T) {
 	})
 	c, _ := New[string, int](
 		WithMaxEntries(4),
-		WithLoader[string, int](loader),
+		WithLoader(loader),
 		WithLoaderTimeout(20*time.Millisecond),
 	)
 	defer c.Close()
@@ -268,7 +268,7 @@ func TestHookOnMissFires(t *testing.T) {
 	misses := atomic.Int64{}
 	c, _ := New[string, int](
 		WithMaxEntries(4),
-		WithOnMiss[string](func(string) { misses.Add(1) }),
+		WithOnMiss(func(string) { misses.Add(1) }),
 	)
 	defer c.Close()
 	_, _ = c.Get("k") // miss
@@ -325,7 +325,7 @@ func TestHookOnLoadFires(t *testing.T) {
 	loaded := atomic.Int64{}
 	c, _ := New[string, int](
 		WithMaxEntries(4),
-		WithLoader[string, int](loader),
+		WithLoader(loader),
 		WithOnLoad(func(_ string, v int, _ time.Duration, err error) {
 			if err == nil && v == 7 {
 				loaded.Add(1)
@@ -374,7 +374,7 @@ func TestNegativeTombstoneSuppressesEvictEvent(t *testing.T) {
 	c, _ := New[string, int](
 		WithMaxEntries(4),
 		WithClock(clk),
-		WithLoader[string, int](loader),
+		WithLoader(loader),
 		WithNegativeCache(time.Second),
 		WithJanitorInterval(time.Hour),
 	)
@@ -405,7 +405,7 @@ func TestOnEvictCallbackCanReEnterCache(t *testing.T) {
 		WithMaxEntries(2),
 		WithShards(1),
 		WithPolicy(PolicyLRU),
-		WithOnEvict[string, int](func(string, int, EvictionReason) {
+		WithOnEvict(func(string, int, EvictionReason) {
 			_, _ = c.Get("a")
 			select {
 			case called <- struct{}{}:
@@ -418,7 +418,7 @@ func TestOnEvictCallbackCanReEnterCache(t *testing.T) {
 	// MaxEntries(2) with 1 shard yields a per-shard budget of
 	// 2 + 10% slop. Insert enough to push past the slop and
 	// trigger an eviction.
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		_ = c.Set("k"+intToStr(i), i)
 	}
 
@@ -451,7 +451,7 @@ func TestInvalidateTagFiresOnEvict(t *testing.T) {
 	got := make(chan EvictionReason, 4)
 	c, _ := New[string, int](
 		WithMaxEntries(8),
-		WithOnEvict[string, int](func(_ string, _ int, r EvictionReason) {
+		WithOnEvict(func(_ string, _ int, r EvictionReason) {
 			got <- r
 		}),
 	)
@@ -463,7 +463,7 @@ func TestInvalidateTagFiresOnEvict(t *testing.T) {
 		t.Fatalf("InvalidateTag = %d, want 2", removed)
 	}
 
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		select {
 		case r := <-got:
 			if r != EvictReasonTag {
@@ -479,7 +479,7 @@ func TestInvalidateTagsFiresOnEvict(t *testing.T) {
 	got := make(chan struct{}, 4)
 	c, _ := New[string, int](
 		WithMaxEntries(8),
-		WithOnEvict[string, int](func(string, int, EvictionReason) { got <- struct{}{} }),
+		WithOnEvict(func(string, int, EvictionReason) { got <- struct{}{} }),
 	)
 	defer c.Close()
 
@@ -488,7 +488,7 @@ func TestInvalidateTagsFiresOnEvict(t *testing.T) {
 	if removed := c.InvalidateTags("ta", "tb"); removed != 2 {
 		t.Fatalf("InvalidateTags = %d, want 2", removed)
 	}
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		select {
 		case <-got:
 		case <-time.After(time.Second):
@@ -502,7 +502,7 @@ func TestWithGroupShrinkFiresOnEvict(t *testing.T) {
 	c, _ := New[string, int](
 		WithMaxEntries(16),
 		WithGroup("group-a", 2),
-		WithOnEvict[string, int](func(string, int, EvictionReason) { got <- struct{}{} }),
+		WithOnEvict(func(string, int, EvictionReason) { got <- struct{}{} }),
 	)
 	defer c.Close()
 
@@ -531,7 +531,7 @@ func TestOnEvictCallbackCanReEnterCacheWithSet(t *testing.T) {
 		WithMaxEntries(2),
 		WithShards(1),
 		WithPolicy(PolicyLRU),
-		WithOnEvict[string, int](func(string, int, EvictionReason) {
+		WithOnEvict(func(string, int, EvictionReason) {
 			d := depth.Add(1)
 			if d > maxDepth {
 				return
@@ -546,7 +546,7 @@ func TestOnEvictCallbackCanReEnterCacheWithSet(t *testing.T) {
 	)
 	defer c.Close()
 
-	for i := 0; i < 6; i++ {
+	for i := range 6 {
 		_ = c.Set("k"+itoaSimple(i), i)
 	}
 	select {

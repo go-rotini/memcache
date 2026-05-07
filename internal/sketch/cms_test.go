@@ -10,7 +10,7 @@ func TestCountMinSketchBasic(t *testing.T) {
 		t.Fatal("freshly constructed sketch should report 0")
 	}
 
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		c.Increment(42)
 	}
 	if got := c.Estimate(42); got < 5 {
@@ -21,7 +21,7 @@ func TestCountMinSketchBasic(t *testing.T) {
 func TestCountMinSketchSaturation(t *testing.T) {
 	seeds := []uint64{1, 2, 3, 4}
 	c := New(64, seeds)
-	for i := 0; i < 100; i++ {
+	for range 100 {
 		c.Increment(7)
 	}
 	if got := c.Estimate(7); got != 15 {
@@ -32,7 +32,7 @@ func TestCountMinSketchSaturation(t *testing.T) {
 func TestCountMinSketchReset(t *testing.T) {
 	seeds := []uint64{1, 2, 3, 4}
 	c := New(64, seeds)
-	for i := 0; i < 10; i++ {
+	for range 10 {
 		c.Increment(99)
 	}
 	before := c.Estimate(99)
@@ -62,7 +62,7 @@ func TestCountMinSketchDistinctKeysIndependent(t *testing.T) {
 	c := New(2048, seeds)
 
 	const a, b = uint64(0xaaaa), uint64(0xbbbb)
-	for i := 0; i < 50; i++ {
+	for range 50 {
 		c.Increment(a)
 	}
 	bv := c.Estimate(b)

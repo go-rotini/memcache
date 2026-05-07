@@ -15,8 +15,8 @@ func BenchmarkGetHit(b *testing.B) {
 	c, _ := New[string, int](WithMaxEntries(1024))
 	defer c.Close()
 	_ = c.Set("k", 1)
-	b.ResetTimer()
-	for range b.N {
+
+	for b.Loop() {
 		_, _ = c.Get("k")
 	}
 }
@@ -24,8 +24,8 @@ func BenchmarkGetHit(b *testing.B) {
 func BenchmarkGetMiss(b *testing.B) {
 	c, _ := New[string, int](WithMaxEntries(1024))
 	defer c.Close()
-	b.ResetTimer()
-	for range b.N {
+
+	for b.Loop() {
 		_, _ = c.Get("nope")
 	}
 }
@@ -79,13 +79,13 @@ func BenchmarkGetOrLoad(b *testing.B) {
 	})
 	c, _ := New[string, int](
 		WithMaxEntries(1024),
-		WithLoader[string, int](loader),
+		WithLoader(loader),
 	)
 	defer c.Close()
 	_, _ = c.GetOrLoad(context.Background(), "k")
-	b.ResetTimer()
+
 	ctx := context.Background()
-	for range b.N {
+	for b.Loop() {
 		_, _ = c.GetOrLoad(ctx, "k") // always hot; singleflight not exercised
 	}
 }
@@ -137,8 +137,8 @@ func BenchmarkSnapshotSave(b *testing.B) {
 	}
 	buf := make([]byte, 0, 1<<20)
 	w := &writeOnlyBuffer{buf: buf}
-	b.ResetTimer()
-	for range b.N {
+
+	for b.Loop() {
 		w.buf = w.buf[:0]
 		if err := c.Save(w); err != nil {
 			b.Fatal(err)

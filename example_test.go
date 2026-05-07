@@ -77,7 +77,7 @@ func ExampleCache_GetOrLoad() {
 	)
 	c, _ := memcache.New[string, int](
 		memcache.WithMaxEntries(64),
-		memcache.WithLoader[string, int](loader),
+		memcache.WithLoader(loader),
 	)
 	defer c.Close()
 

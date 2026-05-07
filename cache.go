@@ -234,7 +234,7 @@ func build[K comparable, V any](cfg *config, allowUnbounded bool) (*Cache[K, V],
 	if err != nil {
 		return nil, err
 	}
-	admission, err := resolveAdmissionPolicy[K](cfg, hasher)
+	admission, err := resolveAdmissionPolicy(cfg, hasher)
 	if err != nil {
 		return nil, err
 	}
@@ -319,7 +319,7 @@ func (c *Cache[K, V]) maybeStartAsync(cfg *config) {
 	if !cfg.asyncWrites {
 		return
 	}
-	c.async = newAsyncWrites[K, V](c.shards)
+	c.async = newAsyncWrites(c.shards)
 	c.startAsyncApply()
 }
 

@@ -78,7 +78,7 @@ func TestWithCallbackTimeout_LogsWhenHookExceeds(t *testing.T) {
 		WithMaxEntries(8),
 		WithLogger(logger),
 		WithCallbackTimeout(20*time.Millisecond),
-		WithOnHit[string, int](func(string, int) {
+		WithOnHit(func(string, int) {
 			time.Sleep(80 * time.Millisecond)
 		}),
 	)
@@ -104,7 +104,7 @@ func TestWithCallbackTimeout_NoWarningWhenWithinBudget(t *testing.T) {
 		WithMaxEntries(8),
 		WithLogger(logger),
 		WithCallbackTimeout(time.Second),
-		WithOnHit[string, int](func(string, int) { called.Add(1) }),
+		WithOnHit(func(string, int) { called.Add(1) }),
 	)
 	defer c.Close()
 	_ = c.Set("k", 1)
@@ -121,7 +121,7 @@ func TestWithPurgeVisitor_FiresOnClear(t *testing.T) {
 	visited := map[string]int{}
 	c, _ := New[string, int](
 		WithMaxEntries(8),
-		WithPurgeVisitor[string, int](func(k string, v int) error {
+		WithPurgeVisitor(func(k string, v int) error {
 			visited[k] = v
 			return nil
 		}),
@@ -143,7 +143,7 @@ func TestWithPurgeVisitor_FiresOnClose(t *testing.T) {
 	visited := atomic.Int32{}
 	c, _ := New[string, int](
 		WithMaxEntries(8),
-		WithPurgeVisitor[string, int](func(string, int) error {
+		WithPurgeVisitor(func(string, int) error {
 			visited.Add(1)
 			return nil
 		}),
@@ -165,7 +165,7 @@ func TestWithPurgeVisitor_ErrorIsLogged(t *testing.T) {
 	c, _ := New[string, int](
 		WithMaxEntries(8),
 		WithLogger(logger),
-		WithPurgeVisitor[string, int](func(string, int) error {
+		WithPurgeVisitor(func(string, int) error {
 			return errors.New("disk full")
 		}),
 	)
@@ -180,7 +180,7 @@ func TestWithPurgeVisitor_ErrorIsLogged(t *testing.T) {
 func TestWithCopyOnGet_ReturnsIndependentCopy(t *testing.T) {
 	c, _ := New[string, []int](
 		WithMaxEntries(8),
-		WithCopyOnGet[[]int](func(s []int) []int {
+		WithCopyOnGet(func(s []int) []int {
 			out := make([]int, len(s))
 			copy(out, s)
 			return out
@@ -209,7 +209,7 @@ func TestWithCopyOnGet_NotAppliedOnPeekWhenAbsent(t *testing.T) {
 	calls := atomic.Int32{}
 	c, _ := New[string, int](
 		WithMaxEntries(8),
-		WithCopyOnGet[int](func(v int) int {
+		WithCopyOnGet(func(v int) int {
 			calls.Add(1)
 			return v
 		}),

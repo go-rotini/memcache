@@ -12,7 +12,7 @@ func TestInvalidationPublisher_FiresOnDelete(t *testing.T) {
 	var got []EvictionReason
 	c, _ := New[string, int](
 		WithMaxEntries(8),
-		WithInvalidationPublisher[string](func(_ string, r EvictionReason) {
+		WithInvalidationPublisher(func(_ string, r EvictionReason) {
 			mu.Lock()
 			defer mu.Unlock()
 			got = append(got, r)
@@ -34,7 +34,7 @@ func TestInvalidationPublisher_FiresOnEvict(t *testing.T) {
 	c, _ := New[string, int](
 		WithMaxEntries(2),
 		WithShards(1),
-		WithInvalidationPublisher[string](func(string, EvictionReason) {
+		WithInvalidationPublisher(func(string, EvictionReason) {
 			mu.Lock()
 			defer mu.Unlock()
 			count++
@@ -57,8 +57,8 @@ func TestInvalidationSubscriber_ReceivesAndDeletes(t *testing.T) {
 	publisherSeen := []EvictionReason{}
 	c, _ := New[string, int](
 		WithMaxEntries(8),
-		WithInvalidationSubscriber[string](ch),
-		WithInvalidationPublisher[string](func(_ string, r EvictionReason) {
+		WithInvalidationSubscriber(ch),
+		WithInvalidationPublisher(func(_ string, r EvictionReason) {
 			mu.Lock()
 			defer mu.Unlock()
 			publisherSeen = append(publisherSeen, r)
@@ -89,7 +89,7 @@ func TestInvalidationSubscriber_GoroutineExitsOnClose(t *testing.T) {
 	ch := make(chan string)
 	c, _ := New[string, int](
 		WithMaxEntries(8),
-		WithInvalidationSubscriber[string](ch),
+		WithInvalidationSubscriber(ch),
 	)
 	// Close must cause the subscriber goroutine to return; verify
 	// by confirming Close returns within a reasonable budget.

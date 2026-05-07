@@ -70,7 +70,7 @@ func TestWithStoreTypeMismatchReturnsConfigError(t *testing.T) {
 	store := NewMemoryStore[int, int](nil)
 	_, err := New[string, int](
 		WithMaxEntries(8),
-		WithStore[int, int](store),
+		WithStore(store),
 	)
 	if err == nil {
 		t.Fatal("expected ConfigError on K type mismatch")
@@ -83,11 +83,11 @@ func TestWithStoreTypeMismatchReturnsConfigError(t *testing.T) {
 
 func TestWithStoreSetWritesThroughToStore(t *testing.T) {
 	inner := NewMemoryStore[string, int](nil)
-	store := newTrackingStore[string, int](inner)
+	store := newTrackingStore(inner)
 
 	c, err := New[string, int](
 		WithMaxEntries(64),
-		WithStore[string, int](store),
+		WithStore(store),
 	)
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -108,10 +108,10 @@ func TestWithStoreSetWritesThroughToStore(t *testing.T) {
 }
 
 func TestWithStoreReadHitDoesNotConsultStore(t *testing.T) {
-	store := newTrackingStore[string, int](NewMemoryStore[string, int](nil))
+	store := newTrackingStore(NewMemoryStore[string, int](nil))
 	c, _ := New[string, int](
 		WithMaxEntries(64),
-		WithStore[string, int](store),
+		WithStore(store),
 	)
 	defer c.Close()
 
@@ -131,11 +131,11 @@ func TestWithStoreReadMissFallsThroughToStore(t *testing.T) {
 	inner := NewMemoryStore[string, int](nil)
 	// Pre-populate the store directly (bypassing the cache).
 	_ = inner.Set(context.Background(), "k", 99, 0)
-	store := newTrackingStore[string, int](inner)
+	store := newTrackingStore(inner)
 
 	c, _ := New[string, int](
 		WithMaxEntries(64),
-		WithStore[string, int](store),
+		WithStore(store),
 	)
 	defer c.Close()
 
@@ -160,11 +160,11 @@ func TestWithStoreReadMissFallsThroughToStore(t *testing.T) {
 
 func TestWithStoreDeleteWritesThroughToStore(t *testing.T) {
 	inner := NewMemoryStore[string, int](nil)
-	store := newTrackingStore[string, int](inner)
+	store := newTrackingStore(inner)
 
 	c, _ := New[string, int](
 		WithMaxEntries(64),
-		WithStore[string, int](store),
+		WithStore(store),
 	)
 	defer c.Close()
 
@@ -183,11 +183,11 @@ func TestWithStoreDeleteWritesThroughToStore(t *testing.T) {
 
 func TestWithStoreSetErrorRollsBackInMemory(t *testing.T) {
 	inner := NewMemoryStore[string, int](nil)
-	store := newTrackingStore[string, int](inner)
+	store := newTrackingStore(inner)
 
 	c, _ := New[string, int](
 		WithMaxEntries(64),
-		WithStore[string, int](store),
+		WithStore(store),
 	)
 	defer c.Close()
 
@@ -206,11 +206,11 @@ func TestWithStoreSetErrorRollsBackInMemory(t *testing.T) {
 
 func TestWithStoreDeleteCtxSurfacesStoreError(t *testing.T) {
 	inner := NewMemoryStore[string, int](nil)
-	store := newTrackingStore[string, int](inner)
+	store := newTrackingStore(inner)
 
 	c, _ := New[string, int](
 		WithMaxEntries(64),
-		WithStore[string, int](store),
+		WithStore(store),
 	)
 	defer c.Close()
 
@@ -230,11 +230,11 @@ func TestWithStoreDeleteCtxSurfacesStoreError(t *testing.T) {
 func TestWithStoreHasFallsThroughToStore(t *testing.T) {
 	inner := NewMemoryStore[string, int](nil)
 	_ = inner.Set(context.Background(), "store-only", 42, 0)
-	store := newTrackingStore[string, int](inner)
+	store := newTrackingStore(inner)
 
 	c, _ := New[string, int](
 		WithMaxEntries(64),
-		WithStore[string, int](store),
+		WithStore(store),
 	)
 	defer c.Close()
 
@@ -248,11 +248,11 @@ func TestWithStoreHasFallsThroughToStore(t *testing.T) {
 
 func TestWithStoreCloseDoesNotCloseStore(t *testing.T) {
 	inner := NewMemoryStore[string, int](nil)
-	store := newTrackingStore[string, int](inner)
+	store := newTrackingStore(inner)
 
 	c, _ := New[string, int](
 		WithMaxEntries(64),
-		WithStore[string, int](store),
+		WithStore(store),
 	)
 	if err := c.Close(); err != nil {
 		t.Fatalf("Close: %v", err)
@@ -265,14 +265,14 @@ func TestWithStoreCloseDoesNotCloseStore(t *testing.T) {
 
 func TestWithStoreEvictionDoesNotDeleteFromStore(t *testing.T) {
 	inner := NewMemoryStore[string, int](nil)
-	store := newTrackingStore[string, int](inner)
+	store := newTrackingStore(inner)
 
 	// Tight bound: in-memory evictions must NOT reach the Store.
 	c, _ := New[string, int](
 		WithMaxEntries(2),
 		WithShards(1),
 		WithPolicy(PolicyLRU),
-		WithStore[string, int](store),
+		WithStore(store),
 	)
 	defer c.Close()
 
@@ -296,10 +296,10 @@ func TestWithStoreEvictionDoesNotDeleteFromStore(t *testing.T) {
 }
 
 func TestWithStoreSetCtxCancelledBeforeWriteSurfacesError(t *testing.T) {
-	store := newTrackingStore[string, int](NewMemoryStore[string, int](nil))
+	store := newTrackingStore(NewMemoryStore[string, int](nil))
 	c, _ := New[string, int](
 		WithMaxEntries(64),
-		WithStore[string, int](store),
+		WithStore(store),
 	)
 	defer c.Close()
 
@@ -313,12 +313,12 @@ func TestWithStoreSetCtxCancelledBeforeWriteSurfacesError(t *testing.T) {
 
 func TestWithStoreConcurrentSetGetThroughStore(t *testing.T) {
 	inner := NewMemoryStore[string, int](nil)
-	store := newTrackingStore[string, int](inner)
+	store := newTrackingStore(inner)
 
 	c, _ := New[string, int](
 		WithMaxEntries(2048),
 		WithShards(4),
-		WithStore[string, int](store),
+		WithStore(store),
 	)
 	defer c.Close()
 
@@ -327,10 +327,10 @@ func TestWithStoreConcurrentSetGetThroughStore(t *testing.T) {
 
 	var wg sync.WaitGroup
 	wg.Add(goroutines)
-	for g := 0; g < goroutines; g++ {
+	for g := range goroutines {
 		go func() {
 			defer wg.Done()
-			for i := 0; i < opsPerG; i++ {
+			for i := range opsPerG {
 				k := storeKeyFor(g, i)
 				if err := c.Set(k, g*1000+i); err != nil {
 					t.Errorf("Set(%s): %v", k, err)

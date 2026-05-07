@@ -142,7 +142,7 @@ func TestFastPathFiresOnHitHook(t *testing.T) {
 	c, _ := New[string, int](
 		WithMaxEntries(8),
 		WithPolicy(PolicyFIFO),
-		WithOnHit[string, int](func(string, int) { hits++ }),
+		WithOnHit(func(string, int) { hits++ }),
 	)
 	defer c.Close()
 	_ = c.Set("k", 1)

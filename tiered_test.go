@@ -212,7 +212,7 @@ func TestTieredSetPropagatesL1Error(t *testing.T) {
 	// L1 with MaxValueWeight=1 + a weigher rejects values > 1.
 	l1, err := New[string, []byte](
 		WithMaxBytes(64),
-		WithWeigher[[]byte](BytesWeigher()),
+		WithWeigher(BytesWeigher()),
 		WithMaxValueWeight(1),
 	)
 	if err != nil {
@@ -220,7 +220,7 @@ func TestTieredSetPropagatesL1Error(t *testing.T) {
 	}
 	l2, _ := New[string, []byte](
 		WithMaxBytes(64),
-		WithWeigher[[]byte](BytesWeigher()),
+		WithWeigher(BytesWeigher()),
 	)
 	tc := NewTiered(l1, l2)
 	defer tc.Close()

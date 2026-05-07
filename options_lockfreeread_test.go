@@ -28,7 +28,7 @@ func TestLockFreeReadGatedByExpireFunc(t *testing.T) {
 	// path must be disabled.
 	c, _ := New[string, int](
 		WithMaxEntries(8),
-		WithExpireFunc[string, int](func(string, int, Metadata) bool { return false }),
+		WithExpireFunc(func(string, int, Metadata) bool { return false }),
 		WithLockFreeRead(),
 	)
 	defer c.Close()
@@ -50,7 +50,7 @@ func TestLockFreeReadResetReplacesSnapshot(t *testing.T) {
 	)
 	defer c.Close()
 
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		_ = c.Set(fmt.Sprintf("k%d", i), i)
 	}
 	c.promoteReadMap(c.shards[0])
@@ -86,7 +86,7 @@ func TestLockFreeReadClearReplacesSnapshot(t *testing.T) {
 	)
 	defer c.Close()
 
-	for i := 0; i < 8; i++ {
+	for i := range 8 {
 		_ = c.Set(fmt.Sprintf("k%d", i), i)
 	}
 	c.promoteReadMap(c.shards[0])
@@ -237,13 +237,13 @@ func TestLockFreeReadPromotesAfterEnoughMisses(t *testing.T) {
 	)
 	defer c.Close()
 
-	for i := 0; i < 16; i++ {
+	for i := range 16 {
 		_ = c.Set(fmt.Sprintf("k%d", i), i)
 	}
 	// Snapshot is currently amended-empty (from initialization);
 	// each Get is a snapshot miss + dirty hit. After enough misses,
 	// the slow path triggers promoteReadMap.
-	for i := 0; i < 16; i++ {
+	for i := range 16 {
 		k := fmt.Sprintf("k%d", i)
 		if got, ok := c.Get(k); !ok || got != i {
 			t.Errorf("Get(%s) = (%d, %v), want (%d, true)", k, got, ok, i)
@@ -272,16 +272,16 @@ func TestLockFreeReadConcurrentGetSetUnderRace(t *testing.T) {
 	wg.Add(writers + readers)
 
 	// Pre-seed so reads have something to find.
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		_ = c.Set(fmt.Sprintf("seed-%d", i), i)
 	}
 
 	stop := make(chan struct{})
 
-	for w := 0; w < writers; w++ {
+	for w := range writers {
 		go func(id int) {
 			defer wg.Done()
-			for i := 0; i < opsPerG; i++ {
+			for i := range opsPerG {
 				k := fmt.Sprintf("w%d-%d", id, i)
 				_ = c.Set(k, id*1000+i)
 			}
@@ -289,10 +289,10 @@ func TestLockFreeReadConcurrentGetSetUnderRace(t *testing.T) {
 	}
 
 	hits := atomic.Int64{}
-	for r := 0; r < readers; r++ {
+	for range readers {
 		go func() {
 			defer wg.Done()
-			for i := 0; i < opsPerG; i++ {
+			for i := range opsPerG {
 				k := fmt.Sprintf("seed-%d", i%100)
 				if _, ok := c.Get(k); ok {
 					hits.Add(1)
@@ -348,7 +348,7 @@ func BenchmarkGetLockFreeReadHit(b *testing.B) {
 	defer c.Close()
 
 	keys := make([]string, 256)
-	for i := 0; i < 256; i++ {
+	for i := range 256 {
 		keys[i] = fmt.Sprintf("k%d", i)
 		_ = c.Set(keys[i], i)
 	}
@@ -376,7 +376,7 @@ func BenchmarkGetDefaultHit(b *testing.B) {
 	defer c.Close()
 
 	keys := make([]string, 256)
-	for i := 0; i < 256; i++ {
+	for i := range 256 {
 		keys[i] = fmt.Sprintf("k%d", i)
 		_ = c.Set(keys[i], i)
 	}
@@ -404,7 +404,7 @@ func BenchmarkGetLockFreeReadHitNoStats(b *testing.B) {
 	defer c.Close()
 
 	keys := make([]string, 256)
-	for i := 0; i < 256; i++ {
+	for i := range 256 {
 		keys[i] = fmt.Sprintf("k%d", i)
 		_ = c.Set(keys[i], i)
 	}
@@ -427,7 +427,7 @@ func BenchmarkSyncMapLoad(b *testing.B) {
 	// target row.
 	var m sync.Map
 	keys := make([]string, 256)
-	for i := 0; i < 256; i++ {
+	for i := range 256 {
 		keys[i] = fmt.Sprintf("k%d", i)
 		m.Store(keys[i], i)
 	}

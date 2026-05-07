@@ -354,7 +354,7 @@ func TestEmptyCacheRoundTrip(t *testing.T) {
 func TestWithMaxSnapshotBytesRejectsOversized(t *testing.T) {
 	src, _ := New[string, []byte](
 		WithMaxBytes(1<<20),
-		WithWeigher[[]byte](BytesWeigher()),
+		WithWeigher(BytesWeigher()),
 	)
 	defer src.Close()
 	// 1 KiB value
@@ -366,7 +366,7 @@ func TestWithMaxSnapshotBytesRejectsOversized(t *testing.T) {
 
 	dst, _ := New[string, []byte](
 		WithMaxBytes(1<<20),
-		WithWeigher[[]byte](BytesWeigher()),
+		WithWeigher(BytesWeigher()),
 		WithMaxSnapshotBytes(64), // far below the snapshot's actual size
 	)
 	defer dst.Close()

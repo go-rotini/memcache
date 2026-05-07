@@ -40,8 +40,8 @@ func BenchmarkPerfTargets_LatencyZipfian(b *testing.B) {
 	}
 
 	var hist tdigest.Histogram
-	b.ResetTimer()
-	for range b.N {
+
+	for b.Loop() {
 		k := int(zipf.Uint64())
 		t0 := time.Now()
 		c.Get(k)

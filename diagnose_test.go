@@ -157,7 +157,7 @@ func TestSoonestExpiring(t *testing.T) {
 func TestHistogram(t *testing.T) {
 	c, _ := New[string, []byte](
 		WithMaxBytes(1<<20),
-		WithWeigher[[]byte](BytesWeigher()),
+		WithWeigher(BytesWeigher()),
 	)
 	defer c.Close()
 	_ = c.Set("a", make([]byte, 8))    // weight bucket 1 (1..15)

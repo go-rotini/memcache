@@ -19,10 +19,10 @@ func TestBloomNoFalseNegatives(t *testing.T) {
 	seeds := []uint64{1, 2, 3, 4}
 	b := NewBloom(2048, seeds)
 	const n = 100
-	for i := uint64(0); i < n; i++ {
+	for i := range uint64(n) {
 		b.Set(i)
 	}
-	for i := uint64(0); i < n; i++ {
+	for i := range uint64(n) {
 		if !b.Test(i) {
 			t.Errorf("set key %d incorrectly reported missing (false negative)", i)
 		}

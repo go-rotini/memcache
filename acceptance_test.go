@@ -72,7 +72,7 @@ func TestAcceptanceTokenRefresh(t *testing.T) {
 	c, _ := New[string, string](
 		WithMaxEntries(8),
 		WithClock(clk),
-		WithLoader[string, string](loader),
+		WithLoader(loader),
 		WithRefreshAhead(0.5), // refresh after 50% of TTL elapses
 		WithJanitorInterval(time.Hour),
 	)
@@ -104,7 +104,7 @@ func TestAcceptanceTokenRefresh(t *testing.T) {
 func TestAcceptanceFsnotifyInvalidation(t *testing.T) {
 	c, _ := New[string, []byte](
 		WithMaxBytes(1<<20),
-		WithWeigher[[]byte](BytesWeigher()),
+		WithWeigher(BytesWeigher()),
 	)
 	defer c.Close()
 
@@ -138,7 +138,7 @@ func TestAcceptanceStampede1000ConcurrentLoads(t *testing.T) {
 	})
 	c, _ := New[string, int](
 		WithMaxEntries(8),
-		WithLoader[string, int](loader),
+		WithLoader(loader),
 	)
 	defer c.Close()
 
@@ -218,7 +218,7 @@ func TestAcceptanceNegativeCacheBlocksRepeatedLookups(t *testing.T) {
 	})
 	c, _ := New[string, int](
 		WithMaxEntries(8),
-		WithLoader[string, int](loader),
+		WithLoader(loader),
 		WithNegativeCache(time.Hour),
 	)
 	defer c.Close()
