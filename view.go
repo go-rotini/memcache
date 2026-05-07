@@ -23,9 +23,11 @@ func (c *Cache[K, V]) View() *CacheView[K, V] {
 	return &CacheView[K, V]{cache: c}
 }
 
-// Get delegates to the underlying cache's [Cache.Get]. It does
-// promote the entry in the eviction policy on hit, matching the
-// non-view Get semantics.
+// Get delegates to the underlying cache's [Cache.Get] — including
+// any eviction-policy promotion on hit. CacheView is "read-only"
+// in the sense that it forbids Set/Delete/Compute mutations; it
+// is NOT a side-effect-free view. Use [CacheView.Peek] when you
+// need a no-promotion read.
 func (v *CacheView[K, V]) Get(key K) (V, bool) {
 	if v == nil || v.cache == nil {
 		var zero V
@@ -136,6 +138,8 @@ func (c *Cache[K, V]) Clone() (*Cache[K, V], error) {
 		value      V
 		weight     int64
 		expireAt   int64
+		inserted   int64
+		lastAccess int64
 		slidingTTL int64
 		tags       []string
 		flags      entryFlags
@@ -155,6 +159,8 @@ func (c *Cache[K, V]) Clone() (*Cache[K, V], error) {
 				value:      e.loadValue(),
 				weight:     e.weight,
 				expireAt:   e.expireAt.Load(),
+				inserted:   e.inserted,
+				lastAccess: e.lastAccess.Load(),
 				slidingTTL: e.slidingTTL,
 				tags:       tagsCopy,
 				flags:      e.flags,
@@ -171,8 +177,11 @@ func (c *Cache[K, V]) Clone() (*Cache[K, V], error) {
 		ne.key = ce.key
 		ne.storeValue(ce.value)
 		ne.weight = ce.weight
-		ne.inserted = now
-		ne.lastAccess.Store(now)
+		// Preserve original timestamps so refresh-ahead /
+		// stale-while-revalidate / sliding-TTL heuristics on the
+		// clone behave the same as on the source.
+		ne.inserted = ce.inserted
+		ne.lastAccess.Store(ce.lastAccess)
 		ne.expireAt.Store(ce.expireAt)
 		ne.flags = ce.flags
 		ne.slidingTTL = ce.slidingTTL

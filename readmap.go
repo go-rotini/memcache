@@ -229,6 +229,15 @@ func (c *Cache[K, V]) tryServeFromReadSnapshot(s *shard[K, V], key K, now int64)
 // Anything else routes through the lock so policy state can be
 // updated correctly.
 //
+// Atomic-correctness note: `e.flags` is a non-atomic `uint8` whose
+// `flagSliding`/`flagNegative` bits this function reads without a
+// lock. On every supported architecture this read is tear-free
+// (single-byte loads); the practical guarantee comes from
+// [WithLockFreeRead] gating to configurations where flag mutations
+// are extremely rare (no `WithExpireFunc`, S3-FIFO policy). A
+// future v0.x release may convert `flags` to atomic.Uint32 to make
+// the read formally race-free under Go's memory model.
+//
 // Hits bump e.hits atomically — the existing fast path already
 // does this, and atomic adds are safe regardless of any concurrent
 // writer that might be mutating other fields under the shard lock.

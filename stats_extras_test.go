@@ -15,7 +15,7 @@ import (
 	"time"
 )
 
-func TestStatsLoadCallsAliasMatchesLoadsTotal(t *testing.T) {
+func TestStatsLoadsTotalCounts(t *testing.T) {
 	loader := LoaderFunc[string, int](func(context.Context, string) (int, time.Duration, error) {
 		return 1, 0, nil
 	})
@@ -26,17 +26,8 @@ func TestStatsLoadCallsAliasMatchesLoadsTotal(t *testing.T) {
 		_, _ = c.GetOrLoad(context.Background(), "k")
 	}
 	st := c.Stats()
-	if st.LoadCalls != st.LoadsTotal || st.LoadCalls == 0 {
-		t.Errorf("LoadCalls=%d LoadsTotal=%d (must be equal and >0)", st.LoadCalls, st.LoadsTotal)
-	}
-}
-
-func TestStatsSingleflightsAliasMatchesLoadCoalesced(t *testing.T) {
-	c, _ := New[string, int](WithMaxEntries(8))
-	defer c.Close()
-	st := c.Stats()
-	if st.Singleflights != st.LoadCoalesced {
-		t.Errorf("Singleflights=%d LoadCoalesced=%d (must be equal)", st.Singleflights, st.LoadCoalesced)
+	if st.LoadsTotal == 0 {
+		t.Errorf("LoadsTotal=%d, want > 0", st.LoadsTotal)
 	}
 }
 

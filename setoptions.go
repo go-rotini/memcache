@@ -17,6 +17,11 @@ type setConfig struct {
 	hasTTL    bool
 	hasWeight bool
 	hasExpiry bool
+	// hasTags is set by [SetTags] (even when called with an empty
+	// list) so [Cache.SetWithOptions] can distinguish "caller said
+	// nothing about tags" (auto-tag from CacheTagger) from "caller
+	// explicitly opted out of tags."
+	hasTags bool
 }
 
 // defaultSetConfig returns a setConfig pre-populated from the cache's
@@ -49,12 +54,16 @@ func SetWeight(w int64) SetOption {
 	}
 }
 
-// SetTags attaches tags to the entry. Tag-based invalidation lands
-// in Phase 7; for now the tags are stored on the entry but no global
-// index is maintained, so [Cache.InvalidateTag] is not yet wired.
+// SetTags attaches tags to the entry. Calling SetTags (even with no
+// arguments) is treated as the caller explicitly opting OUT of any
+// auto-tag derivation that would otherwise happen via [CacheTagger]
+// or template tags — `SetTags()` means "no tags," not "use defaults."
+// Pass tag names to attach them; `SetTags("a", "b")` overrides
+// `CacheTagger.CacheTags()` and any `cache:"...,tag=..."` template.
 func SetTags(tags ...string) SetOption {
 	return func(s *setConfig) {
 		s.tags = append(s.tags[:0], tags...)
+		s.hasTags = true
 	}
 }
 

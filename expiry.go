@@ -145,40 +145,35 @@ func (c *Cache[K, V]) runJanitor(s *shard[K, V], stop, tick <-chan struct{}) {
 			now := c.cfg.clock.Now().UnixNano()
 			removed := c.sweepExpiredLocked(s, now)
 			heapEmpty := s.ttl.Len() == 0
-			c.flushPendingCallbacks(s)
 
 			if removed == 0 && heapEmpty {
 				idle++
 				if idle >= janitorIdleShutdownTicks {
-					// Transition to "not running" UNDER the
-					// shard lock so a concurrent insert that
-					// observes running=true still sees a live
-					// goroutine. The shard lock is the same
-					// one [Cache.startJanitorLocked] takes
-					// when it CAS-es running false→true.
-					s.mu.Lock()
+					// Confirm still idle under the lock — if
+					// the race lost (a concurrent insert added
+					// a TTL'd entry), stay alive and re-arm.
 					if s.ttl.Len() == 0 {
-						// Confirm still idle; if the lock
-						// race introduced new TTL entries,
-						// stay alive.
 						s.janitor.running.Store(false)
 						if s.janitor.timer != nil {
 							s.janitor.timer.Stop()
 						}
-						s.mu.Unlock()
+						c.flushAndUnlock(s)
 						return
 					}
-					// Lost the race; reset idle counter and
-					// continue.
-					s.mu.Unlock()
 					idle = 0
 				}
 			} else {
 				idle = 0
 			}
+			// Re-arm the timer UNDER the shard lock so a
+			// concurrent stopJanitor can't race the Stop() →
+			// Reset() ordering. flushAndUnlock releases
+			// the lock as a side effect AFTER the Reset has
+			// landed.
 			if s.janitor.timer != nil {
 				s.janitor.timer.Reset(c.cfg.janitorInterval)
 			}
+			c.flushAndUnlock(s)
 		}
 	}
 }

@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
+	"path/filepath"
 	"sort"
 	"time"
 
@@ -158,16 +160,30 @@ func ExampleNewTiered() {
 	// Output: 42
 }
 
-// ExampleCache_SaveFile + LoadFile is the warm-restart pattern
-// for REPLs and daemons.
+// ExampleCache_SaveFile demonstrates the warm-restart pattern for
+// REPLs and daemons: snapshot to disk, reload on restart.
 func ExampleCache_SaveFile() {
+	dir, _ := os.MkdirTemp("", "memcache-example-*")
+	defer os.RemoveAll(dir)
+	path := filepath.Join(dir, "cache.snap")
+
 	c, _ := memcache.New[string, int](memcache.WithMaxEntries(64))
 	_ = c.Set("warm", 99)
-	// In production: c.SaveFile(path); reload with WithAutoLoad.
-	// Here we keep the example out-of-process-side-effect free.
+	if err := c.SaveFile(path); err != nil {
+		fmt.Println("save:", err)
+		return
+	}
 	_ = c.Close()
-	fmt.Println("saved")
-	// Output: saved
+
+	c2, _ := memcache.New[string, int](memcache.WithMaxEntries(64))
+	defer c2.Close()
+	if _, err := c2.LoadFile(path); err != nil {
+		fmt.Println("load:", err)
+		return
+	}
+	v, ok := c2.Get("warm")
+	fmt.Println(v, ok)
+	// Output: 99 true
 }
 
 // ExampleCache_Items is the canonical diagnostic pattern.

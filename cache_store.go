@@ -128,7 +128,7 @@ func (c *Cache[K, V]) deleteThroughStore(ctx context.Context, key K) error {
 func (c *Cache[K, V]) rollbackInMemory(key K) {
 	s := c.shardFor(key)
 	s.mu.Lock()
-	defer s.mu.Unlock()
+	defer c.unlockShard(s)
 	if e, ok := s.storage.get(key); ok {
 		c.removeLocked(s, e, EvictReasonStoreRollback)
 	}

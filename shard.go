@@ -82,7 +82,7 @@ type shard[K comparable, V any] struct {
 	// released — preventing deadlock when a callback re-enters the
 	// cache for any key that hashes to the same shard. Accessed
 	// under shard.mu by the caller; flushed after unlock by
-	// [Cache.flushPendingCallbacksLocked].
+	// [Cache.flushAndUnlockLocked].
 	pendingCallbacks []func()
 }
 

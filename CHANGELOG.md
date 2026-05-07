@@ -57,7 +57,7 @@ invalidation, snapshot persistence, and tiered composition.
   in tier order. Reads cascade L1 → L2 → ... and promote on hit.
 - **Compute / atomic update**: `Compute(key, fn)` for atomic
   read-modify-write. Re-entrancy from the same goroutine is detected
-  and rejected with `ErrComputeReentry`.
+  and rejected with `ErrComputeReentrant`.
 - **Numeric helpers**: `Increment`, `IncrementBy`, `Decrement`,
   `DecrementBy` as thin wrappers over Compute.
 - **Struct-tag introspection**: `cache:"-"` excludes a field from
@@ -121,19 +121,44 @@ invalidation, snapshot persistence, and tiered composition.
 - **Per-policy stats**: `Stats.PolicyDetail` returns a per-policy
   diagnostic struct (`PolicyDetailLRU`, `PolicyDetailS3FIFO`, etc.)
   describing the live state of shard 0's policy.
-- **Hashed timing wheel**: `internal/wheel/` ships a fully-tested
-  generic timing wheel suitable for high-volume TTL workloads.
-  `WithTTLBuckets(slots, tickPerBucket)` is recognized; cache
-  hot-path wiring is deferred to v0.2 pending benchmark-driven
-  validation. The default per-shard heap remains active.
+- **Hashed timing wheel**: `internal/wheel/` ships a generic timing
+  wheel for high-volume TTL workloads. `WithTTLBuckets(slots,
+  tickPerBucket)` selects the wheel as the per-shard TTL backend;
+  the default remains the per-shard min-heap, which is faster for
+  typical CLI workloads.
+- **Lock-free `Get` fast path**: `WithLockFreeRead()` publishes an
+  immutable per-shard snapshot via `atomic.Pointer` so the Get fast
+  path runs without the shard lock for fast-pathable hits. Gated to
+  S3-FIFO + no `WithExpireFunc` configurations where the read path
+  is provably race-free. ~10% improvement with all features on,
+  ~3× with stats off.
+- **External-store backend**: `WithStore[K, V](store)` wires a
+  user-supplied `Store[K, V]` in as the cache's source of truth.
+  Reads on in-memory miss fall through to the Store and promote;
+  writes/deletes propagate through. The package ships
+  `MemoryStore` as the default in-process implementation; disk-
+  backed and Redis-backed adapters are intended to be third-party.
+- **Async writes**: `WithAsyncWrites()` decouples Set/Delete from
+  the storage update via per-shard pending maps drained by a
+  per-cache apply goroutine. `Sync` blocks until pending drains;
+  `Close` drains before stopping the apply goroutine.
+- **Flat shard storage**: `WithFlatStorage()` opts each shard into
+  an open-addressed flat hash table with linear probing and
+  tombstone-driven compactions instead of `map[K]*entry`. Surfaces
+  `Stats.Compactions` for observability.
 
 ### Performance baseline
 
 `testdata/benchmarks/v0.1.0-baseline.csv` records the v0.1.0
 benchmark sweep on Apple M3 / arm64 / Go 1.26.x. Spec §19.6.5
-latency targets met (p50 100ns / p99 500ns vs spec 200ns / 2µs);
-the `sync.Map`-throughput target is acknowledged as a structural
-gap pending a v0.2 lock-free read-path follow-up.
+latency targets met (p50 100ns / p99 500ns vs spec 200ns / 2µs).
+The "≥50% of sync.Map throughput" gate is documented as
+unachievable for a feature-rich cache (sync.Map's bare lookup
+runs in ~2.8 ns/op; memcache pays 15–20 ns of irreducible per-Get
+work for TTL/policy/hooks/observability even with the lock-free
+path enabled). `WithLockFreeRead()` reduces Get from ~58 ns/op to
+~21 ns/op when stats are disabled — the structural improvement
+the gate intended to drive.
 - **Concurrency limits**: `WithMaxConcurrentLoads(n)` semaphore;
   `WithLoadRateLimit(rps, burst)` token bucket.
 - **Determinism for tests**: `WithClock(Clock)` + `NewFakeClock(...)`
@@ -156,17 +181,16 @@ gap pending a v0.2 lock-free read-path follow-up.
 
 ### Known limitations (tracked for future releases)
 
-- Get RLock fast path (Phase 4 deferred): hot reads currently take
-  the per-shard write lock for policy promotion. A future release
-  will route policy promotions through a write-batched intent log
-  so Get can run under RLock when the entry is fresh.
-- Snapshot codec adapters (Phase 9 deferred): `WithIncrementalSave`
-  and the gzip / zstd / encrypt streaming codec adapters are not
-  yet wired into Save/Load.
-- External-store backend (Phase 10 deferred): `WithStore(...)` for
-  Redis / S3 / disk has stub interfaces but no shipping implementation.
-- Struct-tag extensions (Phase 11 deferred): `cache:"omitempty"`,
-  `cache:"versioned"`, `cache:"tag=template"`, and `CacheKey`
-  derivation are not yet implemented.
+- **Multi-segment incremental snapshots**: `WithIncrementalSave`
+  (multi-segment + manifest, spec §9.8) is not implemented; the
+  shipped snapshot format is single-pass.
+- **`WithLockFreeRead` policy gating**: only S3-FIFO policy +
+  no `WithExpireFunc` is supported; other policy/expire-func
+  combinations silently disable the option (with an info log).
+- **`Tiered` API surface**: covers Get/Set/SetWithTTL/SetWithOptions/
+  Delete/InvalidateTag/Sync; `Compute`, `GetOrLoad`, `Range`,
+  `Save`, `Subscribe` are reachable per-tier via `Tiered.L1()` /
+  `Tiered.L2()` accessors. No coordinated multi-tier wrappers ship
+  in v0.1.0.
 
 [0.1.0]: https://github.com/go-rotini/memcache/releases/tag/v0.1.0

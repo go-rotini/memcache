@@ -13,7 +13,7 @@ Used as the default caching package for [rotini](https://github.com/go-rotini/ro
 - Stale-while-revalidate and negative caching
 - Singleflight loader integration with rate limiting and per-load timeouts
 - Tag-based invalidation, group capacity, prefix delete
-- Snapshot/restore (gob and JSON) with atomic file replacement
+- Snapshot/restore (gob, JSON, raw bytes, gzip-compressed, AES-256-GCM-encrypted) with atomic file replacement
 - Auto-save/auto-load — warm-restart for REPL-style workloads
 - Tiered (L1/L2) caching with pluggable backends
 - Atomic compute family: `Compute`, `ComputeIfAbsent`, `CompareAndSwap`, `Increment`/`Decrement`

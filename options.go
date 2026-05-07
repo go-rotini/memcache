@@ -210,11 +210,9 @@ type config struct {
 	codecCtorErr error
 
 	// ttlBuckets / ttlBucketsTickPerBucket capture the requested
-	// hashed-wheel parameters. The wheel implementation lives in
-	// internal/wheel; the option is recognized but not yet wired
-	// into the cache's TTL backend. New emits a one-shot info log
-	// when the option is set so users know the option is parsed
-	// but not yet active.
+	// hashed-wheel parameters. When ttlBuckets > 0, [newTTLBackend]
+	// selects the wheel-backed TTL backend for every shard; the
+	// per-shard min-heap remains the default otherwise.
 	ttlBuckets              int
 	ttlBucketsTickPerBucket int
 
@@ -851,8 +849,14 @@ func WithEventsBuffer(n int) Option {
 
 // WithOnHit registers a synchronous callback invoked on every Get
 // hit. The callback runs under the shard write lock; slow
-// callbacks block the Get path. For asynchronous notification use
-// [Cache.Subscribe] instead.
+// callbacks block the Get path, and re-entering the cache for any
+// key that hashes to the same shard deadlocks. For asynchronous
+// notification use [Cache.Subscribe] instead.
+//
+// Note that [WithOnEvict]/[WithOnExpire] callbacks fire AFTER the
+// shard lock is released (via the deferred-callback queue), but
+// OnHit/OnMiss run inline because the per-Get cost of routing
+// through that queue would dominate the hot path.
 func WithOnHit[K comparable, V any](fn func(key K, value V)) Option {
 	return func(c *config) {
 		if fn != nil {
@@ -863,7 +867,7 @@ func WithOnHit[K comparable, V any](fn func(key K, value V)) Option {
 
 // WithOnMiss registers a synchronous callback invoked on every Get
 // miss (including expired and negative-tombstone hits). Runs under
-// the shard write lock.
+// the shard write lock — same caveats as [WithOnHit] apply.
 func WithOnMiss[K comparable](fn func(key K)) Option {
 	return func(c *config) {
 		if fn != nil {

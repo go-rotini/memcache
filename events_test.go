@@ -450,3 +450,120 @@ func intToStr(n int) string {
 	}
 	return string(buf[pos:])
 }
+
+// TestInvalidateTagFiresOnEvict regression: explicit-Unlock sites in
+// tags.go (InvalidateTag/InvalidateTags/shrinkGroup) and
+// cache_store.go (rollbackInMemory) used to drop the deferred
+// pendingCallbacks slice on the floor by calling bare s.mu.Unlock()
+// after removeLocked. Verify the callbacks now fire end-to-end.
+func TestInvalidateTagFiresOnEvict(t *testing.T) {
+	got := make(chan EvictionReason, 4)
+	c, _ := New[string, int](
+		WithMaxEntries(8),
+		WithOnEvict[string, int](func(_ string, _ int, r EvictionReason) {
+			got <- r
+		}),
+	)
+	defer c.Close()
+
+	_ = c.SetWithOptions("k1", 1, SetTags("t"))
+	_ = c.SetWithOptions("k2", 2, SetTags("t"))
+	if removed := c.InvalidateTag("t"); removed != 2 {
+		t.Fatalf("InvalidateTag = %d, want 2", removed)
+	}
+
+	for i := 0; i < 2; i++ {
+		select {
+		case r := <-got:
+			if r != EvictReasonTag {
+				t.Errorf("OnEvict reason = %v, want EvictReasonTag", r)
+			}
+		case <-time.After(time.Second):
+			t.Fatal("OnEvict callback did not fire after InvalidateTag")
+		}
+	}
+}
+
+func TestInvalidateTagsFiresOnEvict(t *testing.T) {
+	got := make(chan struct{}, 4)
+	c, _ := New[string, int](
+		WithMaxEntries(8),
+		WithOnEvict[string, int](func(string, int, EvictionReason) { got <- struct{}{} }),
+	)
+	defer c.Close()
+
+	_ = c.SetWithOptions("a", 1, SetTags("ta"))
+	_ = c.SetWithOptions("b", 2, SetTags("tb"))
+	if removed := c.InvalidateTags("ta", "tb"); removed != 2 {
+		t.Fatalf("InvalidateTags = %d, want 2", removed)
+	}
+	for i := 0; i < 2; i++ {
+		select {
+		case <-got:
+		case <-time.After(time.Second):
+			t.Fatal("OnEvict callback did not fire after InvalidateTags")
+		}
+	}
+}
+
+func TestWithGroupShrinkFiresOnEvict(t *testing.T) {
+	got := make(chan struct{}, 4)
+	c, _ := New[string, int](
+		WithMaxEntries(16),
+		WithGroup("group-a", 2),
+		WithOnEvict[string, int](func(string, int, EvictionReason) { got <- struct{}{} }),
+	)
+	defer c.Close()
+
+	// Group capacity of 2: third Set into the group evicts the
+	// oldest member via shrinkGroup.
+	_ = c.SetWithOptions("a", 1, SetTags("group-a"))
+	_ = c.SetWithOptions("b", 2, SetTags("group-a"))
+	_ = c.SetWithOptions("c", 3, SetTags("group-a"))
+
+	select {
+	case <-got:
+	case <-time.After(time.Second):
+		t.Fatal("OnEvict callback did not fire after WithGroup capacity shrink")
+	}
+}
+
+// TestOnEvictCallbackCanReEnterCacheWithSet exercises the deeper
+// case the agent flagged: an OnEvict callback that re-enters via
+// Set on the SAME shard. Before the post-unlock callback dispatch,
+// this would deadlock on the still-held shard write lock. We bound
+// the callback's depth so a buggy implementation with cascading
+// evictions doesn't infinite-loop.
+func TestOnEvictCallbackCanReEnterCacheWithSet(t *testing.T) {
+	var c *Cache[string, int]
+	const maxDepth = 3
+	depth := atomic.Int32{}
+	called := make(chan struct{}, 1)
+	c, _ = New[string, int](
+		WithMaxEntries(2),
+		WithShards(1),
+		WithPolicy(PolicyLRU),
+		WithOnEvict[string, int](func(string, int, EvictionReason) {
+			d := depth.Add(1)
+			if d > maxDepth {
+				return
+			}
+			// Re-enter Set on the same shard — must not deadlock.
+			_ = c.Set(itoaSimple(int(d)), int(d))
+			select {
+			case called <- struct{}{}:
+			default:
+			}
+		}),
+	)
+	defer c.Close()
+
+	for i := 0; i < 6; i++ {
+		_ = c.Set("k"+itoaSimple(i), i)
+	}
+	select {
+	case <-called:
+	case <-time.After(time.Second):
+		t.Fatal("Set-from-OnEvict deadlocked or never fired")
+	}
+}

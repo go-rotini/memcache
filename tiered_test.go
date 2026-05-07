@@ -327,3 +327,15 @@ func TestTieredLenReportsL2(t *testing.T) {
 		t.Errorf("Tiered.Len = %d, want 5 (L2 size); L1.Len = %d", got, l1.Len())
 	}
 }
+
+func TestTieredGetCtxRespectsCanceledContext(t *testing.T) {
+	tc, _, _ := newTieredPair(t)
+	defer tc.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, _, err := tc.GetCtx(ctx, "k")
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("GetCtx with canceled ctx err = %v, want context.Canceled", err)
+	}
+}

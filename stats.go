@@ -49,12 +49,6 @@ type Stats struct {
 	// LoadsTotal is the number of Loader invocations.
 	LoadsTotal uint64
 
-	// LoadCalls is a spec-§12.1 alias for [Stats.LoadsTotal]. Both
-	// fields carry the same value; new code should prefer LoadsTotal.
-	// Tracked here so callers reading the spec's field names compile
-	// against the implementation.
-	LoadCalls uint64
-
 	// LoadHits is the count of loader calls that resolved successfully.
 	LoadHits uint64
 
@@ -64,11 +58,6 @@ type Stats struct {
 	// LoadCoalesced is the count of waiters that joined an in-flight
 	// load (singleflight savings).
 	LoadCoalesced uint64
-
-	// Singleflights is a spec-§12.1 alias for [Stats.LoadCoalesced].
-	// Both fields carry the same value; new code should prefer
-	// LoadCoalesced.
-	Singleflights uint64
 
 	// EventsDropped is the count of subscriber events dropped because
 	// a subscriber's channel was full.
@@ -336,11 +325,9 @@ func (s *statsCounters) snapshot(now time.Time) Stats {
 		Evictions:            s.evictions.Load(),
 		Expirations:          s.expirations.Load(),
 		LoadsTotal:           s.loadsTotal.Load(),
-		LoadCalls:            s.loadsTotal.Load(),
 		LoadHits:             s.loadHits.Load(),
 		LoadErrors:           s.loadErrors.Load(),
 		LoadCoalesced:        s.loadCoalesced.Load(),
-		Singleflights:        s.loadCoalesced.Load(),
 		EventsDropped:        s.eventsDropped.Load(),
 		HashCollisions:       s.hashCollisions.Load(),
 		AdmissionRejects:     s.admissionRejects.Load(),

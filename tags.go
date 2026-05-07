@@ -139,7 +139,7 @@ func (c *Cache[K, V]) InvalidateTag(tag string) int {
 			c.removeLocked(s, e, EvictReasonTag)
 			count++
 		}
-		s.mu.Unlock()
+		c.flushAndUnlock(s)
 	}
 	if count > 0 {
 		c.publishEvent(Event[K, V]{
@@ -173,7 +173,7 @@ func (c *Cache[K, V]) InvalidateTags(tags ...string) int {
 			c.removeLocked(s, e, EvictReasonTag)
 			count++
 		}
-		s.mu.Unlock()
+		c.flushAndUnlock(s)
 	}
 	if count > 0 {
 		c.publishEvent(Event[K, V]{
@@ -256,7 +256,7 @@ func (c *Cache[K, V]) shrinkGroup(tag string, capacity int) {
 		if e, exists := s.storage.get(oldestKey); exists {
 			c.removeLocked(s, e, EvictReasonTag)
 		}
-		s.mu.Unlock()
+		c.flushAndUnlock(s)
 	}
 }
 
@@ -332,25 +332,32 @@ func (c *Cache[K, V]) retagLocked(key K, oldTags, newTags []string) {
 // remains a soft bound; absolute enforcement requires a stricter
 // (and much slower) cross-shard atomic check.
 func (c *Cache[K, V]) validateTagLimits(tags []string) error {
-	if c.cfg.maxTagsPerEntry > 0 && len(tags) > c.cfg.maxTagsPerEntry {
+	// Dedupe `tags` against itself once — used by both the per-
+	// entry cap and the cache-level cap so the two checks agree
+	// on what counts as a "distinct tag".
+	var distinct []string
+	if len(tags) > 0 {
+		seen := make(map[string]struct{}, len(tags))
+		distinct = make([]string, 0, len(tags))
+		for _, t := range tags {
+			if _, dup := seen[t]; dup {
+				continue
+			}
+			seen[t] = struct{}{}
+			distinct = append(distinct, t)
+		}
+	}
+	if c.cfg.maxTagsPerEntry > 0 && len(distinct) > c.cfg.maxTagsPerEntry {
 		return &CapacityError{
-			Reason:     fmt.Sprintf("entry has %d tags; max is %d", len(tags), c.cfg.maxTagsPerEntry),
+			Reason:     fmt.Sprintf("entry has %d tags; max is %d", len(distinct), c.cfg.maxTagsPerEntry),
 			LimitField: "MaxTagsPerEntry",
 		}
 	}
 	if c.cfg.maxTagsTotal > 0 && c.tags != nil {
 		c.tags.mu.RLock()
 		current := len(c.tags.keysByTag)
-		// Dedupe `tags` against the index AND against itself so a
-		// caller passing ["a","a","b"] when "b" is already known
-		// counts as +1 (just "a"), not +2.
-		seen := make(map[string]struct{}, len(tags))
 		newDistinct := 0
-		for _, t := range tags {
-			if _, dup := seen[t]; dup {
-				continue
-			}
-			seen[t] = struct{}{}
+		for _, t := range distinct {
 			if _, ok := c.tags.keysByTag[t]; !ok {
 				newDistinct++
 			}
