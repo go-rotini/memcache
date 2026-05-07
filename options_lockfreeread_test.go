@@ -7,6 +7,105 @@ import (
 	"testing"
 )
 
+func TestLockFreeReadGatedByPolicy(t *testing.T) {
+	// LRU policy is not lock-free-safe in v0; the option must
+	// silently disable.
+	c, _ := New[string, int](
+		WithMaxEntries(8),
+		WithPolicy(PolicyLRU),
+		WithLockFreeRead(),
+	)
+	defer c.Close()
+	for _, sh := range c.shards {
+		if sh.read.Load() != nil {
+			t.Error("LockFreeRead should have been gated off under LRU")
+		}
+	}
+}
+
+func TestLockFreeReadGatedByExpireFunc(t *testing.T) {
+	// WithExpireFunc reads e.tags (non-atomic); the lock-free
+	// path must be disabled.
+	c, _ := New[string, int](
+		WithMaxEntries(8),
+		WithExpireFunc[string, int](func(string, int, Metadata) bool { return false }),
+		WithLockFreeRead(),
+	)
+	defer c.Close()
+	for _, sh := range c.shards {
+		if sh.read.Load() != nil {
+			t.Error("LockFreeRead should have been gated off when ExpireFunc is configured")
+		}
+	}
+}
+
+func TestLockFreeReadResetReplacesSnapshot(t *testing.T) {
+	// Reset must replace the snapshot AND not pool any entry the
+	// snapshot still references; otherwise concurrent readers may
+	// dereference recycled entries.
+	c, _ := New[string, int](
+		WithMaxEntries(64),
+		WithShards(1),
+		WithLockFreeRead(),
+	)
+	defer c.Close()
+
+	for i := 0; i < 8; i++ {
+		_ = c.Set(fmt.Sprintf("k%d", i), i)
+	}
+	c.promoteReadMap(c.shards[0])
+	pre := c.shards[0].read.Load()
+	if pre == nil || len(pre.m) == 0 {
+		t.Fatal("setup: expected populated snapshot")
+	}
+
+	c.Reset()
+
+	post := c.shards[0].read.Load()
+	if post == nil {
+		t.Fatal("Reset cleared snapshot pointer; expected fresh empty snapshot")
+	}
+	if len(post.m) != 0 {
+		t.Errorf("post-Reset snapshot has %d entries, want 0", len(post.m))
+	}
+	// Confirm the previous snapshot's entries are marked
+	// invalidated so a stale-pointer reader sees a miss.
+	for _, e := range pre.m {
+		if !e.invalidated() {
+			t.Error("Reset did not mark previously-snapshotted entry invalidated")
+			break
+		}
+	}
+}
+
+func TestLockFreeReadClearReplacesSnapshot(t *testing.T) {
+	c, _ := New[string, int](
+		WithMaxEntries(64),
+		WithShards(1),
+		WithLockFreeRead(),
+	)
+	defer c.Close()
+
+	for i := 0; i < 8; i++ {
+		_ = c.Set(fmt.Sprintf("k%d", i), i)
+	}
+	c.promoteReadMap(c.shards[0])
+	pre := c.shards[0].read.Load()
+
+	c.Clear()
+
+	post := c.shards[0].read.Load()
+	if post == nil || len(post.m) != 0 {
+		t.Errorf("post-Clear snapshot = %+v, want empty", post)
+	}
+	for _, e := range pre.m {
+		if !e.invalidated() {
+			t.Error("Clear did not mark previously-snapshotted entry invalidated")
+			break
+		}
+	}
+}
+
 func TestLockFreeReadDefaultIsOff(t *testing.T) {
 	c, _ := New[string, int](WithMaxEntries(8))
 	defer c.Close()

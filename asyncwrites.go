@@ -307,6 +307,9 @@ func (c *Cache[K, V]) asyncSet(key K, value V, ttl time.Duration, sliding bool, 
 	if c.closed.Load() {
 		return ErrClosed
 	}
+	if err := c.checkKeySize(key); err != nil {
+		return err
+	}
 	weight, err := c.computeWeight(key, value)
 	if err != nil {
 		return err
@@ -325,6 +328,9 @@ func (c *Cache[K, V]) asyncSet(key K, value V, ttl time.Duration, sliding bool, 
 func (c *Cache[K, V]) asyncSetWithExpiry(key K, value V, weight int64, sc setConfig) error {
 	if c.closed.Load() {
 		return ErrClosed
+	}
+	if err := c.checkKeySize(key); err != nil {
+		return err
 	}
 	if err := c.checkTagLimits(key, sc.tags); err != nil {
 		return err

@@ -15,18 +15,18 @@ lint:
 
 test:
 	@go test -v -count=1 -coverprofile=test.out ./...
-	@go tool cover -func=test.out | tail -1
+	@go tool cover -func=test.out
 
 test-acceptance:
 	@go test -v -count=1 -run TestAcceptance -coverprofile=test_acceptance.out ./...
-	@go tool cover -func=test_acceptance.out | tail -1
+	@go tool cover -func=test_acceptance.out
 
 test-bench:
 	@go test -bench=. -benchmem -count=5 -run='^$$' ./... | tee test_bench.out
 
 test-corpus:
 	@go test -v -count=1 -run TestCorpus -coverprofile=test_corpus.out ./...
-	@go tool cover -func=test_corpus.out | tail -1
+	@go tool cover -func=test_corpus.out
 
 test-fuzz:
 	@go test -fuzz=FuzzCacheOps -fuzztime=60s ./...
@@ -39,4 +39,4 @@ test-mutation:
 
 test-race:
 	@go test -race -count=1 -coverprofile=test_race.out ./...
-	@go tool cover -func=test_race.out | tail -1
+	@go tool cover -func=test_race.out

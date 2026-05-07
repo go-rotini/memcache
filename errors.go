@@ -45,10 +45,6 @@ var (
 	// tags than WithMaxTagsPerEntry permits.
 	ErrTooManyTags = errors.New("memcache: too many tags for entry")
 
-	// ErrPolicyConfig is returned by New when WithPolicy is incompatible
-	// with other options.
-	ErrPolicyConfig = errors.New("memcache: policy configuration invalid")
-
 	// ErrLoaderRateLimited is returned by GetOrLoad when the loader rate
 	// limit (WithLoaderRateLimit) has been exceeded for this tick.
 	ErrLoaderRateLimited = errors.New("memcache: loader rate limit exceeded")
@@ -65,13 +61,6 @@ var (
 	// ErrComputeReentrant is returned (panicked) when a Compute callback
 	// attempts to call back into the cache for the same key.
 	ErrComputeReentrant = errors.New("memcache: compute callback re-entered cache")
-
-	// ErrUnsupportedKeyType is returned by DeletePrefix when called on a
-	// cache whose K is not string and does not implement Prefixer.
-	ErrUnsupportedKeyType = errors.New("memcache: key type does not support requested operation")
-
-	// ErrViewReadOnly is returned by mutation attempts on a CacheView.
-	ErrViewReadOnly = errors.New("memcache: view is read-only")
 )
 
 // ConfigError describes an invalid configuration passed to New.

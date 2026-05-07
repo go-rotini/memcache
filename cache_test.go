@@ -684,21 +684,6 @@ func TestSetWithOptionsSlidingOverride(t *testing.T) {
 	}
 }
 
-func TestSetWithOptionsPriorityClamped(t *testing.T) {
-	// Priority is hint-only, but clamping logic should keep extreme
-	// values in [-100, 100] when they reach the entry.
-	c, _ := New[string, int](WithMaxEntries(4))
-	defer c.Close()
-	// Just verify the option doesn't error — there is no public
-	// observation surface for priority in v0.
-	if err := c.SetWithOptions("k", 1, SetPriority(500)); err != nil {
-		t.Errorf("SetWithOptions(SetPriority(500)) = %v, want nil", err)
-	}
-	if err := c.SetWithOptions("k2", 1, SetPriority(-500)); err != nil {
-		t.Errorf("SetWithOptions(SetPriority(-500)) = %v, want nil", err)
-	}
-}
-
 func TestResizeShrinksAndEvicts(t *testing.T) {
 	c, _ := New[string, int](WithMaxEntries(20), WithShards(1))
 	defer c.Close()

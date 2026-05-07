@@ -341,8 +341,16 @@ func (c *Cache[K, V]) validateTagLimits(tags []string) error {
 	if c.cfg.maxTagsTotal > 0 && c.tags != nil {
 		c.tags.mu.RLock()
 		current := len(c.tags.keysByTag)
+		// Dedupe `tags` against the index AND against itself so a
+		// caller passing ["a","a","b"] when "b" is already known
+		// counts as +1 (just "a"), not +2.
+		seen := make(map[string]struct{}, len(tags))
 		newDistinct := 0
 		for _, t := range tags {
+			if _, dup := seen[t]; dup {
+				continue
+			}
+			seen[t] = struct{}{}
 			if _, ok := c.tags.keysByTag[t]; !ok {
 				newDistinct++
 			}

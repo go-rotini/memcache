@@ -18,11 +18,11 @@ import (
 //
 // Store implementations MUST be safe for concurrent use.
 //
-// NOTE: in v0 the [Cache] does not yet route its hot-path lookups
-// through Store; the interface is published so users can build
-// adapters and so the [Tiered] L2 layer (Phase 10) can host them.
-// Wiring [WithStore] into the cache's storage path is tracked as a
-// v1 follow-up.
+// Wiring: a Cache constructed with [WithStore] treats the Store as
+// its source of truth — reads on in-memory miss fall through to
+// the Store and a Store hit is promoted into the in-memory cache;
+// writes and deletes propagate through. The Store also serves as
+// the L2 backend for [Tiered].
 type Store[K comparable, V any] interface {
 	// Get returns the value stored for key. Missing keys produce
 	// (zero V, false, nil) — only I/O failures populate err.

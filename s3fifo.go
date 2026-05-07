@@ -83,17 +83,21 @@ func newS3FIFO[K comparable, V any](budget int) *s3fifoPolicy[K, V] {
 }
 
 // s3SplitBudget computes the (small, main) sub-budgets from a total.
-// Small gets ~10% (rounded up; never larger than budget itself), Main
-// gets the rest. Negative or zero total yields (0, 0).
+// Small gets ~10% (rounded up); Main gets the rest. For budget==1,
+// Small gets the only slot and Main is empty (degenerate single-
+// queue mode). Negative or zero total yields (0, 0).
 func s3SplitBudget(budget int) (small, main int) {
 	if budget <= 0 {
 		return 0, 0
+	}
+	if budget == 1 {
+		return 1, 0
 	}
 	small = (budget + 9) / 10
 	if small >= budget {
 		small = 1
 	}
-	main = max(budget-small, 1)
+	main = budget - small
 	return small, main
 }
 
@@ -238,8 +242,6 @@ func (p *s3fifoPolicy[K, V]) Len() int {
 }
 
 // Reset clears all state: Small, Main, and Ghost queues.
-//
-//nolint:dupl // structurally similar to twoQPolicy.Reset but operates on different node types
 func (p *s3fifoPolicy[K, V]) Reset() {
 	for n := p.smallHead; n != nil; {
 		nxt := n.next
@@ -258,6 +260,15 @@ func (p *s3fifoPolicy[K, V]) Reset() {
 		n.entry = nil
 		n.next, n.prev = nil, nil
 		n = nxt
+	}
+	// Walk the Ghost list and unlink so we don't leave a still-
+	// linked island of nodes after Reset. Ghost nodes hold no entry
+	// pointer (they're key-only), so this is purely a memory
+	// hygiene step.
+	for g := p.ghostHead; g != nil; {
+		nxt := g.next
+		g.next, g.prev = nil, nil
+		g = nxt
 	}
 	p.smallHead, p.smallTail = nil, nil
 	p.mainHead, p.mainTail = nil, nil

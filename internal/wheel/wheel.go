@@ -138,18 +138,22 @@ func (w *Wheel[T]) AdvanceTo(nowNs int64) []*Entry[T] {
 		return nil
 	}
 	var expired []*Entry[T]
-	// Cap the scan to one full revolution; further ticks just
-	// advance revolutions on slots we already saw.
-	scanSteps := min(stepsTotal, int64(w.slotCount))
-	for range scanSteps {
+	// Split the advance into "full revolutions" plus a "partial"
+	// trailing scan. Full revolutions are handled by decrementing
+	// every entry's revolution counter (each full rev = one
+	// virtual crossing of every slot). The partial covers the
+	// fractional revolution at the end and is processed slot-by-
+	// slot so entries in slots the cursor lands on get the extra
+	// crossing while entries in other slots do not.
+	slotN := int64(w.slotCount)
+	fullRevs := stepsTotal / slotN
+	partial := stepsTotal % slotN
+	if fullRevs > 0 {
+		expired = append(expired, w.decrementAllRevolutions(int(fullRevs))...)
+	}
+	for range partial {
 		w.cursor = (w.cursor + 1) % w.slotCount
 		expired = append(expired, w.processSlot(w.cursor)...)
-	}
-	// Any additional steps beyond a full revolution are accounted
-	// for by decrementing revolutions across the entire wheel.
-	if stepsTotal > int64(w.slotCount) {
-		extraRev := int(stepsTotal/int64(w.slotCount)) - 0
-		expired = append(expired, w.decrementAllRevolutions(extraRev)...)
 	}
 	w.cursorAtNs += stepsTotal * w.tickNs
 	return expired

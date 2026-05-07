@@ -177,3 +177,52 @@ func TestCloneClosedReturnsError(t *testing.T) {
 		t.Error("Clone on closed cache should error")
 	}
 }
+
+// TestCloneRegistersTTLInJanitor verifies that TTL'd entries on a
+// clone are visible to DeleteExpired (which sweeps the per-shard
+// TTL backend). Before the Clone fix, cloned entries lived only in
+// storage with no expiry-heap registration and DeleteExpired
+// reported zero removals.
+func TestCloneRegistersTTLInJanitor(t *testing.T) {
+	clk := NewFakeClock(time.Unix(0, 0))
+	c, _ := New[string, int](
+		WithMaxEntries(8), WithClock(clk),
+		WithJanitorInterval(time.Hour),
+	)
+	defer c.Close()
+	_ = c.SetWithTTL("k", 1, time.Second)
+
+	cl, err := c.Clone()
+	if err != nil {
+		t.Fatalf("Clone: %v", err)
+	}
+	defer cl.Close()
+
+	clk.Advance(2 * time.Second)
+	if removed := cl.DeleteExpired(); removed != 1 {
+		t.Errorf("clone.DeleteExpired = %d, want 1 (TTL not registered with backend)", removed)
+	}
+}
+
+// TestCloneRegistersTags verifies that tagged entries on a clone
+// participate in InvalidateTag. Before the fix, cloned entries
+// lived only on the entry struct with no tag-index entry and
+// InvalidateTag returned 0 even for tags that visibly existed.
+func TestCloneRegistersTags(t *testing.T) {
+	c, _ := New[string, int](WithMaxEntries(8))
+	defer c.Close()
+	_ = c.SetWithOptions("k", 1, SetTags("group-a"))
+
+	cl, err := c.Clone()
+	if err != nil {
+		t.Fatalf("Clone: %v", err)
+	}
+	defer cl.Close()
+
+	if removed := cl.InvalidateTag("group-a"); removed != 1 {
+		t.Errorf("clone.InvalidateTag(group-a) = %d, want 1 (tag index not populated)", removed)
+	}
+	if cl.Has("k") {
+		t.Error("clone still has 'k' after tag invalidation")
+	}
+}

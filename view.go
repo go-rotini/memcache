@@ -178,7 +178,18 @@ func (c *Cache[K, V]) Clone() (*Cache[K, V], error) {
 		ne.slidingTTL = ce.slidingTTL
 		ne.tags = ce.tags
 		ns.storage.set(ce.key, ne)
+		// Register the entry with the shard's TTL backend so
+		// expirations are observable via the janitor (not just
+		// lazily on Get).
+		ns.expiryAdd(ne)
 		ns.policy.OnInsert(ne)
+		// Mirror upsertLocked's pattern: register tags inside the
+		// shard lock (retagLocked takes c.tags.mu internally; the
+		// "shard then index" lock order is preserved).
+		clone.retagLocked(ce.key, nil, ce.tags)
+		if ce.expireAt > 0 {
+			clone.startJanitorLocked(ns)
+		}
 		clone.counters.entries.Add(1)
 		clone.counters.bytes.Add(ce.weight)
 		ns.mu.Unlock()

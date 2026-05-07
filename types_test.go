@@ -39,8 +39,7 @@ func TestEvictionReasonString(t *testing.T) {
 		EvictReasonResize:        "resize",
 		EvictReasonComputed:      "computed",
 		EvictReasonClear:         "clear",
-		EvictReasonClose:         "close",
-		EvictReasonLoadError:     "load-error",
+		EvictReasonStoreRollback: "store-rollback",
 	}
 	for r, want := range cases {
 		if got := r.String(); got != want {
@@ -76,7 +75,6 @@ func TestEventKindString(t *testing.T) {
 		EventInvalidateTag:   "invalidate-tag",
 		EventResize:          "resize",
 		EventSnapshot:        "snapshot",
-		EventCompute:         "compute",
 	}
 	for k, want := range cases {
 		if got := k.String(); got != want {

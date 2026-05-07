@@ -424,18 +424,13 @@ func WithCollisionTracking(b bool) Option {
 	return func(c *config) { c.collisionTracking = b }
 }
 
-// WithTTLBuckets requests time-bucketed expiration via the hashed
-// timing wheel implemented in internal/wheel. The wheel uses
-// `slots × tickPerBucket` slots with a per-tick wall duration of
-// roughly the configured janitor interval / tickPerBucket.
-//
-// EXPERIMENTAL in v0: the wheel package ships and is fully tested,
-// but cache hot-path wiring is deferred to v0.2 pending benchmark-
-// driven validation (the per-shard expiry heap is correct and
-// fast for typical CLI workloads). When this option is supplied
-// the cache logs an info message and continues to use the heap;
-// no behavior change yet. The option is recognized so user code
-// targeting v1 compiles unchanged.
+// WithTTLBuckets enables a hashed timing wheel as the per-shard
+// TTL backend, replacing the default min-heap. The wheel has
+// `slots` buckets, with a per-tick wall duration of roughly
+// `janitorInterval / tickPerBucket` (defaults to one tick per
+// janitor interval when tickPerBucket ≤ 0). Ideal for caches with
+// large numbers of TTL'd entries where the heap's O(log n) insert/
+// remove dominates; for typical CLI workloads the heap is fine.
 func WithTTLBuckets(slots, tickPerBucket int) Option {
 	return func(c *config) {
 		c.ttlBuckets = slots
@@ -569,9 +564,9 @@ func WithShardedStats(b bool) Option {
 
 // WithWeigher attaches a function that returns the "weight" of a
 // value. Used together with [WithMaxBytes] for byte-bounded caches.
-// The function is type-asserted at cache construction time; passing a
-// weigher whose value type does not match V results in
-// [ErrPolicyConfig].
+// The function is type-asserted at cache construction time; a
+// weigher whose value type does not match V is rejected by [New]
+// as a [*ConfigError].
 func WithWeigher[V any](fn Weigher[V]) Option {
 	return func(c *config) {
 		if fn != nil {
@@ -681,10 +676,20 @@ func WithMaxTagsTotal(n int) Option {
 }
 
 // WithMaxConcurrentLoads caps the number of in-flight Loader calls
-// across the cache. When the cap is reached, further [Cache.GetOrLoad]
-// callers wait until a slot opens, returning their context's error
-// (or [ErrLoaderTooManyInFlight] when the wait times out via
-// [WithLoaderTimeout]).
+// across the cache. When the cap is reached, the next caller that
+// becomes a flight leader blocks acquiring a slot.
+//
+// Slot-wait behavior:
+//   - The leader's wait is bounded by [WithLoaderTimeout] (and any
+//     deadline derived from it). On timeout the leader returns
+//     [ErrLoaderTooManyInFlight].
+//   - Followers attaching to an in-flight leader's request via
+//     singleflight wait on the flight's completion; their own
+//     ctx cancellation returns ctx.Err immediately and decrements
+//     the flight's waiter refcount.
+//   - When ALL waiters have canceled their contexts, the leader's
+//     loader ctx is canceled too; the slot-wait then returns
+//     [ErrLoaderTooManyInFlight] for the leader.
 //
 // A non-positive value disables the cap.
 func WithMaxConcurrentLoads(n int) Option {

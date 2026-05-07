@@ -92,15 +92,6 @@ func (f *flightCall[V]) join() {
 	f.refs.Add(1)
 }
 
-// leave decrements the waiter refcount; when the result is zero
-// the loader's context is canceled. Called only on the ctx-
-// cancellation exit path of waitForFlight.
-func (f *flightCall[V]) leave() {
-	if f.refs.Add(-1) == 0 && f.cancel != nil {
-		f.cancel()
-	}
-}
-
 // cachedError is a per-shard "the loader broke" tombstone enabled
 // by [WithErrorTTL]. Distinct from the negative-cache tombstone
 // (which lives on the entries map with [flagNegative] set) because

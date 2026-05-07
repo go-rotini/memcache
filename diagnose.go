@@ -27,9 +27,11 @@ func (c *Cache[K, V]) Items() []KeyedItem[K, V] {
 			if e.expired(now) || e.flags.has(flagNegative) {
 				return true
 			}
+			it := e.item()
+			it.Value = c.returnValue(it.Value)
 			out = append(out, KeyedItem[K, V]{
 				Key:  e.key,
-				Item: e.item(),
+				Item: it,
 			})
 			return true
 		})

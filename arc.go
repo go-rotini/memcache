@@ -175,6 +175,15 @@ func (p *arcPolicy[K, V]) OnRemove(e *entry[K, V]) {
 // adaptive target p (or T2 is empty), drop the LRU of T1 and remember
 // the key in B1; otherwise drop the LRU of T2 and remember the key
 // in B2.
+//
+// Simplification vs. Megiddo & Modha: canonical ARC uses |T1| ≥ p
+// when the just-arrived key hit B2 (case ii) and |T1| > p otherwise.
+// We always use strict >, which biases evictions slightly toward T2
+// and reduces (but does not eliminate) the recency-favoring side of
+// the adapt. The policy still adapts via increase/decreaseP on
+// ghost hits; the simplification trades a small adaptation-quality
+// loss for not having to thread the ghost-provenance signal through
+// the policy interface.
 func (p *arcPolicy[K, V]) Victim() *entry[K, V] {
 	if p.t1Size+p.t2Size == 0 {
 		return nil

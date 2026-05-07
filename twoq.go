@@ -169,8 +169,6 @@ func (p *twoQPolicy[K, V]) Victim() *entry[K, V] {
 func (p *twoQPolicy[K, V]) Len() int { return p.inSize + p.amSize }
 
 // Reset clears all queue and ghost state.
-//
-//nolint:dupl // structurally similar to s3fifoPolicy.Reset but operates on different node types
 func (p *twoQPolicy[K, V]) Reset() {
 	for n := p.inHead; n != nil; {
 		nxt := n.next

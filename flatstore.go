@@ -129,10 +129,19 @@ func (s *flatStore[K, V]) get(key K) (*entry[K, V], bool) {
 }
 
 func (s *flatStore[K, V]) set(key K, e *entry[K, V]) {
+	// Probe first so a pure update on an existing key doesn't
+	// trigger a rebuild — only a fresh insert (Empty / Tombstone
+	// slot consumption) can push the load factor over the
+	// threshold.
+	idx, found := s.probe(key)
+	if found {
+		s.slots[idx].value = e
+		return
+	}
 	if s.shouldGrowBeforeInsert() {
 		s.rebuild(s.nextRebuildCap())
+		idx, _ = s.probe(key)
 	}
-	idx, found := s.probe(key)
 	slot := &s.slots[idx]
 	switch slot.state {
 	case flatSlotEmpty:
@@ -147,8 +156,8 @@ func (s *flatStore[K, V]) set(key K, e *entry[K, V]) {
 		s.occupied++
 		s.tombstones--
 	case flatSlotOccupied:
-		// Update in place; counters unchanged.
-		_ = found
+		// Defensive: shouldn't reach here after rebuild, but if a
+		// concurrent update slipped in, just overwrite.
 		slot.value = e
 	}
 }

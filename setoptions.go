@@ -13,7 +13,6 @@ type setConfig struct {
 	weight    int64         // 0 ⇒ "use the configured Weigher"
 	tags      []string      // attached to the entry; tag-index work lands in Phase 7
 	expireAt  time.Time     // populated when SetExpireAt is used; overrides ttl
-	priority  int8          // hint for future priority-aware policies
 	sliding   bool
 	hasTTL    bool
 	hasWeight bool
@@ -74,26 +73,5 @@ func SetExpireAt(t time.Time) SetOption {
 	return func(s *setConfig) {
 		s.expireAt = t
 		s.hasExpiry = true
-	}
-}
-
-// SetPriority hints to the eviction policy that this entry is more
-// (or less) valuable than its raw access pattern would suggest.
-// Higher values reduce eviction probability. Range -100 to +100;
-// values outside the range are clamped.
-//
-// No v0 policy consumes priority; the value is recorded on the
-// entry for forward compatibility. Future priority-aware policies
-// (e.g., a weighted variant of S3-FIFO) will read it.
-func SetPriority(p int) SetOption {
-	return func(s *setConfig) {
-		switch {
-		case p > 100:
-			s.priority = 100
-		case p < -100:
-			s.priority = -100
-		default:
-			s.priority = int8(p)
-		}
 	}
 }

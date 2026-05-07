@@ -1,5 +1,45 @@
 package memcache
 
+// gateLockFreeRead disables [WithLockFreeRead] when the cache's
+// configuration would make the fast path unsafe. Logs an info
+// message rather than failing New, since the option is purely a
+// performance opt-in — disabling it silently still yields a
+// working cache.
+func gateLockFreeRead(cfg *config) {
+	if !cfg.lockFreeRead || lockFreeReadSupported(cfg) {
+		return
+	}
+	if cfg.logger != nil {
+		cfg.logger.Info("memcache: WithLockFreeRead disabled (requires S3-FIFO policy and no WithExpireFunc)")
+	}
+	cfg.lockFreeRead = false
+}
+
+// lockFreeReadSupported reports whether the configured cache can
+// safely run the [WithLockFreeRead] fast path. Today the fast path
+// reads non-atomic entry fields (`e.flags`, `e.tags` via
+// `WithExpireFunc`'s metadata call) and dispatches through
+// `policy.PromotionNeeded`, which only S3-FIFO has made lock-free.
+//
+// Preconditions:
+//   - Policy must be S3-FIFO (the only policy with atomic per-entry
+//     state for PromotionNeeded).
+//   - WithExpireFunc must NOT be configured (its evaluation reads
+//     e.tags via Metadata).
+//
+// Future work: tighten flag/tag reads to be lock-free-safe and
+// extend other policies' PromotionNeeded to be safe under no lock,
+// then relax these preconditions.
+func lockFreeReadSupported(cfg *config) bool {
+	if cfg.policy != PolicyS3FIFO {
+		return false
+	}
+	if cfg.expireFunc != nil {
+		return false
+	}
+	return true
+}
+
 // readMap is the immutable read-side snapshot of a shard's storage,
 // published behind an [atomic.Pointer] so [Cache.Get] can consult
 // it without taking any shard lock. It is replaced wholesale on

@@ -272,6 +272,7 @@ func build[K comparable, V any](cfg *config, allowUnbounded bool) (*Cache[K, V],
 			Message: "WithMaxBytes requires WithWeigher",
 		}
 	}
+	gateLockFreeRead(cfg)
 
 	shardCount := nextPowerOfTwo(max(cfg.shards, 1))
 
@@ -417,8 +418,9 @@ func applyJitter(ttl, j time.Duration) time.Duration {
 	if j <= 0 {
 		return ttl
 	}
-	// rand.Int64N(2*j) is in [0, 2*j); subtract j to get [-j, +j-1].
-	delta := rand.Int64N(int64(2*j)) - int64(j)
+	// Closed interval [-j, +j]: rand.Int64N(2*j+1) is in [0, 2*j],
+	// shifting by -j gives [-j, +j].
+	delta := rand.Int64N(int64(2*j)+1) - int64(j)
 	return ttl + time.Duration(delta)
 }
 
@@ -1001,9 +1003,14 @@ func (c *Cache[K, V]) runHook(name string, fn func()) {
 	done := make(chan struct{})
 	start := c.cfg.clock.Now()
 	go func() {
+		// time.NewTimer (vs time.After) lets the timer be reclaimed
+		// as soon as `done` fires; relevant on hot paths with
+		// millions of OnEvict callbacks per minute.
+		t := time.NewTimer(deadline)
+		defer t.Stop()
 		select {
 		case <-done:
-		case <-time.After(deadline):
+		case <-t.C:
 			if c.cfg.logger != nil {
 				c.cfg.logger.Warn("memcache: callback exceeded WithCallbackTimeout",
 					"hook", name, "deadline", deadline)
@@ -1121,10 +1128,7 @@ func (c *Cache[K, V]) Set(key K, value V) error {
 // blocking call.
 func (c *Cache[K, V]) setCtx(ctx context.Context, key K, value V) error {
 	ttl := extractCacheableTTL(value, c.cfg.defaultTTL)
-	tags := extractCacheableTags(value)
-	if tpl := extractTemplateTags(value); len(tpl) > 0 {
-		tags = append(tags, tpl...)
-	}
+	tags := deriveAutoTags(value)
 	if c.async != nil {
 		return c.asyncSet(key, value, ttl, c.cfg.slidingTTL, tags)
 	}
@@ -1144,12 +1148,14 @@ func (c *Cache[K, V]) SetWithTTL(key K, value V, ttl time.Duration) error {
 	if ttl < 0 {
 		return ErrInvalidTTL
 	}
+	tags := deriveAutoTags(value)
 	if c.async != nil {
-		return c.asyncSet(key, value, ttl, c.cfg.slidingTTL, nil)
+		return c.asyncSet(key, value, ttl, c.cfg.slidingTTL, tags)
 	}
-	if err := c.setLocked(key, value, ttl, c.cfg.slidingTTL, nil); err != nil {
+	if err := c.setLocked(key, value, ttl, c.cfg.slidingTTL, tags); err != nil {
 		return err
 	}
+	c.enforceGroupBudgets(tags)
 	return c.propagateSetToStore(context.Background(), key, value, ttl)
 }
 
@@ -1174,6 +1180,15 @@ func (c *Cache[K, V]) SetWithOptions(key K, value V, opts ...SetOption) error {
 	if sc.hasTTL && sc.ttl < 0 {
 		return ErrInvalidTTL
 	}
+	if err := c.checkKeySize(key); err != nil {
+		return err
+	}
+	// Auto-tag from CacheTagger / template tags ONLY when the
+	// caller didn't supply explicit tags via SetTags. Per spec:
+	// explicit per-call options always win.
+	if sc.tags == nil {
+		sc.tags = deriveAutoTags(value)
+	}
 	if err := c.checkTagLimits(key, sc.tags); err != nil {
 		return err
 	}
@@ -1187,6 +1202,7 @@ func (c *Cache[K, V]) SetWithOptions(key K, value V, opts ...SetOption) error {
 				Key:        key,
 				Reason:     "explicit weight exceeds MaxValueWeight",
 				LimitField: "MaxValueWeight",
+				Cause:      ErrValueTooLarge,
 			}
 		}
 	} else {
@@ -1366,17 +1382,38 @@ func (c *Cache[K, V]) Reset() {
 			c.counters.entries.Add(-1)
 			c.counters.bytes.Add(-e.weight)
 			s.policy.OnRemove(e)
-			s.pool.put(e)
+			c.recycleOrInvalidate(s, e)
 			return true
 		})
 		s.storage.clearAll()
 		s.policy.Reset()
 		s.ttl.Reset()
+		// Replace the read snapshot so it no longer points at any
+		// of the entries we just removed. Lock-free readers
+		// holding a stale pointer keep working until GC.
+		if c.cfg.lockFreeRead {
+			s.read.Store(newEmptyReadMap[K, V]())
+			s.readMisses.Store(0)
+		}
 		s.mu.Unlock()
 	}
 	if c.tags != nil {
 		c.tags.reset()
 	}
+}
+
+// recycleOrInvalidate is the common entry-disposal helper for
+// bulk-removal paths (`Reset`, `Clear`). When [WithLockFreeRead]
+// is on, it marks the entry invalidated so readers holding the
+// previous snapshot observe a miss; otherwise it returns the
+// entry to the per-shard pool. Mirrors the same conditional in
+// [Cache.removeLocked].
+func (c *Cache[K, V]) recycleOrInvalidate(s *shard[K, V], e *entry[K, V]) {
+	if c.cfg.lockFreeRead {
+		e.markInvalidated()
+		return
+	}
+	s.pool.put(e)
 }
 
 // Close releases all resources, stops every shard's janitor goroutine,
@@ -1393,6 +1430,14 @@ func (c *Cache[K, V]) Close() error {
 	if !c.closed.CompareAndSwap(false, true) {
 		return nil
 	}
+	// Stop the auto-save goroutine FIRST so its tick handler can't
+	// observe `closed=true` mid-Close and produce a spurious
+	// "cache closed" warning. saveFileTo below bypasses the closed
+	// check explicitly so the final snapshot still runs.
+	if c.autoSaveStop != nil {
+		close(c.autoSaveStop)
+		<-c.autoSaveDone
+	}
 	// Drain any pending async writes BEFORE the snapshot so the
 	// final on-disk state reflects every Set/Delete the caller
 	// returned from. The apply goroutine drains-and-exits when its
@@ -1406,10 +1451,6 @@ func (c *Cache[K, V]) Close() error {
 			c.cfg.logger.Warn("memcache: final auto-save failed",
 				"path", c.cfg.autoSavePath, "err", err)
 		}
-	}
-	if c.autoSaveStop != nil {
-		close(c.autoSaveStop)
-		<-c.autoSaveDone
 	}
 	c.stopAllJanitors()
 	if c.invalidationSubscriberDone != nil {
@@ -1441,7 +1482,7 @@ func (c *Cache[K, V]) runPurgeVisitor() {
 		s.mu.RLock()
 		s.storage.each(func(e *entry[K, V]) bool {
 			if !e.flags.has(flagNegative) {
-				staged = append(staged, kv{k: e.key, v: e.loadValue()})
+				staged = append(staged, kv{k: e.key, v: c.returnValue(e.loadValue())})
 			}
 			return true
 		})
@@ -1520,6 +1561,9 @@ func (c *Cache[K, V]) setLocked(key K, value V, ttl time.Duration, sliding bool,
 	if c.closed.Load() {
 		return ErrClosed
 	}
+	if err := c.checkKeySize(key); err != nil {
+		return err
+	}
 	weight, err := c.computeWeight(key, value)
 	if err != nil {
 		return err
@@ -1532,6 +1576,36 @@ func (c *Cache[K, V]) setLocked(key K, value V, ttl time.Duration, sliding bool,
 	defer s.mu.Unlock()
 	c.upsertLocked(s, key, value, weight, c.effectiveTTL(ttl), sliding, int64(ttl), tags)
 	return nil
+}
+
+// checkKeySize enforces [WithMaxKeySize] for caches whose K type
+// has a meaningful byte length (`string` or `[]byte`). Returns nil
+// when the limit isn't configured or the key fits; otherwise
+// returns a [*CapacityError] wrapping [ErrKeyTooLarge]. Other K
+// types pay no overhead and never error — the size of a struct or
+// integer key is implementation-defined.
+func (c *Cache[K, V]) checkKeySize(key K) error {
+	if c.cfg.maxKeySize <= 0 {
+		return nil
+	}
+	var n int
+	switch k := any(key).(type) {
+	case string:
+		n = len(k)
+	case []byte:
+		n = len(k)
+	default:
+		return nil
+	}
+	if n <= c.cfg.maxKeySize {
+		return nil
+	}
+	return &CapacityError{
+		Key:        key,
+		Reason:     "key exceeds MaxKeySize",
+		LimitField: "MaxKeySize",
+		Cause:      ErrKeyTooLarge,
+	}
 }
 
 // checkTagLimits decorates a [Cache.validateTagLimits] result
@@ -1559,6 +1633,7 @@ func (c *Cache[K, V]) computeWeight(key K, value V) (int64, error) {
 			Key:        key,
 			Reason:     "value weight exceeds MaxValueWeight",
 			LimitField: "MaxValueWeight",
+			Cause:      ErrValueTooLarge,
 		}
 	}
 	return weight, nil
@@ -1800,8 +1875,14 @@ func (c *Cache[K, V]) removeLocked(s *shard[K, V], e *entry[K, V], reason Evicti
 		// stale snapshot pointer observes the deletion. Skip
 		// pooling — concurrent readers may still be dereferencing
 		// the entry; let GC reclaim it after the next snapshot
-		// promotion drops the last reference.
+		// promotion drops the last reference. Bump readMisses so
+		// expire-only workloads (where reads don't tick the miss
+		// counter) eventually trigger a promotion that drops the
+		// stale entry from the snapshot.
 		e.markInvalidated()
+		if s.readMisses.Add(1) >= s.readMissThreshold() {
+			c.promoteReadMapLocked(s)
+		}
 	} else {
 		s.pool.put(e)
 	}
@@ -1874,7 +1955,7 @@ func (c *Cache[K, V]) rangeShard(s *shard[K, V], now int64, fn func(K, V) bool) 
 		if c.entryExpiredLocked(e, now) || e.flags.has(flagNegative) {
 			return true
 		}
-		if !fn(e.key, e.loadValue()) {
+		if !fn(e.key, c.returnValue(e.loadValue())) {
 			stopped = true
 			return false
 		}
@@ -1917,12 +1998,19 @@ func (c *Cache[K, V]) Clear() {
 				c.counters.evictionsByReason[EvictReasonClear].Add(1)
 			}
 			s.policy.OnRemove(e)
-			s.pool.put(e)
+			c.recycleOrInvalidate(s, e)
 			return true
 		})
 		s.storage.clearAll()
 		s.policy.Reset()
 		s.ttl.Reset()
+		// Replace the read snapshot so it no longer points at any
+		// of the entries we just removed. Lock-free readers
+		// holding a stale pointer keep working until GC.
+		if c.cfg.lockFreeRead {
+			s.read.Store(newEmptyReadMap[K, V]())
+			s.readMisses.Store(0)
+		}
 		s.mu.Unlock()
 	}
 	if c.tags != nil {
@@ -2059,7 +2147,7 @@ func (c *Cache[K, V]) SetIfAbsent(key K, value V) (bool, error) {
 	}
 	c.upsertLocked(s, key, value, weight,
 		c.effectiveTTL(c.cfg.defaultTTL),
-		c.cfg.slidingTTL, int64(c.cfg.defaultTTL), nil)
+		c.cfg.slidingTTL, int64(c.cfg.defaultTTL), deriveAutoTags(value))
 	return true, nil
 }
 
@@ -2084,7 +2172,7 @@ func (c *Cache[K, V]) SetIfPresent(key K, value V) (bool, error) {
 	}
 	c.upsertLocked(s, key, value, weight,
 		c.effectiveTTL(c.cfg.defaultTTL),
-		c.cfg.slidingTTL, int64(c.cfg.defaultTTL), nil)
+		c.cfg.slidingTTL, int64(c.cfg.defaultTTL), deriveAutoTags(value))
 	return true, nil
 }
 
@@ -2104,7 +2192,7 @@ func (c *Cache[K, V]) DeleteIf(key K, pred func(V) bool) bool {
 	if !ok || c.entryExpiredLocked(e, now) || e.flags.has(flagNegative) {
 		return false
 	}
-	if !pred(e.loadValue()) {
+	if !pred(c.returnValue(e.loadValue())) {
 		return false
 	}
 	c.removeLocked(s, e, EvictReasonDeleted)
@@ -2143,7 +2231,7 @@ func (c *Cache[K, V]) GetOrSet(key K, value V) (V, bool, error) {
 	}
 	c.upsertLocked(s, key, value, weight,
 		c.effectiveTTL(c.cfg.defaultTTL),
-		c.cfg.slidingTTL, int64(c.cfg.defaultTTL), nil)
+		c.cfg.slidingTTL, int64(c.cfg.defaultTTL), deriveAutoTags(value))
 	return value, false, nil
 }
 
@@ -2169,32 +2257,43 @@ func (c *Cache[K, V]) PeekOrAdd(key K, value V) (V, bool, error) {
 	}
 	c.upsertLocked(s, key, value, weight,
 		c.effectiveTTL(c.cfg.defaultTTL),
-		c.cfg.slidingTTL, int64(c.cfg.defaultTTL), nil)
+		c.cfg.slidingTTL, int64(c.cfg.defaultTTL), deriveAutoTags(value))
 	return value, false, nil
 }
 
 // Resize changes the cache's bound at runtime. When MaxEntries is the
 // configured bound, newSize is interpreted as the new entry budget;
 // when MaxBytes is the configured bound, newSize is the new byte
-// budget. Resize returns the number of entries evicted as a result
-// of shrinking; growing the cache evicts nothing.
+// budget. For caches built via [NewUnbounded] (neither bound set),
+// Resize is interpreted as setting MaxEntries — pick the desired
+// dimension at construction time if you need to be sure.
+//
+// Resize returns the number of entries evicted as a result of
+// shrinking; growing the cache (or passing newSize ≤ 0) evicts
+// nothing and returns 0.
 //
 // Per-shard sub-budgets are recomputed and propagated to each shard
 // and its eviction policy via [evictionPolicy.SetBudget]. Subsequent
 // Set/Compute calls drive any further eviction the policies need.
+//
+// Concurrency: Resize mutates the cache's bound fields without a
+// lock. Hot-path code does not read these fields, so there is no
+// race against ongoing Get/Set; concurrent Resize calls produce a
+// last-writer-wins result on the bound and an additive count of
+// evictions.
 func (c *Cache[K, V]) Resize(newSize int64) int {
-	if c.closed.Load() {
-		return 0
-	}
-	if newSize < 0 {
+	if c.closed.Load() || newSize <= 0 {
 		return 0
 	}
 	c.counters.resizes.Add(1)
 
-	if c.cfg.maxEntries > 0 || c.cfg.maxBytes <= 0 {
-		c.cfg.maxEntries = int(newSize)
-	} else {
+	// "Bytes-bounded" iff explicitly configured at construction —
+	// don't promote a 0-bytes cache to byte-bounded just because
+	// maxEntries happens to be 0.
+	if c.cfg.maxBytes > 0 {
 		c.cfg.maxBytes = newSize
+	} else {
+		c.cfg.maxEntries = int(newSize)
 	}
 
 	perShard := perShardBudget(c.cfg.maxEntries, len(c.shards))
@@ -2384,7 +2483,7 @@ func (c *Cache[K, V]) DeleteWhere(pred func(key K, value V) bool) int {
 			if c.entryExpiredLocked(e, now) || e.flags.has(flagNegative) {
 				return true
 			}
-			pairs = append(pairs, candidate{key: e.key, value: e.loadValue()})
+			pairs = append(pairs, candidate{key: e.key, value: c.returnValue(e.loadValue())})
 			return true
 		})
 		s.mu.RUnlock()
@@ -2567,7 +2666,7 @@ func (c *Cache[K, V]) loadOrJoin(
 		if c.cfg.statsEnabled {
 			c.counters.loadCoalesced.Add(1)
 		}
-		return waitForFlight(ctx, flight)
+		return c.waitOrLeave(ctx, s, key, flight)
 	}
 
 	// Rate limit BEFORE registering a flight so a rejected leader
@@ -2595,7 +2694,38 @@ func (c *Cache[K, V]) loadOrJoin(
 	s.mu.Unlock()
 
 	go c.runLoader(loaderCtx, s, key, flight, fn) //nolint:contextcheck // detached by design
-	return waitForFlight(ctx, flight)
+	return c.waitOrLeave(ctx, s, key, flight)
+}
+
+// waitOrLeave blocks on the flight's completion or the caller's
+// ctx cancellation. On ctx-cancel it acquires the shard lock to
+// atomically (a) decrement the flight's refcount, (b) cancel the
+// loader's ctx if all waiters have left, and (c) remove the flight
+// from `s.inflight` so no new joiner can attach to a flight whose
+// loader is about to abort. This closes the race window where a
+// late joiner could otherwise observe the loader's `context.
+// Canceled` error from a context they never owned.
+func (c *Cache[K, V]) waitOrLeave(ctx context.Context, s *shard[K, V], key K, flight *flightCall[V]) (V, error) {
+	var zero V
+	select {
+	case <-flight.done:
+		if flight.err != nil {
+			return zero, flight.err
+		}
+		return flight.val, nil
+	case <-ctx.Done():
+		s.mu.Lock()
+		if flight.refs.Add(-1) == 0 {
+			if cur, ok := s.inflight[key]; ok && cur == flight {
+				delete(s.inflight, key)
+			}
+			if flight.cancel != nil {
+				flight.cancel()
+			}
+		}
+		s.mu.Unlock()
+		return zero, ctx.Err() //nolint:wrapcheck // pass ctx.Err verbatim
+	}
 }
 
 // newLoaderCtx builds the loader's context. Always cancellable so
@@ -2606,6 +2736,23 @@ func (c *Cache[K, V]) newLoaderCtx() (context.Context, context.CancelFunc) {
 		return context.WithTimeout(context.Background(), c.cfg.loaderTimeout)
 	}
 	return context.WithCancel(context.Background())
+}
+
+// tagLoaderTimeout joins [ErrLoaderTimeout] onto a deadline error
+// produced under [WithLoaderTimeout] so callers can distinguish a
+// per-loader timeout from a generic caller-canceled context. The
+// original deadline error is retained via errors.Join so existing
+// `errors.Is(err, context.DeadlineExceeded)` checks keep working.
+// No-op for nil errors, errors that aren't deadline-related, or
+// caches without a loader timeout configured.
+func (c *Cache[K, V]) tagLoaderTimeout(err error) error {
+	if err == nil || c.cfg.loaderTimeout <= 0 {
+		return err
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	return errors.Join(ErrLoaderTimeout, err)
 }
 
 // runLoader executes fn in a fresh goroutine, persists the result
@@ -2651,6 +2798,7 @@ func (c *Cache[K, V]) runLoader(
 	loadStart := c.cfg.clock.Now()
 	val, ttl, err := fn(loaderCtx, key)
 	c.counters.loadLatency.Record(c.cfg.clock.Now().Sub(loadStart))
+	err = c.tagLoaderTimeout(err)
 	flight.val = val
 	flight.ttl = ttl
 	flight.err = err
@@ -2672,11 +2820,17 @@ func (c *Cache[K, V]) runLoader(
 		if c.cfg.statsEnabled {
 			c.counters.loadErrors.Add(1)
 		}
-	case c.cfg.errorTTL > 0 && !errors.Is(err, ErrNotFound):
+	case c.cfg.errorTTL > 0 && !errors.Is(err, ErrNotFound) &&
+		!errors.Is(err, context.Canceled) &&
+		!errors.Is(err, context.DeadlineExceeded):
 		// WithErrorTTL caches "the loader broke" errors but
-		// explicitly skips ErrNotFound so that
-		// WithNegativeCache remains the only path for
-		// not-found tombstones.
+		// explicitly skips:
+		//   - ErrNotFound: WithNegativeCache is the only path
+		//     for not-found tombstones.
+		//   - context.Canceled / DeadlineExceeded: caching a
+		//     cancellation produced by ONE caller's context
+		//     would surface that error to subsequent unrelated
+		//     callers within errorTTL.
 		s.errors[key] = &cachedError{
 			err:      err,
 			expireAt: c.cfg.clock.Now().UnixNano() + int64(c.cfg.errorTTL),
@@ -2815,27 +2969,6 @@ func (c *Cache[K, V]) triggerAsyncRefreshLocked(s *shard[K, V], key K) {
 	flight := newFlightCall[V](cancel)
 	s.inflight[key] = flight
 	go c.runLoader(loaderCtx, s, key, flight, c.loader.Load)
-}
-
-// waitForFlight blocks until the flight resolves or ctx is canceled.
-// On ctx cancel the canceling waiter decrements the flight's
-// refcount via [flightCall.leave]; the loader keeps running while
-// any other waiter is still interested. When ALL waiters have
-// canceled, leave's atomic decrement reaches zero and the flight's
-// stored cancel function fires — the Loader's context goes Done
-// and (if it respects ctx) the load aborts with ctx.Canceled.
-func waitForFlight[V any](ctx context.Context, flight *flightCall[V]) (V, error) {
-	var zero V
-	select {
-	case <-flight.done:
-		if flight.err != nil {
-			return zero, flight.err
-		}
-		return flight.val, nil
-	case <-ctx.Done():
-		flight.leave()
-		return zero, ctx.Err() //nolint:wrapcheck // pass ctx.Err verbatim
-	}
 }
 
 // GetMulti returns the cached value for each key in keys. Missing

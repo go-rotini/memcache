@@ -107,6 +107,43 @@ func TestAddInThePast(t *testing.T) {
 	}
 }
 
+// TestAdvanceSlotAwareDecrement is a regression test for the
+// over-decrement in AdvanceTo. Previously the formula applied a
+// blanket `extraRev` decrement to every slot regardless of whether
+// the cursor's partial sweep actually crossed that slot, so an
+// entry sitting in a slot the partial didn't reach would be evicted
+// one revolution too early. The fix splits the advance into
+// "full revolutions" (decrement everyone) plus a partial slot-by-
+// slot scan.
+func TestAdvanceSlotAwareDecrement(t *testing.T) {
+	// 4-slot wheel. Two entries: e1 in a slot the partial sweep
+	// will cross, e2 in a slot it will NOT cross. Both have the
+	// same revolutions count.
+	w := New[string](4, tick, origin)
+	// ExpireAtNs=10 → ticksAhead=10, slot=(0+10)%4=2, rev=(10-1)/4=2.
+	e1 := &Entry[string]{Payload: "in-partial", ExpireAtNs: 10 * tick}
+	// ExpireAtNs=11 → slot=(0+11)%4=3, rev=(11-1)/4=2.
+	e2 := &Entry[string]{Payload: "outside-partial", ExpireAtNs: 11 * tick}
+	w.Add(e1)
+	w.Add(e2)
+	if e1.revolutions != 2 || e2.revolutions != 2 {
+		t.Fatalf("setup: e1.rev=%d e2.rev=%d, want 2 each",
+			e1.revolutions, e2.revolutions)
+	}
+	// Advance 10 ticks: 2 full revs + 2-tick partial. The partial
+	// crosses slots 1 and 2 — so e1 in slot 2 sees an extra
+	// crossing (3 total) and expires; e2 in slot 3 sees only the
+	// 2 full-rev crossings and survives with rev=0.
+	exp := w.AdvanceTo(10 * tick)
+	if len(exp) != 1 {
+		t.Errorf("AdvanceTo(10) expirations = %d, want 1 (only e1)", len(exp))
+	}
+	if e2.revolutions != 0 {
+		t.Errorf("e2.revolutions = %d, want 0 (full revs decremented; partial didn't cross)",
+			e2.revolutions)
+	}
+}
+
 func TestNilEntrySafe(t *testing.T) {
 	w := New[string](4, tick, origin)
 	w.Add(nil)    // must not panic

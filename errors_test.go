@@ -10,9 +10,9 @@ func TestSentinelErrorsDistinct(t *testing.T) {
 	sentinels := []error{
 		ErrNotFound, ErrClosed, ErrUnbounded, ErrNoLoader, ErrInvalidTTL,
 		ErrSnapshotIncompatible, ErrSnapshotCorrupt,
-		ErrKeyTooLarge, ErrValueTooLarge, ErrTooManyTags, ErrPolicyConfig,
+		ErrKeyTooLarge, ErrValueTooLarge, ErrTooManyTags,
 		ErrLoaderRateLimited, ErrLoaderTimeout, ErrLoaderTooManyInFlight,
-		ErrComputeReentrant, ErrUnsupportedKeyType, ErrViewReadOnly,
+		ErrComputeReentrant,
 	}
 	seen := make(map[string]bool)
 	for _, s := range sentinels {

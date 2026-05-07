@@ -133,6 +133,20 @@ func extractCacheableTags[V any](value V) []string {
 	return nil
 }
 
+// deriveAutoTags merges [CacheTagger].CacheTags() and any
+// `cache:"...,tag=..."` template tags from value. Returns nil if
+// neither source produces any tags. Used by every Set entry point
+// that doesn't take explicit tags so all paths (`Set`,
+// `SetWithTTL`, `SetIfAbsent`, `GetOrSet`, etc.) auto-tag
+// uniformly.
+func deriveAutoTags[V any](value V) []string {
+	tags := extractCacheableTags(value)
+	if tpl := extractTemplateTags(value); len(tpl) > 0 {
+		tags = append(tags, tpl...)
+	}
+	return tags
+}
+
 // SetCacheable stores v in c under the key returned by
 // v.CacheKey(). Compile-time constrained to caches with `K=string`
 // because `CacheKey()` returns string; non-string-keyed caches use

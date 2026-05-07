@@ -82,14 +82,12 @@ const (
 	EvictReasonResize                              // Resize shrunk the cache
 	EvictReasonComputed                            // Compute returned ComputeDelete
 	EvictReasonClear                               // Clear()
-	EvictReasonClose                               // Close()
-	EvictReasonLoadError                           // Loader failed during refresh
 	EvictReasonStoreRollback                       // Store write-through failed; in-memory rolled back
 )
 
 // numEvictionReasons is the count of distinct reasons. Update if reasons
 // are added.
-const numEvictionReasons = 15
+const numEvictionReasons = 13
 
 // String returns a human-readable name for the reason.
 func (r EvictionReason) String() string {
@@ -118,10 +116,6 @@ func (r EvictionReason) String() string {
 		return "computed"
 	case EvictReasonClear:
 		return "clear"
-	case EvictReasonClose:
-		return "close"
-	case EvictReasonLoadError:
-		return "load-error"
 	case EvictReasonStoreRollback:
 		return "store-rollback"
 	default:
@@ -145,7 +139,6 @@ const (
 	EventInvalidateTag
 	EventResize
 	EventSnapshot // Save/Load completion
-	EventCompute  // Compute fired (off by default; for audit)
 )
 
 // String returns a human-readable name for the event kind.
@@ -173,8 +166,6 @@ func (k EventKind) String() string {
 		return "resize"
 	case EventSnapshot:
 		return "snapshot"
-	case EventCompute:
-		return "compute"
 	default:
 		return unknownString
 	}
@@ -282,8 +273,9 @@ type Number interface {
 }
 
 // Prefixer is implemented by key types that have a meaningful "prefix"
-// concept. DeletePrefix first checks if K is string, then falls back to
-// this interface, then returns ErrUnsupportedKeyType.
+// concept. [Cache.DeletePrefix] first checks if K is string, then
+// falls back to this interface; for K types that satisfy neither,
+// DeletePrefix is a silent no-op (returns 0).
 type Prefixer interface {
 	HasPrefix(prefix string) bool
 }
