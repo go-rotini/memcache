@@ -110,14 +110,25 @@ func (c *Cache[K, V]) startJanitorLocked(s *shard[K, V]) {
 
 // stopJanitor signals the janitor to exit. Idempotent — calling on
 // a stopped janitor is a no-op.
+//
+// Acquires s.mu so reads of `s.janitor.stop`/`s.janitor.timer` are
+// serialized with [startJanitorLocked]'s writes; otherwise a
+// concurrent restart (e.g., from a refresh-ahead Loader Set during
+// Close) races on those fields.
 func (c *Cache[K, V]) stopJanitor(s *shard[K, V]) {
 	if !s.janitor.running.CompareAndSwap(true, false) {
 		return
 	}
-	if s.janitor.timer != nil {
-		s.janitor.timer.Stop()
+	s.mu.Lock()
+	timer := s.janitor.timer
+	stop := s.janitor.stop
+	s.mu.Unlock()
+	if timer != nil {
+		timer.Stop()
 	}
-	close(s.janitor.stop)
+	if stop != nil {
+		close(stop)
+	}
 }
 
 // janitorIdleShutdownTicks is how many consecutive idle ticks the

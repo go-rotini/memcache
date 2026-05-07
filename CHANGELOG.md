@@ -150,6 +150,16 @@ invalidation, snapshot persistence, and tiered composition.
   an open-addressed flat hash table with linear probing and
   tombstone-driven compactions instead of `map[K]*entry`. Surfaces
   `Stats.Compactions` for observability.
+- **Concurrency limits**: `WithMaxConcurrentLoads(n)` semaphore;
+  `WithLoaderRateLimit(perSecond)` token bucket;
+  `WithLoaderTimeout(d)` per-call deadline.
+- **Determinism for tests**: `WithClock(Clock)` + `NewFakeClock(...)`
+  for deterministic TTL exercises without `time.Sleep`.
+- **Test scaffolding**: 14 godoc `Example` tests, 7 acceptance
+  scenarios (REPL warm restart, token refresh, fsnotify-style
+  invalidation, 1000-goroutine stampede, daemon snapshot rotation,
+  negative cache, tiered warm pool), 9 benchmarks, 4 fuzz targets,
+  6 regression-corpus tests.
 
 ### Performance baseline
 
@@ -163,16 +173,6 @@ work for TTL/policy/hooks/observability even with the lock-free
 path enabled). `WithLockFreeRead()` reduces Get from ~58 ns/op to
 ~21 ns/op when stats are disabled — the structural improvement
 the gate intended to drive.
-- **Concurrency limits**: `WithMaxConcurrentLoads(n)` semaphore;
-  `WithLoaderRateLimit(perSecond)` token bucket;
-  `WithLoaderTimeout(d)` per-call deadline.
-- **Determinism for tests**: `WithClock(Clock)` + `NewFakeClock(...)`
-  for deterministic TTL exercises without `time.Sleep`.
-- **Test scaffolding**: 14 godoc `Example` tests, 7 acceptance
-  scenarios (REPL warm restart, token refresh, fsnotify-style
-  invalidation, 1000-goroutine stampede, daemon snapshot rotation,
-  negative cache, tiered warm pool), 9 benchmarks, 4 fuzz targets,
-  6 regression-corpus tests.
 
 ### Fixed
 
