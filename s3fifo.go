@@ -41,6 +41,19 @@ type s3fifoPolicy[K comparable, V any] struct {
 	ghostSize            int
 	ghostBudget          int
 	ghostSet             map[K]*s3GhostNode[K]
+
+	// recentInsert is the node most recently registered via OnInsert.
+	// Victim refuses to return it as a victim - rotating it past head
+	// instead - so the just-inserted entry cannot be evicted by the
+	// post-insert eviction loop the cache runs synchronously after
+	// Set. Without this guard a single Set/Get round-trip can lose
+	// its entry: e.g. with a tiny Main saturated at freq>=1, a Ghost-
+	// rebirth insert lands a new node at Main tail; the rotation
+	// loop then drains all original entries to freq=0 and the new
+	// node arrives at head with freq=0 first, becoming the victim.
+	// Cleared by OnRemove (if the recent node is itself removed) and
+	// by Reset; otherwise just overwritten by the next OnInsert.
+	recentInsert *s3Node[K, V]
 }
 
 // s3Node is the intrusive list node attached to an entry's
@@ -114,9 +127,11 @@ func (p *s3fifoPolicy[K, V]) SetBudget(budget int) {
 }
 
 // OnInsert places e into Main if its key is in Ghost, otherwise Small.
-// Ghost-rebirth entries start at freq=1 so they survive at least one
-// Main second-chance pass and aren't picked as victim by the same
-// post-insert eviction loop.
+// Ghost-rebirth entries start at freq=1 (vs 0 for fresh Small inserts)
+// so they survive at least one Main second-chance pass. The node is
+// also recorded as recentInsert so Victim refuses to evict it during
+// this Set's eviction loop; freq alone is not enough protection when
+// existing Main entries are saturated above freq=1.
 func (p *s3fifoPolicy[K, V]) OnInsert(e *entry[K, V]) {
 	n := &s3Node[K, V]{entry: e}
 	e.policyData = n
@@ -129,6 +144,7 @@ func (p *s3fifoPolicy[K, V]) OnInsert(e *entry[K, V]) {
 	} else {
 		p.pushSmallTail(n)
 	}
+	p.recentInsert = n
 }
 
 // OnAccess bumps the entry's freq counter (saturating at 3). Membership
@@ -162,6 +178,9 @@ func (p *s3fifoPolicy[K, V]) OnRemove(e *entry[K, V]) {
 	} else {
 		p.unlinkSmall(n)
 	}
+	if p.recentInsert == n {
+		p.recentInsert = nil
+	}
 	n.entry = nil
 	n.next = nil
 	n.prev = nil
@@ -177,17 +196,28 @@ func (p *s3fifoPolicy[K, V]) OnRemove(e *entry[K, V]) {
 // budget, so internal rotations that don't yield an eviction simply
 // continue the loop here.
 func (p *s3fifoPolicy[K, V]) Victim() *entry[K, V] {
-	// Bound the loop by the worst-case rotation count: each Main
-	// entry can require up to (s3FreqMax + 1) decrement-and-rotate
-	// passes before its freq reaches zero, and Small can promote
-	// every entry into Main once. A tighter bound (smallSize+mainSize+1)
-	// can exit early with both queues still over budget when freqs
-	// are saturated, which previously fell through to the defensive
+	// Bound the loop by the worst-case rotation count: each entry
+	// can require up to (s3FreqMax + 1) decrement-and-rotate passes
+	// before its freq reaches zero, plus one extra cycle to absorb
+	// recentInsert rotations (Victim refuses to evict the just-
+	// inserted node and rotates it instead, costing one iteration
+	// per cycle). A tighter bound (smallSize+mainSize+1) can exit
+	// early with both queues still over budget when freqs are
+	// saturated, which previously fell through to the defensive
 	// fallback and evicted the wrong queue.
-	maxRotations := (p.smallSize+p.mainSize)*(int(s3FreqMax)+1) + 1
+	maxRotations := (p.smallSize+p.mainSize+1)*(int(s3FreqMax)+1) + 1
 	for range maxRotations {
 		if p.smallSize > p.smallBudget && p.smallHead != nil {
 			n := p.smallHead
+			if n == p.recentInsert {
+				// Don't evict / promote the just-inserted entry
+				// during its own post-insert eviction loop;
+				// rotate it past head and let another candidate
+				// surface.
+				p.unlinkSmall(n)
+				p.pushSmallTail(n)
+				continue
+			}
 			if n.freq.Load() >= 1 {
 				// Promote to Main: clear freq per S3-FIFO
 				// semantics so it gets a fair shake there.
@@ -204,6 +234,11 @@ func (p *s3fifoPolicy[K, V]) Victim() *entry[K, V] {
 		}
 		if p.mainSize > p.mainBudget && p.mainHead != nil {
 			n := p.mainHead
+			if n == p.recentInsert {
+				p.unlinkMain(n)
+				p.pushMainTail(n)
+				continue
+			}
 			if n.freq.Load() >= 1 {
 				n.freq.Add(^uint32(0))
 				p.unlinkMain(n)
@@ -217,25 +252,46 @@ func (p *s3fifoPolicy[K, V]) Victim() *entry[K, V] {
 		return nil
 	}
 	// Defensive fallback: if we somehow looped without returning,
-	// pick from whichever queue is actually over budget. Evicting
-	// from an at-budget Small (the default before this fix) can
-	// drop a freshly inserted entry while the over-budget Main is
-	// the real culprit.
-	if p.mainSize > p.mainBudget && p.mainHead != nil {
-		n := p.mainHead
-		p.unlinkMain(n)
-		return n.entry
+	// pick from whichever queue is actually over budget, skipping
+	// recentInsert. Evicting from an at-budget Small (the default
+	// before this fix) can drop a freshly inserted entry while the
+	// over-budget Main is the real culprit.
+	if p.mainSize > p.mainBudget {
+		if n := p.firstMainNotRecent(); n != nil {
+			p.unlinkMain(n)
+			return n.entry
+		}
 	}
-	if p.smallHead != nil {
-		n := p.smallHead
+	if n := p.firstSmallNotRecent(); n != nil {
 		p.unlinkSmall(n)
 		p.recordGhost(n.entry.key)
 		return n.entry
 	}
-	if p.mainHead != nil {
-		n := p.mainHead
+	if n := p.firstMainNotRecent(); n != nil {
 		p.unlinkMain(n)
 		return n.entry
+	}
+	return nil
+}
+
+// firstSmallNotRecent returns the oldest Small node that isn't the
+// just-inserted entry, or nil if no such node exists.
+func (p *s3fifoPolicy[K, V]) firstSmallNotRecent() *s3Node[K, V] {
+	for n := p.smallHead; n != nil; n = n.next {
+		if n != p.recentInsert {
+			return n
+		}
+	}
+	return nil
+}
+
+// firstMainNotRecent returns the oldest Main node that isn't the
+// just-inserted entry, or nil if no such node exists.
+func (p *s3fifoPolicy[K, V]) firstMainNotRecent() *s3Node[K, V] {
+	for n := p.mainHead; n != nil; n = n.next {
+		if n != p.recentInsert {
+			return n
+		}
 	}
 	return nil
 }
@@ -280,6 +336,7 @@ func (p *s3fifoPolicy[K, V]) Reset() {
 	p.ghostHead, p.ghostTail = nil, nil
 	p.smallSize, p.mainSize, p.ghostSize = 0, 0, 0
 	p.ghostSet = make(map[K]*s3GhostNode[K])
+	p.recentInsert = nil
 }
 
 // pushSmallTail appends n to the tail (newest) of the Small queue.
