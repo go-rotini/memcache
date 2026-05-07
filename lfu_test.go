@@ -119,3 +119,150 @@ func TestLFUVictimAfterEmptyBucket(t *testing.T) {
 		t.Errorf("Victim = %v, want b (lowest freq)", v)
 	}
 }
+
+func TestLFUUpdateBehavesLikeAccess(t *testing.T) {
+	p := newLFU[string, int]()
+	a := makeLFUEntry("a")
+	p.OnInsert(a)
+	p.OnUpdate(a)
+	n := a.policyData.(*lfuNode[string, int])
+	if n.freq != 2 {
+		t.Errorf("after OnUpdate, freq=%d want 2", n.freq)
+	}
+}
+
+func TestLFUSetBudgetIsNoop(t *testing.T) {
+	p := newLFU[string, int]()
+	a := makeLFUEntry("a")
+	p.OnInsert(a)
+	p.SetBudget(0)
+	p.SetBudget(100)
+	p.SetBudget(-1)
+	if p.Len() != 1 {
+		t.Errorf("Len after SetBudget = %d, want 1", p.Len())
+	}
+}
+
+func TestLFUSnapshot(t *testing.T) {
+	p := newLFU[string, int]()
+	a := makeLFUEntry("a")
+	b := makeLFUEntry("b")
+	p.OnInsert(a)
+	p.OnInsert(b)
+	p.OnAccess(a) // a now in bucket 2
+	d, ok := p.Snapshot().(PolicyDetailLFU)
+	if !ok {
+		t.Fatalf("Snapshot type %T, want PolicyDetailLFU", p.Snapshot())
+	}
+	if d.Size != 2 {
+		t.Errorf("Size = %d, want 2", d.Size)
+	}
+	if d.DistinctBuckets != 2 {
+		t.Errorf("DistinctBuckets = %d, want 2", d.DistinctBuckets)
+	}
+}
+
+func TestLFUPromotionNeededAlwaysTrue(t *testing.T) {
+	p := newLFU[string, int]()
+	a := makeLFUEntry("a")
+	p.OnInsert(a)
+	if !p.PromotionNeeded(a) {
+		t.Error("LFU PromotionNeeded should always return true")
+	}
+}
+
+// TestLFUVictimWalksToNextNonEmpty drives nextNonEmpty by manually
+// putting the policy into a state where minFreq points at a stale,
+// missing bucket but a non-empty bucket exists at higher freq. The
+// Victim loop must scan forward and find it.
+func TestLFUVictimWalksToNextNonEmpty(t *testing.T) {
+	p := newLFU[string, int]()
+	a := makeLFUEntry("a")
+	p.OnInsert(a)
+	// Promote 'a' a few times so it sits in bucket 5.
+	p.OnAccess(a)
+	p.OnAccess(a)
+	p.OnAccess(a)
+	p.OnAccess(a) // now in bucket 5, minFreq=5
+	// Force minFreq stale: simulate a state where minFreq points at
+	// a missing bucket so Victim must walk via nextNonEmpty.
+	p.minFreq = 1
+	v := p.Victim()
+	if v == nil || v.key != "a" {
+		t.Errorf("Victim with stale minFreq = %v, want a", v)
+	}
+}
+
+func TestLFUNextNonEmptyEmptyMap(t *testing.T) {
+	p := newLFU[string, int]()
+	if _, ok := p.nextNonEmpty(0); ok {
+		t.Error("nextNonEmpty on empty buckets should return false")
+	}
+}
+
+// TestLFUNextNonEmptySkipsEmptyBuckets exercises the "list.head == nil"
+// continue branch by injecting an empty bucket directly.
+func TestLFUNextNonEmptySkipsEmptyBuckets(t *testing.T) {
+	p := newLFU[string, int]()
+	a := makeLFUEntry("a")
+	p.OnInsert(a)
+	p.OnAccess(a) // bucket{1} empties, bucket{2}={a}
+	// Manually inject an empty bucket at freq 3 to force the head==nil
+	// continue branch.
+	p.buckets[3] = &lfuList[string, int]{}
+	got, ok := p.nextNonEmpty(0)
+	if !ok || got != 2 {
+		t.Errorf("nextNonEmpty = (%d, %v), want (2, true)", got, ok)
+	}
+}
+
+// TestLFUNextNonEmptyFromSkipsLowerBuckets exercises the
+// "f <= from continue" branch by passing a from value that exceeds
+// some populated bucket frequencies.
+func TestLFUNextNonEmptyFromSkipsLowerBuckets(t *testing.T) {
+	p := newLFU[string, int]()
+	a := makeLFUEntry("a")
+	b := makeLFUEntry("b")
+	p.OnInsert(a)
+	p.OnInsert(b)
+	p.OnAccess(a)
+	p.OnAccess(a) // a in bucket 3
+	// Now buckets has 1 (b) and 3 (a). Asking for nextNonEmpty(2)
+	// must skip bucket 1 (f <= from) and pick bucket 3.
+	got, ok := p.nextNonEmpty(2)
+	if !ok || got != 3 {
+		t.Errorf("nextNonEmpty(2) = (%d, %v), want (3, true)", got, ok)
+	}
+}
+
+func TestLFUVictimEmptyReturnsNil(t *testing.T) {
+	p := newLFU[string, int]()
+	if v := p.Victim(); v != nil {
+		t.Errorf("Victim on empty policy = %v, want nil", v)
+	}
+}
+
+func TestLFURemoveBadPolicyDataIsNoop(t *testing.T) {
+	p := newLFU[string, int]()
+	bogus := makeLFUEntry("bogus")
+	bogus.policyData = "not-a-node"
+	p.OnRemove(bogus)
+	if p.Len() != 0 {
+		t.Errorf("Len = %d, want 0", p.Len())
+	}
+}
+
+func TestLFUAccessBadPolicyDataIsNoop(t *testing.T) {
+	p := newLFU[string, int]()
+	bogus := makeLFUEntry("bogus")
+	bogus.policyData = "not-a-node"
+	p.OnAccess(bogus)
+}
+
+// TestLFUListRemoveOnDetachedNodeIsNoop exercises the default-return
+// branch in lfuList.remove when the node has already been unlinked.
+func TestLFUListRemoveOnDetachedNodeIsNoop(t *testing.T) {
+	l := &lfuList[string, int]{}
+	stray := &lfuNode[string, int]{}
+	l.remove(stray) // n.prev nil and l.head != n → default return; no panic
+}

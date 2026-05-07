@@ -102,6 +102,82 @@ func TestViewNilSafe(t *testing.T) {
 	}
 }
 
+// TestViewBytesAndStatsForwarded cover the live-receiver Bytes/Stats paths.
+func TestViewBytesAndStatsForwardedAlways(t *testing.T) {
+	c, _ := New[string, int](WithMaxEntries(8))
+	defer c.Close()
+	_ = c.Set("k", 1)
+	v := c.View()
+	// Bytes is wired even when no byte budget is set; just exercise the path.
+	_ = v.Bytes()
+	st := v.Stats()
+	if st.Inserts == 0 {
+		t.Errorf("View.Stats.Inserts = %d, want > 0", st.Inserts)
+	}
+}
+
+// TestViewMethodsAllNilSafe exercises every nil-receiver branch on
+// CacheView so the early-return paths are covered.
+func TestViewMethodsAllNilSafe(t *testing.T) {
+	var v *CacheView[string, int]
+	if got, ok := v.Peek("k"); ok || got != 0 {
+		t.Error("nil view Peek must return zero")
+	}
+	if v.Has("k") {
+		t.Error("nil view Has must return false")
+	}
+	if d, ok := v.TTL("k"); ok || d != 0 {
+		t.Error("nil view TTL must return zero")
+	}
+	if exp, ok := v.Expiry("k"); ok || !exp.IsZero() {
+		t.Error("nil view Expiry must return zero time")
+	}
+	v.Range(func(string, int) bool { return true }) // must not panic
+	if got := v.Keys(); got != nil {
+		t.Errorf("nil view Keys = %v, want nil", got)
+	}
+	if got := v.Bytes(); got != 0 {
+		t.Errorf("nil view Bytes = %d, want 0", got)
+	}
+	if got := v.Stats(); got != (Stats{}) {
+		t.Errorf("nil view Stats = %v, want zero Stats", got)
+	}
+}
+
+// TestViewMethodsCacheNilReceiver explicitly covers the case where
+// the view itself is non-nil but its embedded *Cache is nil.
+func TestViewMethodsCacheNilReceiver(t *testing.T) {
+	v := &CacheView[string, int]{cache: nil}
+	if got, ok := v.Get("k"); ok || got != 0 {
+		t.Error("CacheView with nil cache: Get must return zero")
+	}
+	if got, ok := v.Peek("k"); ok || got != 0 {
+		t.Error("CacheView with nil cache: Peek must return zero")
+	}
+	if v.Has("k") {
+		t.Error("CacheView with nil cache: Has must return false")
+	}
+	if d, ok := v.TTL("k"); ok || d != 0 {
+		t.Error("CacheView with nil cache: TTL must return zero")
+	}
+	if exp, ok := v.Expiry("k"); ok || !exp.IsZero() {
+		t.Error("CacheView with nil cache: Expiry must return zero time")
+	}
+	v.Range(func(string, int) bool { return true })
+	if got := v.Keys(); got != nil {
+		t.Errorf("CacheView with nil cache: Keys = %v, want nil", got)
+	}
+	if got := v.Len(); got != 0 {
+		t.Errorf("CacheView with nil cache: Len = %d, want 0", got)
+	}
+	if got := v.Bytes(); got != 0 {
+		t.Errorf("CacheView with nil cache: Bytes = %d, want 0", got)
+	}
+	if got := v.Stats(); got != (Stats{}) {
+		t.Errorf("CacheView with nil cache: Stats = %v, want zero Stats", got)
+	}
+}
+
 func TestCloneIndependent(t *testing.T) {
 	c, _ := New[string, int](WithMaxEntries(8))
 	defer c.Close()

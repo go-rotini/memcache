@@ -3,6 +3,7 @@ package memcache
 import (
 	"errors"
 	"io"
+	"strings"
 	"testing"
 )
 
@@ -86,5 +87,89 @@ func TestCodecErrorIs(t *testing.T) {
 	}
 	if !errors.Is(err, io.EOF) {
 		t.Errorf("errors.Is should follow Unwrap to io.EOF")
+	}
+}
+
+func TestCapacityErrorUnwrapAndIsCause(t *testing.T) {
+	// Unwrap returns the wrapped sentinel when set.
+	err := &CapacityError{
+		Key:        "k",
+		Reason:     "too many tags",
+		LimitField: "MaxTagsPerEntry",
+		Cause:      ErrTooManyTags,
+	}
+	if got := errors.Unwrap(err); got != ErrTooManyTags {
+		t.Errorf("Unwrap = %v, want %v", got, ErrTooManyTags)
+	}
+	// Is should match the wrapped sentinel via the Cause branch.
+	if !errors.Is(err, ErrTooManyTags) {
+		t.Error("errors.Is should follow Cause to the sentinel")
+	}
+	// Without a Cause, Unwrap returns nil and Is(non-peer) is false.
+	bare := &CapacityError{Key: "k", Reason: "too big", LimitField: "MaxBytes"}
+	if got := errors.Unwrap(bare); got != nil {
+		t.Errorf("Unwrap with nil Cause = %v, want nil", got)
+	}
+	if errors.Is(bare, io.EOF) {
+		t.Error("Is should NOT match an unrelated sentinel")
+	}
+}
+
+func TestLoadErrorErrorAndUnwrap(t *testing.T) {
+	root := io.EOF
+	err := &LoadError{Key: "k", Err: root}
+	if err.Error() == "" {
+		t.Error("LoadError.Error() should be non-empty")
+	}
+	if got := err.Unwrap(); got != root {
+		t.Errorf("Unwrap = %v, want %v", got, root)
+	}
+}
+
+func TestSnapshotErrorErrorEmptyPath(t *testing.T) {
+	// Path empty branch.
+	err := &SnapshotError{Op: "save", Message: "io fail"}
+	if err.Error() == "" {
+		t.Error("SnapshotError.Error() with empty path should still be non-empty")
+	}
+	if errors.Unwrap(err) != nil {
+		t.Error("Unwrap on SnapshotError without Err should return nil")
+	}
+	if errors.Is(err, io.EOF) {
+		t.Error("Is on SnapshotError without wrapped Err should be false")
+	}
+}
+
+func TestSnapshotErrorErrorWithPath(t *testing.T) {
+	err := &SnapshotError{Op: "load", Path: "/tmp/x", Message: "bad"}
+	got := err.Error()
+	if got == "" || !strings.Contains(got, "/tmp/x") {
+		t.Errorf("Error() with path = %q, want it to contain path", got)
+	}
+}
+
+func TestCodecErrorErrorAndUnwrap(t *testing.T) {
+	err := &CodecError{Op: "unmarshal", Codec: "json", Err: io.ErrUnexpectedEOF}
+	if err.Error() == "" {
+		t.Error("CodecError.Error() should be non-empty")
+	}
+	if got := err.Unwrap(); got != io.ErrUnexpectedEOF {
+		t.Errorf("Unwrap = %v, want %v", got, io.ErrUnexpectedEOF)
+	}
+}
+
+func TestCapacityErrorIsNonPeerNonCause(t *testing.T) {
+	// Cover the final "return false" branch in CapacityError.Is.
+	err := &CapacityError{Key: "k", Reason: "x", LimitField: "y"}
+	if errors.Is(err, ErrNotFound) {
+		t.Error("Is should be false for unrelated sentinel and no Cause")
+	}
+}
+
+func TestLoadErrorIsNonPeer(t *testing.T) {
+	// Cover the negative path in LoadError.Is by passing a non-peer.
+	err := &LoadError{Key: "k", Err: io.EOF}
+	if errors.Is(err, &CodecError{}) {
+		t.Error("LoadError.Is should not match a CodecError")
 	}
 }

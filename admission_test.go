@@ -1,6 +1,7 @@
 package memcache
 
 import (
+	"errors"
 	"sync/atomic"
 	"testing"
 )
@@ -12,6 +13,70 @@ func TestAdmitAlways(t *testing.T) {
 	}
 	a.Observe("k") // no-op
 	a.Reset()
+}
+
+func TestAdmitAlwaysObserveAndResetCovered(t *testing.T) {
+	// Both methods are no-ops but their bodies still need execution
+	// to count toward coverage.
+	var a AdmitAlways[int]
+	a.Observe(1)
+	a.Observe(2)
+	a.Reset()
+	if !a.Admit(99) {
+		t.Error("AdmitAlways.Admit must be true after Observe/Reset")
+	}
+}
+
+func TestResolveAdmissionPolicyTypeMismatch(t *testing.T) {
+	// An AdmissionPolicy[string] supplied to a cache built around
+	// integer keys must surface a ConfigError with a useful message.
+	policy := AdmitAlways[string]{}
+	_, err := New[int, int](
+		WithMaxEntries(8),
+		WithAdmissionPolicy[string](policy),
+	)
+	if err == nil {
+		t.Fatal("expected ConfigError on key-type mismatch")
+	}
+	var ce *ConfigError
+	if !errors.As(err, &ce) {
+		t.Errorf("expected *ConfigError, got %T (%v)", err, err)
+	}
+}
+
+func TestResolveAdmissionPolicyDefaultPath(t *testing.T) {
+	// No admission option supplied → AdmitAlways path.
+	c, err := New[string, int](WithMaxEntries(8))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer c.Close()
+	if err := c.Set("k", 1); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok := c.Get("k"); !ok || v != 1 {
+		t.Errorf("got (%d, %v), want (1, true)", v, ok)
+	}
+}
+
+func TestResolveAdmissionPolicyDoorkeeperUnboundedFallbackSize(t *testing.T) {
+	// Byte-bounded cache (no maxEntries) + WithDoorkeeper exercises
+	// the fallback expected=1024 path inside resolveAdmissionPolicy.
+	c, err := New[string, int](
+		WithMaxBytes(1<<20),
+		WithWeigher(func(int) int64 { return 8 }),
+		WithDoorkeeper(true),
+	)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	defer c.Close()
+	// First Set is rejected by doorkeeper, second admitted.
+	_ = c.Set("k", 1)
+	_ = c.Set("k", 2)
+	if v, ok := c.Get("k"); !ok || v != 2 {
+		t.Errorf("doorkeeper second-set: got (%d, %v), want (2, true)", v, ok)
+	}
 }
 
 func TestDoorkeeperRejectsFirstSeen(t *testing.T) {

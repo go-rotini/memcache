@@ -139,3 +139,160 @@ func TestS3FIFOBudgetSplit(t *testing.T) {
 		t.Errorf("ghostBudget = %d, want 9", p.ghostBudget)
 	}
 }
+
+func TestS3SplitBudgetEdgeCases(t *testing.T) {
+	if s, m := s3SplitBudget(0); s != 0 || m != 0 {
+		t.Errorf("s3SplitBudget(0) = %d/%d, want 0/0", s, m)
+	}
+	if s, m := s3SplitBudget(-5); s != 0 || m != 0 {
+		t.Errorf("s3SplitBudget(-5) = %d/%d, want 0/0", s, m)
+	}
+	if s, m := s3SplitBudget(1); s != 1 || m != 0 {
+		t.Errorf("s3SplitBudget(1) = %d/%d, want 1/0", s, m)
+	}
+	// Default-100/9 path; just ensure positivity.
+	if s, m := s3SplitBudget(100); s+m != 100 || s == 0 {
+		t.Errorf("s3SplitBudget(100): s=%d m=%d", s, m)
+	}
+}
+
+func TestS3FIFOSetBudgetTrimsGhost(t *testing.T) {
+	p := newS3FIFO[string, int](10)
+	for _, k := range []string{"a", "b", "c", "d", "e"} {
+		p.recordGhost(k)
+	}
+	// Shrink budget; ghosts should be trimmed.
+	p.SetBudget(1) // small=1, main=0, ghostBudget=0
+	if p.ghostSize != 0 {
+		t.Errorf("after SetBudget(1) ghostSize=%d, want 0", p.ghostSize)
+	}
+	// Negative budget: zero everything.
+	p.SetBudget(-1)
+	if p.smallBudget != 0 || p.mainBudget != 0 {
+		t.Errorf("SetBudget(-1) budgets: small=%d main=%d, want 0/0",
+			p.smallBudget, p.mainBudget)
+	}
+}
+
+// TestS3FIFOPromotionNeededAfterSaturation covers the freq-saturated branch
+// where PromotionNeeded returns false.
+func TestS3FIFOPromotionNeededAfterSaturation(t *testing.T) {
+	p := newS3FIFO[string, int](10)
+	a := makeS3Entry("a")
+	p.OnInsert(a)
+	if !p.PromotionNeeded(a) {
+		t.Error("fresh entry should need promotion")
+	}
+	for range int(s3FreqMax) {
+		p.OnAccess(a)
+	}
+	if p.PromotionNeeded(a) {
+		t.Error("saturated entry should NOT need promotion")
+	}
+	// Bad policyData should err on the side of "promotion needed".
+	bogus := makeS3Entry("bogus")
+	bogus.policyData = "not-a-node"
+	if !p.PromotionNeeded(bogus) {
+		t.Error("entry with non-s3Node policyData should need promotion")
+	}
+}
+
+func TestS3FIFOAccessBadPolicyDataIsNoop(t *testing.T) {
+	p := newS3FIFO[string, int](10)
+	bogus := makeS3Entry("bogus")
+	bogus.policyData = "not-a-node"
+	p.OnAccess(bogus) // must not panic
+}
+
+func TestS3FIFORecordGhostDuplicateNoop(t *testing.T) {
+	p := newS3FIFO[string, int](4)
+	p.recordGhost("k")
+	p.recordGhost("k") // duplicate; should early-return
+	if p.ghostSize != 1 {
+		t.Errorf("ghostSize after dup recordGhost = %d, want 1", p.ghostSize)
+	}
+}
+
+func TestS3FIFOResetClearsGhost(t *testing.T) {
+	p := newS3FIFO[string, int](4)
+	a := makeS3Entry("a")
+	p.OnInsert(a)
+	p.recordGhost("ghost1")
+	p.recordGhost("ghost2")
+	p.Reset()
+	if p.ghostSize != 0 || len(p.ghostSet) != 0 {
+		t.Errorf("after Reset: ghostSize=%d ghostSet=%d",
+			p.ghostSize, len(p.ghostSet))
+	}
+	if p.ghostHead != nil || p.ghostTail != nil {
+		t.Error("after Reset, ghost head/tail should be nil")
+	}
+}
+
+// TestS3FIFOResetClearsAllQueues exercises the small, main, and ghost
+// loops in Reset() by populating each region first.
+func TestS3FIFOResetClearsAllQueues(t *testing.T) {
+	p := newS3FIFO[string, int](4)
+	// Put one entry into Small.
+	a := makeS3Entry("a")
+	p.OnInsert(a)
+	// Put one entry into Main directly via ghost rebirth.
+	p.recordGhost("b")
+	b := makeS3Entry("b")
+	p.OnInsert(b)
+	// Add additional ghost entries.
+	p.recordGhost("ghost-x")
+	p.recordGhost("ghost-y")
+	if p.smallSize == 0 || p.mainSize == 0 || p.ghostSize == 0 {
+		t.Fatalf("setup failed: small=%d main=%d ghost=%d",
+			p.smallSize, p.mainSize, p.ghostSize)
+	}
+	p.Reset()
+	if p.smallSize != 0 || p.mainSize != 0 || p.ghostSize != 0 {
+		t.Errorf("after Reset: small=%d main=%d ghost=%d, want all 0",
+			p.smallSize, p.mainSize, p.ghostSize)
+	}
+	if a.policyData != nil || b.policyData != nil {
+		t.Error("after Reset, entries' policyData must be cleared")
+	}
+}
+
+func TestS3FIFOVictimEmptyReturnsNil(t *testing.T) {
+	p := newS3FIFO[string, int](4)
+	if v := p.Victim(); v != nil {
+		t.Errorf("Victim on empty = %v, want nil", v)
+	}
+}
+
+// TestS3FIFOVictimMainSecondChance exercises the main second-chance path
+// where main entry has freq>=1, gets demoted to tail with freq decremented.
+func TestS3FIFOVictimMainSecondChance(t *testing.T) {
+	p := newS3FIFO[string, int](2) // small=1, main=1
+	// Promote 'a' to main with high freq.
+	a := makeS3Entry("a")
+	p.OnInsert(a)
+	p.OnAccess(a) // freq=1
+	// Push small over budget so 'a' gets promoted to main.
+	b := makeS3Entry("b")
+	p.OnInsert(b) // smallSize=2 > 1
+	for {
+		v := p.Victim()
+		if v == nil {
+			break
+		}
+		v.policyData = nil
+	}
+	// Now insert another entry that goes to small; trigger eviction
+	// to push main over budget too.
+	for _, k := range []string{"c", "d", "e"} {
+		p.OnInsert(makeS3Entry(k))
+	}
+	// Drive Victim repeatedly.
+	for range 10 {
+		v := p.Victim()
+		if v == nil {
+			break
+		}
+		v.policyData = nil
+	}
+}
