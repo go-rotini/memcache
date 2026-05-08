@@ -54,7 +54,7 @@ func main() {
         memcache.WithMaxEntries(10_000),
         memcache.WithDefaultTTL(15*time.Minute),
         memcache.WithLoader(memcache.LoaderFunc[string, *Profile](
-            func(ctx context.Context, key string) (*Profile, time.Duration, error) {
+            func(_ context.Context, key string) (*Profile, time.Duration, error) {
                 // Fetch from upstream — called at most once per concurrent miss.
                 return &Profile{Name: key, Age: 30}, 15 * time.Minute, nil
             },
@@ -66,7 +66,7 @@ func main() {
     defer cache.Close()
 
     // Synchronous get/set
-    cache.Set("alice", &Profile{Name: "alice", Age: 30})
+    _ = cache.Set("alice", &Profile{Name: "alice", Age: 30})
     if p, ok := cache.Get("alice"); ok {
         fmt.Println(p.Name)
     }
