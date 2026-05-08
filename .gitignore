@@ -34,9 +34,6 @@ go.work.sum
 # macOS Finder metadata
 .DS_Store
 
-# Benchmark output
-test_bench.out
-
 # Mutation testing output
 test_mutation.json
 
