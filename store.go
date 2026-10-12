@@ -7,20 +7,16 @@ import (
 )
 
 // Store is the pluggable backend interface. The package ships
-// [MemoryStore] as the default; disk-backed (BoltDB-style),
-// Redis-backed, and other adapters are intended to be third-party
-// implementations layered behind this contract.
+// [MemoryStore]; disk, network and other backends implement the same
+// interface.
 //
-// Every method takes a [context.Context] so backends can support
-// per-call deadlines, cancellation, and tracing without
-// retrofitting them later. Implementations of in-process stores
-// (like [MemoryStore]) can choose to honor only ctx.Err() at entry.
+// Every method takes a [context.Context] for deadlines, cancellation
+// and tracing; in-process stores may check only ctx.Err() at entry.
 //
-// Store implementations MUST be safe for concurrent use.
+// Store implementations must be safe for concurrent use.
 //
 // A Cache built with [WithStore] treats the Store as its source of
 // truth (read-through with promotion, write-through, delete-through).
-// Store also serves as L2 for [Tiered].
 type Store[K comparable, V any] interface {
 	// Get returns the value stored for key. Missing keys produce
 	// (zero V, false, nil); only I/O failures populate err.
@@ -65,9 +61,7 @@ type storedEntry[V any] struct {
 }
 
 // NewMemoryStore constructs an empty in-memory [Store]. clock
-// controls TTL evaluation; passing nil falls back to [RealClock]
-// so callers can inline `NewMemoryStore[K, V](nil)` for typical
-// production use.
+// controls TTL evaluation; nil means [RealClock].
 func NewMemoryStore[K comparable, V any](clock Clock) *MemoryStore[K, V] {
 	if clock == nil {
 		clock = RealClock{}

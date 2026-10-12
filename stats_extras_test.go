@@ -1,4 +1,4 @@
-// stats_extras_test.go covers the spec §12.1 counters.
+// stats_extras_test.go covers the extended Stats counters.
 
 package memcache
 

@@ -27,9 +27,7 @@ type EncryptedCodec struct {
 }
 
 // NewEncryptedCodec wraps base with AES-256-GCM keyed by key.
-// key must be exactly 32 bytes; shorter or longer keys return a
-// configuration error at construction time so the failure is loud
-// rather than masked as a runtime decode error later.
+// key must be exactly 32 bytes; any other length returns an error.
 func NewEncryptedCodec(base Codec, key []byte) (*EncryptedCodec, error) {
 	if len(key) != 32 {
 		return nil, fmt.Errorf("%w: got %d", errEncryptKeyLength, len(key))

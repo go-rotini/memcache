@@ -134,7 +134,7 @@ func TestS3FIFOBudgetSplit(t *testing.T) {
 		t.Errorf("budget split: small=%d main=%d, want 1, 9",
 			p.smallBudget, p.mainBudget)
 	}
-	// Ghost budget mirrors main per spec.
+	// Ghost budget mirrors main.
 	if p.ghostBudget != 9 {
 		t.Errorf("ghostBudget = %d, want 9", p.ghostBudget)
 	}

@@ -423,8 +423,8 @@ func BenchmarkGetLockFreeReadHitNoStats(b *testing.B) {
 }
 
 func BenchmarkSyncMapLoad(b *testing.B) {
-	// Reference for the spec's "throughput vs sync.Map" perf
-	// target row.
+	// Baseline for comparing lock-free-read throughput against
+	// sync.Map.
 	var m sync.Map
 	keys := make([]string, 256)
 	for i := range 256 {

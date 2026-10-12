@@ -12,22 +12,16 @@ import (
 // caches with a colliding name silently no-op rather than panic.
 var expvarRegistry sync.Map // map[string]struct{}
 
-// expvarFunc is published as an [expvar.Func] that returns a
-// snapshot of the cache's [Stats]. Reading the var emits the
-// current counters; the live entry/byte counts always reflect the
-// cache at read time.
-//
-// The published variable is structured: a `map[string]any` so
-// stdlib `expvar.Handler` JSON-encodes it cleanly. Callers
-// integrating with /debug/vars get the full Stats shape with one
-// option call.
+// expvarFunc is the [expvar.Var] published by [WithExpvar]. Its String
+// method renders a subset of the cache's current [Stats] as a JSON
+// object.
 type expvarFunc[K comparable, V any] struct {
 	c *Cache[K, V]
 }
 
 // publishExpvar registers c's Stats under the configured name.
-// Idempotent across processes: a duplicate registration silently
-// no-ops rather than panicking.
+// A second registration of the same name in the process is a no-op
+// rather than a panic.
 func publishExpvar[K comparable, V any](c *Cache[K, V]) {
 	name := c.cfg.expvarName
 	if name == "" {
@@ -39,7 +33,7 @@ func publishExpvar[K comparable, V any](c *Cache[K, V]) {
 	expvar.Publish(name, expvarFunc[K, V]{c: c})
 }
 
-// Value implements [expvar.Var].
+// String implements [expvar.Var].
 func (f expvarFunc[K, V]) String() string {
 	st := f.c.Stats()
 	// Tiny hand-rolled JSON encoder so the package keeps zero

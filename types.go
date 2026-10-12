@@ -68,12 +68,12 @@ func (p Policy) String() string {
 type EvictionReason uint8
 
 // Eviction reasons. The order is fixed for stable indexing into
-// Stats.EvictionsByReason.
+// [Stats.EvictionsByReason].
 const (
 	EvictReasonCapacity      EvictionReason = iota // policy chose to evict
 	EvictReasonExpired                             // TTL hit
 	EvictReasonExpireFunc                          // WithExpireFunc returned true
-	EvictReasonReplaced                            // overwritten by Set
+	EvictReasonReplaced                            // overwritten by an entry from a loaded snapshot
 	EvictReasonDeleted                             // explicit Delete
 	EvictReasonDeletedPrefix                       // DeletePrefix
 	EvictReasonDeletedWhere                        // DeleteWhere
@@ -123,7 +123,7 @@ func (r EvictionReason) String() string {
 	}
 }
 
-// EventKind identifies an event kind for Subscribe.
+// EventKind identifies an event kind for [Cache.Subscribe].
 type EventKind uint8
 
 // Event kinds.
@@ -171,18 +171,20 @@ func (k EventKind) String() string {
 	}
 }
 
-// Event is an observable cache event delivered to Subscribe channels.
+// Event is an observable cache event delivered to [Cache.Subscribe]
+// channels.
 type Event[K comparable, V any] struct {
 	Kind   EventKind
 	Key    K
 	Value  V
-	Reason EvictionReason // populated for EventEvict
-	Err    error          // populated for EventLoadError
+	Reason EvictionReason // populated for EventEvict and EventExpire
+	Err    error          // populated for EventLoadError and EventLoadTimeout
 	At     time.Time
 	Tags   []string
 }
 
-// ComputeAction is the return discriminator for Compute callbacks.
+// ComputeAction tells [Cache.Compute] and [Cache.ComputeIfPresent] what
+// to do with the callback's result.
 type ComputeAction uint8
 
 // Compute actions.
@@ -206,14 +208,14 @@ func (a ComputeAction) String() string {
 	}
 }
 
-// Item is the value-with-metadata view used by Range, snapshots, and
-// events.
+// Item is an entry's value plus its metadata, as returned by
+// [Cache.Items] and the other diagnostic listings.
 type Item[V any] struct {
 	Value      V
 	Expiry     time.Time // zero if no TTL
 	LastAccess time.Time
 	Inserted   time.Time
-	Hits       uint32 // hit count since insertion
+	Hits       uint32 // hit count since the value was last set
 	Weight     int64
 	Tags       []string
 	Sliding    bool
@@ -226,7 +228,8 @@ type KeyedItem[K comparable, V any] struct {
 	Key K
 }
 
-// Metadata is the value-less view used by ItemMetadata.
+// Metadata is an entry's metadata without its value, as returned by
+// [Cache.ItemMetadata] and passed to [WithExpireFunc] predicates.
 type Metadata struct {
 	Expiry     time.Time
 	Inserted   time.Time
@@ -237,18 +240,20 @@ type Metadata struct {
 	Sliding    bool
 }
 
-// LoadResult is one entry in a BulkLoader response.
+// LoadResult is one entry in a [BulkLoader] response.
 type LoadResult[V any] struct {
 	Value V
 	TTL   time.Duration
 	Err   error // per-key error; cache treats these as load failures, not catastrophic
 }
 
-// Histogram is a coarse multi-dimensional summary of cache contents.
+// Histogram is a coarse summary of cache contents, returned by
+// [Cache.Histogram]. Each bucket counts entries below its exclusive upper
+// bound.
 type Histogram struct {
-	AgeBuckets    [8]int64 // bucket bounds: 1s, 10s, 1m, 10m, 1h, 1d, 7d, +inf
-	WeightBuckets [8]int64 // bucket bounds: 1, 16, 256, 4Ki, 64Ki, 1Mi, 16Mi, +inf
-	HitsBuckets   [8]int64 // bucket bounds: 0, 1, 2, 4, 16, 64, 256, +inf
+	AgeBuckets    [8]int64 // upper bounds: 1s, 10s, 1m, 10m, 1h, 1d, 7d, +inf
+	WeightBuckets [8]int64 // upper bounds: 1, 16, 256, 4Ki, 64Ki, 1Mi, 16Mi, +inf
+	HitsBuckets   [8]int64 // upper bounds: 1, 2, 4, 16, 64, 256, +inf (last slot unused)
 	TotalEntries  int
 	TotalWeight   int64
 }
@@ -264,18 +269,17 @@ type SnapshotInfo struct {
 	Metadata  map[string]string
 }
 
-// Number is the type constraint for numeric atomic operations
-// (Increment, Decrement, IncrementBy).
+// Number is the type constraint for [Increment], [Decrement] and
+// [IncrementBy].
 type Number interface {
 	~int | ~int8 | ~int16 | ~int32 | ~int64 |
 		~uint | ~uint8 | ~uint16 | ~uint32 | ~uint64 |
 		~float32 | ~float64
 }
 
-// Prefixer is implemented by key types that have a meaningful "prefix"
-// concept. [Cache.DeletePrefix] first checks if K is string, then
-// falls back to this interface; for K types that satisfy neither,
-// DeletePrefix is a silent no-op (returns 0).
+// Prefixer is implemented by non-string key types that support
+// [Cache.DeletePrefix]. For K types that are neither string nor
+// Prefixer, DeletePrefix is a no-op that returns 0.
 type Prefixer interface {
 	HasPrefix(prefix string) bool
 }

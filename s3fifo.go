@@ -203,8 +203,8 @@ func (p *s3fifoPolicy[K, V]) Victim() *entry[K, V] {
 	// inserted node and rotates it instead, costing one iteration
 	// per cycle). A tighter bound (smallSize+mainSize+1) can exit
 	// early with both queues still over budget when freqs are
-	// saturated, which previously fell through to the defensive
-	// fallback and evicted the wrong queue.
+	// saturated, falling through to the defensive fallback and
+	// evicting from the wrong queue.
 	maxRotations := (p.smallSize+p.mainSize+1)*(int(s3FreqMax)+1) + 1
 	for range maxRotations {
 		if p.smallSize > p.smallBudget && p.smallHead != nil {

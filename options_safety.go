@@ -49,9 +49,9 @@ func WithSafeKeys(b bool) Option {
 	return func(c *config) { c.safeKeys = b }
 }
 
-// WithCallbackTimeout bounds synchronous-hook duration before a warning
-// is logged. Best-effort: Go cannot preempt the callback. d <= 0
-// disables; default 0.
+// WithCallbackTimeout sets how long a synchronous hook may run before a
+// warning is logged. The hook is not interrupted. d <= 0 disables the
+// warning; the default is 100ms.
 func WithCallbackTimeout(d time.Duration) Option {
 	return func(c *config) { c.callbackTimeout = d }
 }
@@ -67,9 +67,10 @@ func WithPurgeVisitor[K comparable, V any](fn func(key K, value V) error) Option
 	}
 }
 
-// WithCopyOnGet installs fn applied to V on every successful Get/Peek
-// return; callers receive fn(value). fn is called under the shard's
-// read lock and MUST be fast and side-effect-free.
+// WithCopyOnGet installs fn applied to values handed out by Get, Peek,
+// Range, GetOrSet and the other read methods; callers receive
+// fn(value). fn may be called under a shard lock and must be fast and
+// side-effect-free.
 func WithCopyOnGet[V any](fn func(V) V) Option {
 	return func(c *config) {
 		if fn != nil {

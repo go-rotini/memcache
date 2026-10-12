@@ -115,7 +115,7 @@ func (e *entry[K, V]) expired(now int64) bool {
 // expireAt forward to now+slidingTTL. The sliding refresh is coalesced:
 // it only fires when the access is more than slidingTTL/4 newer than
 // the previously recorded lastAccess. Returns true when expireAt was
-// moved (signal for [Cache.expiryFix]). Concurrent racers are benign.
+// moved (signal for [shard.expiryFix]). Concurrent racers are benign.
 func (e *entry[K, V]) touchAccess(nowNanos int64) (expiryShifted bool) {
 	if !e.flags.has(flagSliding) || e.slidingTTL <= 0 {
 		e.lastAccess.Store(nowNanos)

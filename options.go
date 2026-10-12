@@ -277,14 +277,16 @@ func nextPowerOfTwo(n int) int {
 	return p
 }
 
-// WithMaxEntries sets the maximum number of entries (across all
-// shards). Must be > 0.
+// WithMaxEntries sets the maximum number of entries across all shards.
+// A negative n is a [*ConfigError] at [New]; 0 leaves the entry count
+// unbounded.
 func WithMaxEntries(n int) Option {
 	return func(c *config) { c.maxEntries = n }
 }
 
 // WithMaxBytes sets the maximum total weight of entries across the
-// cache. Effective only when the cache has a configured Weigher.
+// cache. It requires [WithWeigher]; without one, [New] returns a
+// [*ConfigError].
 func WithMaxBytes(n int64) Option {
 	return func(c *config) { c.maxBytes = n }
 }
@@ -296,7 +298,8 @@ func WithDefaultTTL(d time.Duration) Option {
 }
 
 // WithSlidingTTL toggles sliding-TTL behavior on the cache's default TTL.
-// When true, every Get refreshes the entry's expiry to now+slidingTTL.
+// When true, a Get refreshes the entry's expiry to now plus its TTL;
+// refreshes less than a quarter of the TTL apart are skipped.
 func WithSlidingTTL(b bool) Option {
 	return func(c *config) { c.slidingTTL = b }
 }
@@ -324,8 +327,9 @@ func WithPolicy(p Policy) Option {
 	return func(c *config) { c.policy = p }
 }
 
-// WithShards sets the shard count. Must be a power of two; values that
-// are not are rounded up at construction time.
+// WithShards sets the shard count. Values that are not a power of two
+// are rounded up to one; values below 1 become 1. The default is
+// 4×GOMAXPROCS rounded up to a power of two, capped at 1024.
 func WithShards(n int) Option {
 	return func(c *config) {
 		if n < 1 {
@@ -335,20 +339,22 @@ func WithShards(n int) Option {
 	}
 }
 
-// WithMaxKeySize rejects keys whose serialized representation exceeds
-// n bytes. Default 0 (no limit).
+// WithMaxKeySize rejects string keys longer than n bytes with a
+// [*CapacityError] matching [ErrKeyTooLarge]. Keys of other types are
+// not measured. Default 0 (no limit).
 func WithMaxKeySize(n int) Option {
 	return func(c *config) { c.maxKeySize = n }
 }
 
-// WithMaxValueWeight rejects values whose Weigher result exceeds n.
-// Default 0 (no limit).
+// WithMaxValueWeight rejects values whose weight exceeds n with a
+// [*CapacityError] matching [ErrValueTooLarge]. Default 0 (no limit).
 func WithMaxValueWeight(n int64) Option {
 	return func(c *config) { c.maxValueWeight = n }
 }
 
-// WithName attaches a human-readable name to the cache. Used in stats,
-// events, and error messages.
+// WithName attaches a human-readable name to the cache. It is written
+// to snapshot headers (see [SnapshotInfo]) and included in some log
+// messages.
 func WithName(name string) Option {
 	return func(c *config) { c.name = name }
 }
@@ -469,9 +475,11 @@ func WithWeigher[V any](fn Weigher[V]) Option {
 	}
 }
 
-// WithHasher overrides the default key hasher. Useful when the caller
-// can supply a faster hasher for their key type than the package's
-// default reflect-based fallback.
+// WithHasher overrides the default key hasher. The default handles
+// string, integer and bool keys directly and hashes other key types
+// through their fmt %v form, so a custom hasher is faster for struct
+// or pointer keys. A hasher whose type does not match K is rejected by
+// [New] as a [*ConfigError].
 func WithHasher[K comparable](fn func(K) uint64) Option {
 	return func(c *config) {
 		if fn != nil {
@@ -573,8 +581,11 @@ func WithErrorTTL(d time.Duration) Option {
 	return func(c *config) { c.errorTTL = d }
 }
 
-// WithLoaderTimeout sets the per-call deadline applied to Loader
-// contexts when the caller does not supply one.
+// WithLoaderTimeout sets a deadline on every Loader call. Loader
+// contexts are detached from the caller's context, so this is the only
+// deadline a Loader sees. A load that times out returns an error
+// matching both [ErrLoaderTimeout] and [context.DeadlineExceeded].
+// Zero (the default) sets no deadline.
 func WithLoaderTimeout(d time.Duration) Option {
 	return func(c *config) { c.loaderTimeout = d }
 }
@@ -594,9 +605,9 @@ func WithStaleWhileRevalidate(staleFor time.Duration) Option {
 	return func(c *config) { c.swrStaleFor = staleFor }
 }
 
-// WithExpvar registers the cache's Stats under name in stdlib expvar as
-// a JSON object keyed on snake-case stat names. A duplicate registration
-// is silently a no-op.
+// WithExpvar publishes the cache's main [Stats] counters under name in
+// the standard expvar package, as a JSON object with snake_case keys.
+// If name is already registered by another cache, this is a no-op.
 func WithExpvar(name string) Option {
 	return func(c *config) {
 		if name != "" {
@@ -672,9 +683,9 @@ func WithEventsBuffer(n int) Option {
 }
 
 // WithOnHit registers a synchronous callback invoked on every Get hit.
-// The callback runs under the shard lock; slow callbacks block the Get
-// path and re-entering the cache for a same-shard key deadlocks. Use
-// [Cache.Subscribe] for asynchronous notification.
+// The callback may run while the shard lock is held; slow callbacks
+// block the Get path and re-entering the cache for a same-shard key
+// can deadlock. Use [Cache.Subscribe] for asynchronous notification.
 func WithOnHit[K comparable, V any](fn func(key K, value V)) Option {
 	return func(c *config) {
 		if fn != nil {
@@ -695,9 +706,9 @@ func WithOnMiss[K comparable](fn func(key K)) Option {
 }
 
 // WithOnEvict registers a callback invoked when an entry is removed for
-// any reason OTHER than TTL expiry. The callback fires AFTER the shard
-// lock is released, so re-entering the cache from the callback is safe.
-// Multiple removals from one locked section batch their callbacks.
+// any reason other than expiry. [Cache.Clear], [Cache.Reset] and
+// [Cache.Close] do not fire it. The callback fires after the shard lock
+// is released, so re-entering the cache from the callback is safe.
 func WithOnEvict[K comparable, V any](fn func(key K, value V, reason EvictionReason)) Option {
 	return func(c *config) {
 		if fn != nil {
@@ -728,12 +739,13 @@ func WithOnLoad[K comparable, V any](fn func(key K, value V, ttl time.Duration, 
 }
 
 // WithExpireFunc registers a per-entry expiry predicate. fn is called
-// on every Get and janitor sweep with the entry's metadata; true marks
-// it expired regardless of TTL. Removals via fn are recorded under
-// [EvictReasonExpireFunc]. fn MUST be fast and side-effect-free; it is
-// called under shard locks and is NOT routed through
-// [WithCallbackTimeout]. A panicking fn is recovered and the entry is
-// treated as fresh.
+// whenever a read checks an entry's freshness (Get, Peek, Has, Range and
+// similar); true marks the entry expired regardless of TTL. The janitor
+// and [Cache.DeleteExpired] check TTLs only. Removals via fn are
+// recorded under [EvictReasonExpireFunc]. fn must be fast and
+// side-effect-free; it is called under shard locks and is not routed
+// through [WithCallbackTimeout]. A panicking fn is recovered and the
+// entry is treated as fresh.
 func WithExpireFunc[K comparable, V any](fn func(key K, value V, meta Metadata) bool) Option {
 	return func(c *config) {
 		if fn != nil {

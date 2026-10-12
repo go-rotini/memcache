@@ -7,16 +7,16 @@ import (
 )
 
 // AdmissionPolicy decides whether to admit a candidate key into the cache.
-// It is consulted on each [Cache.Set] before the entry is written; returning
-// false drops the candidate silently. Implementations must be safe for
-// concurrent use.
+// It is consulted whenever a write would insert a key that is not yet
+// cached; updates to existing keys bypass it. Returning false drops the
+// write silently. Implementations must be safe for concurrent use.
 type AdmissionPolicy[K comparable] interface {
 	// Admit returns true if the candidate key should be inserted into
 	// the cache.
 	Admit(key K) bool
 
-	// Observe records a key access. Called on Set (regardless of Admit's
-	// verdict) and on every successful Get hit.
+	// Observe records a key access. Called after every Admit
+	// (regardless of its verdict) and on Get hits.
 	Observe(key K)
 
 	// Reset clears the policy's internal state.
@@ -87,8 +87,9 @@ func WithAdmissionPolicy[K comparable](p AdmissionPolicy[K]) Option {
 	}
 }
 
-// WithDoorkeeper enables a default-sized [Doorkeeper] sized for the cache's
-// max-entries budget (or 1024 when unbounded). Pass false to opt out.
+// WithDoorkeeper enables a [Doorkeeper] sized for the cache's
+// [WithMaxEntries] bound (or 1024 keys when there is none). It is
+// ignored when [WithAdmissionPolicy] is also set.
 func WithDoorkeeper(b bool) Option {
 	return func(c *config) { c.doorkeeperEnabled = b }
 }

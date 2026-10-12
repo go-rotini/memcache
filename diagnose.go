@@ -35,7 +35,7 @@ func (c *Cache[K, V]) Items() []KeyedItem[K, V] {
 }
 
 // ItemMetadata returns the entry's metadata without copying its value.
-// Absent or negative-tombstone entries return (zero, false).
+// Absent, expired or negative-tombstone entries return (zero, false).
 func (c *Cache[K, V]) ItemMetadata(key K) (Metadata, bool) {
 	if c.closed.Load() {
 		return Metadata{}, false
@@ -52,9 +52,8 @@ func (c *Cache[K, V]) ItemMetadata(key K) (Metadata, bool) {
 }
 
 // Hottest returns the n entries with the highest hit counts, descending.
-// n=0 returns every entry. Hit count is the per-entry hits counter, a
-// coarse proxy for popularity; frequency-aware policy state is not
-// exposed here.
+// n <= 0 returns every entry. Hit counts reset when an entry's value is
+// replaced.
 func (c *Cache[K, V]) Hottest(n int) []KeyedItem[K, V] {
 	all := c.Items()
 	sort.Slice(all, func(i, j int) bool {
@@ -222,7 +221,7 @@ func weightBucket(w int64) int {
 }
 
 // hitsBucket maps a hit count to its [Histogram] HitsBucket index.
-// Bounds: 0, 1, 2, 4, 16, 64, 256, +∞.
+// Upper bounds: 1, 2, 4, 16, 64, 256, +∞; index 7 is never used.
 func hitsBucket(h uint32) int {
 	switch {
 	case h < 1:

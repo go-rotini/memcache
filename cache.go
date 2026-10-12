@@ -671,10 +671,9 @@ func (c *Cache[K, V]) ResetStats() {
 }
 
 // Has reports whether the cache contains a fresh entry for key. It does
-// NOT promote the entry in the eviction policy and never invokes the
-// configured Loader. The shard RLock MUST be held through every field
-// read on the resolved entry to avoid racing with eviction's pool
-// recycling.
+// not promote the entry in the eviction policy and never invokes the
+// configured [Loader]. With [WithStore], an in-memory miss is checked
+// against the Store.
 func (c *Cache[K, V]) Has(key K) bool {
 	if c.closed.Load() {
 		return false
@@ -994,8 +993,8 @@ func (c *Cache[K, V]) GetWithExpiry(key K) (V, time.Time, bool) {
 }
 
 // Set stores value under key with the cache's default TTL. If V
-// implements [CacheTTLer] the value's TTL overrides [WithDefaultTTL]; if V
-// implements [CacheTagger] its tags are merged into the entry's tag set.
+// implements [CacheTTLer] the value's TTL overrides [WithDefaultTTL]; the
+// entry's tags come from [CacheTagger] or a cache struct-tag template.
 // After insertion, [WithGroup]-bounded groups named by the entry's tags
 // are shrunk back to capacity.
 func (c *Cache[K, V]) Set(key K, value V) error {
@@ -1057,8 +1056,7 @@ func (c *Cache[K, V]) SetWithOptions(key K, value V, opts ...SetOption) error {
 	// Auto-tag from CacheTagger / template tags ONLY when the
 	// caller didn't invoke SetTags at all. SetTags() with no args
 	// means "explicitly no tags" (sc.hasTags=true) and bypasses
-	// auto-tag derivation. Per spec: explicit per-call options
-	// always win.
+	// auto-tag derivation. Explicit per-call options always win.
 	if !sc.hasTags {
 		sc.tags = deriveAutoTags(value)
 	}
@@ -1257,12 +1255,12 @@ func (c *Cache[K, V]) recycleOrInvalidate(s *shard[K, V], e *entry[K, V]) {
 	s.pool.put(e)
 }
 
-// Close releases all resources, stops the auto-save goroutine after
-// writing a final snapshot, stops every shard's janitor, closes every
-// active subscriber channel, and disables further operations. Close is
-// idempotent. After Close, writes return [ErrClosed] and reads return
-// the zero value with ok=false. A final auto-save error is logged but
-// not returned.
+// Close drains pending async writes, writes a final [WithAutoSave]
+// snapshot, stops background goroutines, runs the [WithPurgeVisitor]
+// visitor over the remaining entries, empties the cache, and closes
+// every [Cache.Subscribe] channel. Close is idempotent and always
+// returns nil; a final auto-save error is logged. After Close, writes
+// return [ErrClosed] and reads report a miss.
 func (c *Cache[K, V]) Close() error {
 	if !c.closed.CompareAndSwap(false, true) {
 		return nil
@@ -2146,8 +2144,9 @@ func (c *Cache[K, V]) shrinkShardLocked(s *shard[K, V]) int {
 
 // Sync drains pending background work (async tag cleanup, async writes)
 // and returns when the cache is quiescent. Returns ctx.Err() if ctx
-// cancels first. Useful before [Cache.Save] so the snapshot reflects
-// every Set/Delete already returned.
+// ends first, or [ErrClosed] on a closed cache. Useful before
+// [Cache.Save] so the snapshot reflects every Set/Delete already
+// returned.
 func (c *Cache[K, V]) Sync(ctx context.Context) error {
 	if c.closed.Load() {
 		return ErrClosed
@@ -2201,15 +2200,12 @@ func (c *Cache[K, V]) DeleteExpired() int {
 	return count
 }
 
-// DeletePrefix removes every entry whose key begins with the given
-// prefix. Only valid when K is `string` or implements [Prefixer]. For
-// caches with other K types DeletePrefix is a no-op and returns 0;
-// callers can detect this case via [Prefixer] type assertions on
-// their own K type before calling.
+// DeletePrefix removes every entry whose key begins with prefix and
+// returns the number removed. K must be string or implement [Prefixer];
+// for other key types DeletePrefix is a no-op that returns 0.
 //
-// Iteration is O(n) shard-by-shard. Tag-based invalidation
-// ([Cache.InvalidateTag], Phase 7) is the preferred mechanism when
-// applicable.
+// DeletePrefix scans every entry. [Cache.InvalidateTag] is cheaper when
+// the entries share a tag.
 func (c *Cache[K, V]) DeletePrefix(prefix string) int {
 	if c.closed.Load() {
 		return 0
@@ -2306,7 +2302,9 @@ func (c *Cache[K, V]) DeleteWhere(pred func(key K, value V) bool) int {
 // same missing key share a single Loader invocation (singleflight).
 // Returns [ErrNoLoader], [ErrClosed], ctx.Err(), or any error from the
 // Loader. [ErrNotFound] with [WithNegativeCache] active records a
-// tombstone and returns the same error.
+// tombstone and returns the same error. The load runs on a context
+// detached from ctx: a caller whose ctx ends gets ctx.Err(), and the
+// load is canceled only once every waiting caller has given up.
 func (c *Cache[K, V]) GetOrLoad(ctx context.Context, key K) (V, error) {
 	var zero V
 	if c.closed.Load() {
@@ -2341,9 +2339,9 @@ func (c *Cache[K, V]) GetOrLoadFn(
 }
 
 // Refresh asynchronously triggers a Loader call for key, replacing the
-// cached value when the load completes. Joins an existing in-flight
-// call. Returns [ErrNoLoader], [ErrClosed], or ctx.Err() if already
-// canceled.
+// cached value when the load completes. It does nothing when a load for
+// key is already in flight. Returns [ErrNoLoader], [ErrClosed], or
+// ctx.Err() if ctx has already ended.
 func (c *Cache[K, V]) Refresh(ctx context.Context, key K) error {
 	if c.closed.Load() {
 		return ErrClosed

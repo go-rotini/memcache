@@ -23,18 +23,19 @@ type CacheKeyer interface {
 }
 
 // CacheTTLer is implemented by values that supply their own TTL at insert
-// time. [Cache.Set] uses the returned duration in place of the configured
-// default; explicit TTLs from [Cache.SetWithTTL] / [Cache.SetWithOptions]
-// take precedence. Returning 0 means no expiry; a negative duration falls
-// back to the cache default.
+// time. [Cache.Set] and [Cache.SetCtx] use the returned duration in place
+// of [WithDefaultTTL]; other write methods ignore it. Returning 0 means no
+// expiry; a negative duration falls back to the cache default.
 type CacheTTLer interface {
 	CacheTTL() time.Duration
 }
 
-// CacheTagger is implemented by values that auto-tag themselves at insert
-// time. [Cache.Set] merges the returned tags into the entry's tag set;
-// [Cache.SetWithTags] and [Cache.SetWithOptions] override and drop
-// auto-tags. A nil or empty slice leaves the entry untagged.
+// CacheTagger is implemented by values that tag themselves at insert
+// time. [Cache.Set] and the other value-only writes ([Cache.SetWithTTL],
+// [Cache.SetIfAbsent], [Cache.GetOrSet], ...) tag the entry with the
+// returned tags plus any cache struct-tag template tags, replacing the
+// entry's previous tags. [Cache.SetWithTags], or [Cache.SetWithOptions]
+// with [SetTags], uses the explicit tags instead.
 type CacheTagger interface {
 	CacheTags() []string
 }
@@ -102,7 +103,7 @@ func SetCacheable[V CacheKeyer](c *Cache[string, V], v V, opts ...SetOption) err
 }
 
 // GetCacheable looks up an entry in c by deriving the key from
-// proto.CacheKey(). Returns the cached value or proto's zero on miss.
+// proto.CacheKey(). It returns the zero V and false on a miss.
 func GetCacheable[V CacheKeyer](c *Cache[string, V], proto V) (V, bool) {
 	return c.Get(proto.CacheKey())
 }

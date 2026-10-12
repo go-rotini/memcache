@@ -24,8 +24,8 @@ type TieredStats struct {
 	// Misses is the count of Tiered.Get calls that found neither
 	// tier.
 	Misses uint64
-	// Promotions is L2Hits but recorded after the L1 promotion
-	// actually wrote successfully (failed Sets do not bump it).
+	// Promotions is the count of L2 hits that were successfully
+	// written to L1.
 	Promotions uint64
 }
 
@@ -84,11 +84,9 @@ func (t *Tiered[K, V]) Get(key K) (V, bool) {
 	return zero, false
 }
 
-// Set writes value to BOTH tiers (write-through). Returns the
-// first error encountered; partial failure is possible but
-// uncommon (e.g., L1 succeeds but L2 hits a weight limit). In
-// that case L1 may carry a fresher value than L2 until the next
-// Set rebalances.
+// Set writes value to L1, then L2, and returns the first error. If the
+// L1 write fails, L2 is not written; if only the L2 write fails, L1
+// holds a newer value than L2.
 func (t *Tiered[K, V]) Set(key K, value V) error {
 	if t.closed.Load() {
 		return ErrClosed
@@ -173,10 +171,8 @@ func (t *Tiered[K, V]) SetWithOptions(key K, value V, opts ...SetOption) error {
 	return t.l2.SetWithOptions(key, value, opts...)
 }
 
-// InvalidateTag removes every entry tagged with t from BOTH tiers.
-// Returns the total number of entries removed across both tiers.
-// Negative-cache tombstones and invalidated read-snapshot entries
-// are not counted by either tier's InvalidateTag.
+// InvalidateTag removes every entry tagged with tag from both tiers and
+// returns the total number removed.
 func (t *Tiered[K, V]) InvalidateTag(tag string) int {
 	if t.closed.Load() {
 		return 0
@@ -206,11 +202,8 @@ func (t *Tiered[K, V]) Sync(ctx context.Context) error {
 	return t.l2.Sync(ctx)
 }
 
-// Len returns the number of entries in L2. Because writes are
-// write-through, L1 ⊆ L2 in steady state, so reporting L2's Len
-// is the most accurate "how many distinct keys does this tiered
-// cache hold" measurement. Use [Tiered.L1]/[Tiered.L2] and their
-// own Len() if you need per-tier counts.
+// Len returns the number of entries in L2, since every Tiered write
+// reaches L2. Use [Tiered.L1] and [Tiered.L2] for per-tier counts.
 func (t *Tiered[K, V]) Len() int {
 	if t.closed.Load() {
 		return 0
@@ -230,18 +223,15 @@ func (t *Tiered[K, V]) Stats() TieredStats {
 	}
 }
 
-// L1 returns the underlying L1 [Cache]. Useful for callers that
-// need to apply L1-specific operations (e.g., InvalidateTag) that
-// the Tiered wrapper does not expose directly.
+// L1 returns the underlying L1 [Cache], for operations Tiered does not
+// expose.
 func (t *Tiered[K, V]) L1() *Cache[K, V] { return t.l1 }
 
 // L2 returns the underlying L2 [Cache]. Same caveats as [Tiered.L1].
 func (t *Tiered[K, V]) L2() *Cache[K, V] { return t.l2 }
 
-// Close closes BOTH tiers. The first non-nil error encountered is
-// returned; subsequent close errors are silently swallowed (the
-// caller cannot act on more than one shutdown failure usefully).
-// Idempotent: subsequent Close calls return nil.
+// Close closes both tiers and returns the first error. Subsequent
+// calls return nil.
 func (t *Tiered[K, V]) Close() error {
 	if !t.closed.CompareAndSwap(false, true) {
 		return nil

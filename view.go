@@ -97,10 +97,10 @@ func (v *CacheView[K, V]) Stats() Stats {
 	return v.cache.Stats()
 }
 
-// Clone returns a new [Cache] populated with a snapshot of c's live
-// entries. Hit counts and policy positioning are not preserved. Holds
-// each source shard's read lock per pass; concurrent mutations produce
-// a per-shard-consistent (not cache-wide-consistent) snapshot.
+// Clone returns a new [Cache], built with c's options, populated with a
+// snapshot of c's live entries. Hit counts and policy positioning are not
+// preserved. The snapshot is consistent per shard, not across the whole
+// cache, when c is modified concurrently.
 func (c *Cache[K, V]) Clone() (*Cache[K, V], error) {
 	if c.closed.Load() {
 		return nil, ErrClosed

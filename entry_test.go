@@ -61,8 +61,8 @@ func TestEntryTouchAccessSliding(t *testing.T) {
 }
 
 func TestEntryTouchAccessSlidingCoalesces(t *testing.T) {
-	// Per spec §19.1.1: writes are skipped when the access is less
-	// than slidingTTL/4 newer than the recorded lastAccess.
+	// Writes are skipped when the access is less than slidingTTL/4
+	// newer than the recorded lastAccess.
 	const slide = int64(time.Minute)
 	e := &entry[string, int]{
 		flags:      flagSliding,

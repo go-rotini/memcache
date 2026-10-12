@@ -28,11 +28,10 @@ func (f LoaderFunc[K, V]) Load(ctx context.Context, key K) (V, time.Duration, er
 // query. Used by [Cache.GetMultiOrLoad] when configured with
 // [WithBulkLoader].
 type BulkLoader[K comparable, V any] interface {
-	// LoadMulti fetches values for the given keys. Implementations
-	// should populate the returned map with one entry per requested
-	// key; missing keys may be omitted (treated as load-failures with
-	// [ErrNotFound]) or present with a per-key error in
-	// LoadResult.Err.
+	// LoadMulti fetches values for the given keys. Keys that could
+	// not be loaded may be omitted or carry a per-key error in
+	// LoadResult.Err; either way they are left out of the result and
+	// not cached. A non-nil error aborts the whole call.
 	LoadMulti(ctx context.Context, keys []K) (map[K]LoadResult[V], error)
 }
 
@@ -51,15 +50,12 @@ type flightCall[V any] struct {
 
 	// refs is the count of waiters who haven't given up. Starts
 	// at 1 (the leader) and grows as followers join via
-	// [flightCall.join]. A ctx-canceling waiter decrements via
-	// [flightCall.leave]; when the count reaches zero the
+	// [flightCall.join]. A ctx-canceling waiter decrements it in
+	// [Cache.waitOrLeave]; when the count reaches zero the
 	// loader's context is canceled.
 	refs atomic.Int32
 
-	// cancel is the cancel func of the loader's context. nil
-	// when no cancel has been configured (e.g. WithLoaderTimeout
-	// disabled and no aggregation needed yet); always non-nil
-	// once newFlightCall has been called.
+	// cancel is the cancel func of the loader's context.
 	cancel func()
 }
 

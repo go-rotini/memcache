@@ -136,15 +136,18 @@ func (c *Cache[K, V]) saveFileTo(path string) (err error) {
 
 // Load replaces the cache contents with the snapshot read from r and
 // returns the number of entries inserted. Records past their TTL are
-// skipped. On error the cache may be partially loaded.
+// skipped. On error the cache may be partially loaded. Read and decode
+// failures are [*SnapshotError] values; see [ErrSnapshotIncompatible]
+// and [ErrSnapshotCorrupt].
 func (c *Cache[K, V]) Load(r io.Reader) (n int, err error) {
 	_, span := c.tracer.Start(context.Background(), "memcache.snapshot.load")
 	defer func() { span.End(err) }()
 	return c.loadInto(r, true)
 }
 
-// Merge folds the snapshot's entries into the cache, overwriting existing
-// keys. Untouched keys are preserved. Returns inserts plus replacements.
+// Merge is [Cache.Load] without the reset: the snapshot's entries
+// overwrite existing keys and other keys are kept. It returns the number
+// of entries written.
 func (c *Cache[K, V]) Merge(r io.Reader) (int, error) {
 	return c.loadInto(r, false)
 }
@@ -285,8 +288,8 @@ func (c *Cache[K, V]) snapshotEntries() []entrySnapshot[K, V] {
 }
 
 // applySnapshot inserts (or overwrites) one snapshotted record while
-// preserving the snapshot's expireAt and inserted timestamps. Hits and
-// generation reset to zero; policy state initializes fresh on Load.
+// preserving the snapshot's expireAt, inserted and hits values.
+// Policy state initializes fresh.
 func (c *Cache[K, V]) applySnapshot(snap entrySnapshot[K, V]) {
 	s := c.shardFor(snap.key)
 	s.mu.Lock()

@@ -99,25 +99,21 @@ func (idx *tagIndex[K]) distinctTagCount() int {
 	return len(idx.keysByTag)
 }
 
-// SetWithTags stores value under key and indexes the entry under
-// each supplied tag. The cache-level default TTL applies. Tags can
-// later be used to remove this and similarly-tagged entries in one
-// call via [Cache.InvalidateTag].
+// SetWithTags stores value under key with the cache's default TTL and
+// indexes the entry under each supplied tag, replacing any tags derived
+// from the value. [Cache.InvalidateTag] later removes every entry
+// carrying a tag in one call.
 //
-// Returns the same errors as [Cache.Set] plus, in future revisions,
-// [ErrTooManyTags] when limit options are added.
+// It is SetWithOptions(key, value, SetTags(tags...)); a tag set over
+// [WithMaxTagsPerEntry] or [WithMaxTagsTotal] returns a
+// [*CapacityError] matching [ErrTooManyTags].
 func (c *Cache[K, V]) SetWithTags(key K, value V, tags ...string) error {
 	return c.SetWithOptions(key, value, SetTags(tags...))
 }
 
-// InvalidateTag removes every entry currently tagged with tag.
-// Returns the number of entries removed; eviction stats record
-// each removal under [EvictReasonTag].
-//
-// Lock discipline: the tag→keys snapshot is taken under the index's
-// read lock and that lock is released before any per-shard write
-// lock is acquired, so InvalidateTag never holds both
-// simultaneously (matching spec §19.2.1).
+// InvalidateTag removes every entry currently tagged with tag and
+// returns the number removed. Each removal is recorded under
+// [EvictReasonTag].
 func (c *Cache[K, V]) InvalidateTag(tag string) int {
 	if c.closed.Load() || c.tags == nil {
 		return 0

@@ -16,9 +16,9 @@ var (
 	errRawCodecNotBytesPtr = errors.New("raw codec only supports *[]byte destinations")
 )
 
-// Codec is the abstraction the snapshot subsystem uses to serialize
-// keys and values to bytes. The package ships gob, JSON, and raw
-// implementations; users may supply their own via WithCodec.
+// Codec serializes snapshot keys and values to bytes. The package ships
+// [GobCodec], [JSONCodec] and [RawCodec], plus the [CompressedCodec] and
+// [EncryptedCodec] wrappers; install one with [WithCodec].
 type Codec interface {
 	// Marshal encodes v to bytes.
 	Marshal(v any) ([]byte, error)
@@ -31,10 +31,10 @@ type Codec interface {
 	Name() string
 }
 
-// GobCodec is the default snapshot codec. Compact, fast, Go-only. Each
-// snapshot Save/Load round trip includes type schema in the byte
-// stream; types whose fields change between writes/reads handle the
-// drift gracefully (gob's documented behavior for missing/extra fields).
+// GobCodec is the default snapshot codec, using encoding/gob. Each
+// encoded key and value carries its own gob type description, so struct
+// fields added or removed between save and load are handled by gob's
+// usual rules.
 type GobCodec struct{}
 
 // Marshal encodes v with encoding/gob.
@@ -57,9 +57,9 @@ func (GobCodec) Unmarshal(data []byte, v any) error {
 // Name reports "gob".
 func (GobCodec) Name() string { return "gob" }
 
-// JSONCodec is a JSON snapshot codec. Larger and slower than gob, but
-// portable across languages and `jq`-able. Requires V (and K when used
-// as a map key in the snapshot format) to be JSON-marshalable.
+// JSONCodec is a snapshot codec using encoding/json. Larger and slower
+// than gob, but readable by other tools. K and V must be
+// JSON-marshalable.
 type JSONCodec struct{}
 
 // Marshal encodes v with encoding/json.
@@ -82,11 +82,8 @@ func (JSONCodec) Unmarshal(data []byte, v any) error {
 // Name reports "json".
 func (JSONCodec) Name() string { return "json" }
 
-// RawCodec passes byte slices through without encoding. It is only valid
-// for caches whose value type is []byte. Marshal returns the input
-// directly (a defensive copy is made so subsequent mutations of the
-// caller's slice don't affect the snapshot stream); Unmarshal copies
-// the input into the destination *[]byte.
+// RawCodec passes byte slices through without encoding: Marshal accepts
+// only []byte and Unmarshal only *[]byte, and both copy the bytes.
 type RawCodec struct{}
 
 // Marshal copies and returns v's bytes. Returns an error if v is not

@@ -127,9 +127,8 @@ func (c *Cache[K, V]) stopJanitor(s *shard[K, V]) {
 }
 
 // janitorIdleShutdownTicks is how many consecutive idle ticks the
-// janitor must observe before exiting. Per spec §7.3 the
-// recommendation is 5; matches the "no TTL entries for 5 ×
-// JanitorInterval" formulation.
+// janitor must observe before exiting: a shard with no TTL entries for
+// 5 × JanitorInterval stops its janitor goroutine.
 const janitorIdleShutdownTicks = 5
 
 // runJanitor is the per-shard sweep loop. It wakes every configured
