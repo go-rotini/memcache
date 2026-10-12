@@ -68,8 +68,8 @@ func WithPurgeVisitor[K comparable, V any](fn func(key K, value V) error) Option
 }
 
 // WithCopyOnGet installs fn applied to values handed out by Get, Peek,
-// Range, GetOrSet and the other read methods; callers receive
-// fn(value). fn may be called under a shard lock and must be fast and
+// GetWithExpiry, GetOrLoad (hit or load), Range, GetOrSet and the other
+// read methods; callers receive fn(value). fn may be called under a shard lock and must be fast and
 // side-effect-free.
 func WithCopyOnGet[V any](fn func(V) V) Option {
 	return func(c *config) {

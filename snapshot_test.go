@@ -3,14 +3,17 @@ package memcache
 import (
 	"bytes"
 	"errors"
+	"io"
+	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
 
 func TestSnapshotRoundTrip(t *testing.T) {
-	src, _ := New[string, int](WithMaxEntries(8))
+	src, _ := New[string, int](WithMaxEntries(8), WithShards(1))
 	defer src.Close()
 	for k, v := range map[string]int{"alice": 1, "bob": 2, "carol": 3} {
 		_ = src.Set(k, v)
@@ -20,7 +23,7 @@ func TestSnapshotRoundTrip(t *testing.T) {
 		t.Fatalf("Save: %v", err)
 	}
 
-	dst, _ := New[string, int](WithMaxEntries(8))
+	dst, _ := New[string, int](WithMaxEntries(8), WithShards(1))
 	defer dst.Close()
 	n, err := dst.Load(&buf)
 	if err != nil {
@@ -38,7 +41,7 @@ func TestSaveFileLoadFileRoundTrip(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "snapshot.gob")
 
-	src, _ := New[string, int](WithMaxEntries(8))
+	src, _ := New[string, int](WithMaxEntries(8), WithShards(1))
 	defer src.Close()
 	for i := range 5 {
 		_ = src.Set(itoaSimple(i), i*10)
@@ -56,7 +59,7 @@ func TestSaveFileLoadFileRoundTrip(t *testing.T) {
 		t.Fatal("snapshot file is empty")
 	}
 
-	dst, _ := New[string, int](WithMaxEntries(8))
+	dst, _ := New[string, int](WithMaxEntries(8), WithShards(1))
 	defer dst.Close()
 	n, err := dst.LoadFile(path)
 	if err != nil {
@@ -203,12 +206,12 @@ func TestLoadResetsBeforeReading(t *testing.T) {
 }
 
 func TestMergePreservesUntouched(t *testing.T) {
-	c, _ := New[string, int](WithMaxEntries(8))
+	c, _ := New[string, int](WithMaxEntries(8), WithShards(1))
 	defer c.Close()
 	_ = c.Set("preexisting", 99)
 	_ = c.Set("overwrite-me", 1)
 
-	src, _ := New[string, int](WithMaxEntries(8))
+	src, _ := New[string, int](WithMaxEntries(8), WithShards(1))
 	defer src.Close()
 	_ = src.Set("overwrite-me", 2)
 	_ = src.Set("new", 3)
@@ -478,5 +481,59 @@ func TestCloseWritesFinalAutoSave(t *testing.T) {
 	}
 	if v, _ := c2.Get("k"); v != 99 {
 		t.Errorf("final auto-save round trip: Get(k) = %d, want 99", v)
+	}
+}
+
+func TestRawCodecSnapshotRoundTrip(t *testing.T) {
+	t.Run("string keys", func(t *testing.T) {
+		testRawSnapshot(t, []string{"", "a", "user:42"}, WithCodec(RawCodec{}))
+	})
+	t.Run("named string keys", func(t *testing.T) {
+		type id string
+		testRawSnapshot(t, []id{"x", "y"}, WithCodec(RawCodec{}))
+	})
+	t.Run("int keys", func(t *testing.T) {
+		testRawSnapshot(t, []int{-1, 0, 7, math.MaxInt}, WithCodec(RawCodec{}))
+	})
+	t.Run("uint8 keys", func(t *testing.T) {
+		testRawSnapshot(t, []uint8{0, 255}, WithCodec(RawCodec{}))
+	})
+	t.Run("compressed raw", func(t *testing.T) {
+		testRawSnapshot(t, []string{"k1", "k2"}, WithCompressedCodec(RawCodec{}, 1))
+	})
+}
+
+func testRawSnapshot[K comparable](t *testing.T, keys []K, codec Option) {
+	t.Helper()
+	src, _ := New[K, []byte](WithMaxEntries(16), WithShards(1), codec)
+	defer src.Close()
+	for i, k := range keys {
+		_ = src.Set(k, []byte{byte(i)})
+	}
+	var buf bytes.Buffer
+	if err := src.Save(&buf); err != nil {
+		t.Fatalf("Save: %v", err)
+	}
+	dst, _ := New[K, []byte](WithMaxEntries(16), WithShards(1), codec)
+	defer dst.Close()
+	if n, err := dst.Load(&buf); err != nil || n != len(keys) {
+		t.Fatalf("Load = (%d, %v), want (%d, nil)", n, err, len(keys))
+	}
+	for i, k := range keys {
+		if v, ok := dst.Get(k); !ok || !bytes.Equal(v, []byte{byte(i)}) {
+			t.Errorf("Get(%v) = (%v, %v)", k, v, ok)
+		}
+	}
+}
+
+func TestRawCodecSnapshotRejectsUnsupportedKey(t *testing.T) {
+	type pair struct{ a, b int }
+	c, _ := New[pair, []byte](WithMaxEntries(4), WithCodec(RawCodec{}))
+	defer c.Close()
+	_ = c.Set(pair{1, 2}, []byte("v"))
+	err := c.Save(io.Discard)
+	var ce *CodecError
+	if !errors.As(err, &ce) || !strings.Contains(err.Error(), "key") {
+		t.Fatalf("Save = %v, want a *CodecError about the key type", err)
 	}
 }

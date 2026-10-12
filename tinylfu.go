@@ -340,3 +340,15 @@ func (p *tinyLFUPolicy[K, V]) Snapshot() any {
 // PromotionNeeded always returns true: OnAccess bumps the sketch and may
 // move entries between segments, so the read-only fast path is unsafe.
 func (p *tinyLFUPolicy[K, V]) PromotionNeeded(*entry[K, V]) bool { return true }
+
+// shed picks a victim regardless of the region budgets, in the order
+// probationary, window, protected.
+func (p *tinyLFUPolicy[K, V]) shed() *entry[K, V] {
+	for _, tail := range []*tinyLFUNode[K, V]{p.probationaryTail, p.windowTail, p.protectedTail} {
+		if tail != nil {
+			p.unlink(tail)
+			return tail.entry
+		}
+	}
+	return nil
+}

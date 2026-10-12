@@ -468,3 +468,29 @@ func (p *s3fifoPolicy[K, V]) PromotionNeeded(e *entry[K, V]) bool {
 	}
 	return n.freq.Load() < s3FreqMax
 }
+
+// shed picks a victim regardless of the Small/Main budgets: the oldest
+// Small entry (recorded in Ghost), else the oldest Main entry. With
+// keepRecent the just-inserted entry is skipped.
+func (p *s3fifoPolicy[K, V]) shed(keepRecent bool) *entry[K, V] {
+	if n := p.firstSmallNotRecent(); n != nil {
+		p.unlinkSmall(n)
+		p.recordGhost(n.entry.key)
+		return n.entry
+	}
+	if n := p.firstMainNotRecent(); n != nil {
+		p.unlinkMain(n)
+		return n.entry
+	}
+	if keepRecent || p.recentInsert == nil {
+		return nil
+	}
+	n := p.recentInsert
+	if n.inMain {
+		p.unlinkMain(n)
+	} else {
+		p.unlinkSmall(n)
+		p.recordGhost(n.entry.key)
+	}
+	return n.entry
+}

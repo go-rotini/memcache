@@ -320,7 +320,26 @@ func (c *Cache[K, V]) applySnapshot(snap entrySnapshot[K, V]) {
 	if snap.expireAt > 0 {
 		c.startJanitorLocked(s)
 	}
-	c.evictWhileOverBudgetLocked(s)
+	c.evictOverTotalLocked(s)
+}
+
+// evictOverTotalLocked evicts from s while the cache holds more entries
+// than [WithMaxEntries] allows. Loading bounds the total rather than each
+// shard: keys hash with a per-cache random seed, so a snapshot's entries
+// spread over shards differently than in the cache that saved them, and
+// per-shard budgets would drop entries that fit the cache. A shard left
+// over its share trims on its next write. The byte budget is enforced as
+// usual when s is unlocked. Caller MUST hold s.mu.
+func (c *Cache[K, V]) evictOverTotalLocked(s *shard[K, V]) {
+	limit := int64(c.cfg.maxEntries)
+	for limit > 0 && c.counters.entries.Load() > limit && s.storage.length() > 0 {
+		victim := shedVictim(s.policy, false)
+		if victim == nil {
+			return
+		}
+		c.removeLocked(s, victim, EvictReasonCapacity)
+		c.counters.evictions.Add(1)
+	}
 }
 
 func (c *Cache[K, V]) writeHeader(w io.Writer, count int64) error {
@@ -428,7 +447,7 @@ func sortStrings(a []string) {
 }
 
 func (c *Cache[K, V]) writeRecord(w io.Writer, snap *entrySnapshot[K, V]) error {
-	keyBytes, err := c.cfg.codec.Marshal(snap.key)
+	keyBytes, err := c.marshalKey(snap.key)
 	if err != nil {
 		return wrapSaveErr("key marshal", err)
 	}
@@ -572,7 +591,7 @@ func (c *Cache[K, V]) readRecord(r io.Reader, h hash.Hash32) (entrySnapshot[K, V
 		return snap, &SnapshotError{Op: "load", Message: "reading value bytes", Err: err}
 	}
 
-	if err := c.cfg.codec.Unmarshal(keyBytes, &snap.key); err != nil {
+	if err := c.unmarshalKey(keyBytes, &snap.key); err != nil {
 		return snap, &SnapshotError{Op: "load", Message: "key unmarshal", Err: err}
 	}
 	if err := c.unmarshalValue(valBytes, &snap.value); err != nil {
@@ -667,4 +686,30 @@ func readString(r io.Reader) (string, error) {
 
 func wrapSaveErr(field string, err error) error {
 	return &SnapshotError{Op: "save", Message: "writing " + field, Err: err}
+}
+
+// marshalKey encodes a snapshot key with the configured [Codec]. A raw
+// codec takes only bytes, so string and integer keys are first turned
+// into bytes (see rawKeyBytes).
+func (c *Cache[K, V]) marshalKey(key K) ([]byte, error) {
+	if !isRawCodec(c.cfg.codec) {
+		return c.cfg.codec.Marshal(key)
+	}
+	b, err := rawKeyBytes(key)
+	if err != nil {
+		return nil, err
+	}
+	return c.cfg.codec.Marshal(b)
+}
+
+// unmarshalKey reverses [Cache.marshalKey].
+func (c *Cache[K, V]) unmarshalKey(data []byte, dst *K) error {
+	if !isRawCodec(c.cfg.codec) {
+		return c.cfg.codec.Unmarshal(data, dst)
+	}
+	var b []byte
+	if err := c.cfg.codec.Unmarshal(data, &b); err != nil {
+		return err
+	}
+	return setRawKey(b, dst)
 }

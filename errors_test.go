@@ -1,10 +1,12 @@
 package memcache
 
 import (
+	"context"
 	"errors"
 	"io"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestSentinelErrorsDistinct(t *testing.T) {
@@ -171,5 +173,26 @@ func TestLoadErrorIsNonPeer(t *testing.T) {
 	err := &LoadError{Key: "k", Err: io.EOF}
 	if errors.Is(err, &CodecError{}) {
 		t.Error("LoadError.Is should not match a CodecError")
+	}
+}
+
+func TestGetOrLoadWrapsLoaderErrorInLoadError(t *testing.T) {
+	boom := errors.New("boom")
+	l := &countingLoader{err: boom}
+	c, _ := New[string, int](WithMaxEntries(8), WithLoader(l), WithNegativeCache(time.Minute))
+	defer c.Close()
+	_, err := c.GetOrLoad(context.Background(), "k")
+	var le *LoadError
+	if !errors.As(err, &le) || le.Key != "k" || !errors.Is(err, boom) {
+		t.Fatalf("GetOrLoad error = %#v, want *LoadError{Key: k} wrapping boom", err)
+	}
+
+	l.err = ErrNotFound
+	_, err = c.GetOrLoad(context.Background(), "nf")
+	if !errors.As(err, &le) || !errors.Is(err, ErrNotFound) {
+		t.Fatalf("loader ErrNotFound = %#v, want *LoadError wrapping ErrNotFound", err)
+	}
+	if _, err = c.GetOrLoad(context.Background(), "nf"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("negative-cache hit = %v, want ErrNotFound", err)
 	}
 }

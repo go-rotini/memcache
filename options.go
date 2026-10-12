@@ -285,8 +285,11 @@ func WithMaxEntries(n int) Option {
 }
 
 // WithMaxBytes sets the maximum total weight of entries across the
-// cache. It requires [WithWeigher]; without one, [New] returns a
-// [*ConfigError].
+// cache, as measured by the [Weigher]. A write that takes the cache over
+// it evicts policy-chosen victims, from the written shard first and then
+// from the others, until the total fits again. It requires [WithWeigher];
+// without one, [New] returns a [*ConfigError]. With [WithMaxEntries] as
+// well, both bounds apply.
 func WithMaxBytes(n int64) Option {
 	return func(c *config) { c.maxBytes = n }
 }
@@ -475,7 +478,8 @@ func WithWeigher[V any](fn Weigher[V]) Option {
 	}
 }
 
-// WithHasher overrides the default key hasher. The default handles
+// WithHasher overrides the default key hasher. The default is keyed
+// randomly per cache, so key placement can't be predicted; it handles
 // string, integer and bool keys directly and hashes other key types
 // through their fmt %v form, so a custom hasher is faster for struct
 // or pointer keys. A hasher whose type does not match K is rejected by

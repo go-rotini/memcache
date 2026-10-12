@@ -123,7 +123,9 @@ func (e *CapacityError) Is(target error) bool {
 	return false
 }
 
-// LoadError wraps an error returned by a Loader.
+// LoadError wraps an error returned by a [Loader] or a [Cache.GetOrLoadFn]
+// function, as returned from [Cache.GetOrLoad] and [Cache.GetOrLoadFn].
+// [errors.Is] and [errors.As] see the Loader's error through Unwrap.
 type LoadError struct {
 	Key any
 	Err error

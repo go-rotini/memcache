@@ -47,3 +47,45 @@ func TestClampWeight(t *testing.T) {
 		}
 	}
 }
+
+func TestWithMaxBytesEnforcedForEveryPolicy(t *testing.T) {
+	for _, p := range []Policy{PolicyLRU, PolicyFIFO, PolicyLFU, PolicyS3FIFO, PolicyTinyLFU, Policy2Q, PolicyARC} {
+		// maxEntries 0 is bytes-only; 1000 is an entry bound the byte
+		// budget hits first.
+		for _, maxEntries := range []int{0, 1000} {
+			t.Run(p.String(), func(t *testing.T) {
+				testMaxBytesEnforced(t, p, maxEntries)
+			})
+		}
+	}
+}
+
+func testMaxBytesEnforced(t *testing.T, p Policy, maxEntries int) {
+	t.Helper()
+	c, err := New[int, string](WithMaxEntries(maxEntries), WithMaxBytes(100), WithWeigher(StringWeigher()), WithShards(4), WithPolicy(p))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	for i := range 200 {
+		_ = c.Set(i, "0123456789")
+		if got := c.Bytes(); got > 100 {
+			t.Fatalf("after %d sets Bytes() = %d, want <= 100", i+1, got)
+		}
+	}
+	if c.Len() == 0 {
+		t.Fatal("cache evicted everything")
+	}
+	evicted := c.Resize(50)
+	if got := c.Bytes(); got > 50 || evicted == 0 {
+		t.Fatalf("after Resize(50): Bytes() = %d, evicted = %d", got, evicted)
+	}
+	// A heavy insert sheds from other shards too.
+	_ = c.Set(-1, string(make([]byte, 45)))
+	if got := c.Bytes(); got > 50 {
+		t.Fatalf("after heavy Set: Bytes() = %d, want <= 50", got)
+	}
+	if !c.Has(-1) {
+		t.Fatal("heavy Set evicted its own entry while others remained")
+	}
+}

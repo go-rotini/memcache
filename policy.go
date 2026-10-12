@@ -159,3 +159,21 @@ func newPolicy[K comparable, V any](p Policy, cfg policyConfig[K]) evictionPolic
 		return newLRU[K, V]()
 	}
 }
+
+// shedVictim returns an entry to evict when the cache is over its byte
+// budget. Unlike Victim it ignores the policy's entry sub-budgets, so it
+// yields a candidate whenever the policy holds one. With keepRecent,
+// S3-FIFO still refuses to give up the entry inserted by the current
+// Set.
+func shedVictim[K comparable, V any](p evictionPolicy[K, V], keepRecent bool) *entry[K, V] {
+	if v := p.Victim(); v != nil {
+		return v
+	}
+	switch p := p.(type) {
+	case *s3fifoPolicy[K, V]:
+		return p.shed(keepRecent)
+	case *tinyLFUPolicy[K, V]:
+		return p.shed()
+	}
+	return nil
+}

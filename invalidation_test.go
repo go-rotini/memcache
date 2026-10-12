@@ -56,7 +56,7 @@ func TestInvalidationSubscriber_ReceivesAndDeletes(t *testing.T) {
 	var mu sync.Mutex
 	publisherSeen := []EvictionReason{}
 	c, _ := New[string, int](
-		WithMaxEntries(8),
+		WithMaxEntries(8), WithShards(1),
 		WithInvalidationSubscriber(ch),
 		WithInvalidationPublisher(func(_ string, r EvictionReason) {
 			mu.Lock()

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 )
 
 func TestNoopTracerStart(t *testing.T) {
@@ -39,4 +40,28 @@ func TestNoopTracerThroughInterface(t *testing.T) {
 	}
 	span.SetAttr("path", "/tmp/x")
 	span.End(nil)
+}
+
+type recordingTracer struct{ ended chan error }
+
+func (r recordingTracer) Start(ctx context.Context, _ string, _ ...Attr) (context.Context, Span) {
+	return ctx, recordingSpan(r)
+}
+
+type recordingSpan recordingTracer
+
+func (r recordingSpan) End(err error)     { r.ended <- err }
+func (recordingSpan) SetAttr(string, any) {}
+
+func TestLoadSpanRecordsLoadError(t *testing.T) {
+	boom := errors.New("boom")
+	tr := recordingTracer{ended: make(chan error, 1)}
+	c, _ := New[string, int](WithMaxEntries(8), WithTracer(tr))
+	defer c.Close()
+	_, err := c.GetOrLoadFn(context.Background(), "k", func(context.Context, string) (int, time.Duration, error) {
+		return 0, 0, boom
+	})
+	if got := <-tr.ended; !errors.Is(got, boom) || !errors.Is(err, boom) {
+		t.Fatalf("span ended with %v, call returned %v; want both to wrap %v", got, err, boom)
+	}
 }

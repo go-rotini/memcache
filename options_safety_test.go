@@ -2,6 +2,7 @@ package memcache
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"log/slog"
 	"reflect"
@@ -142,7 +143,7 @@ func TestWithPurgeVisitor_FiresOnClear(t *testing.T) {
 func TestWithPurgeVisitor_FiresOnClose(t *testing.T) {
 	visited := atomic.Int32{}
 	c, _ := New[string, int](
-		WithMaxEntries(8),
+		WithMaxEntries(8), WithShards(1),
 		WithPurgeVisitor(func(string, int) error {
 			visited.Add(1)
 			return nil
@@ -223,5 +224,31 @@ func TestWithCopyOnGet_NotAppliedOnPeekWhenAbsent(t *testing.T) {
 	_, _ = c.Peek("present")
 	if calls.Load() != 1 {
 		t.Errorf("copy fn fired %d times on hit, want 1", calls.Load())
+	}
+}
+
+func TestWithCopyOnGet_AppliedByGetOrLoadAndGetWithExpiry(t *testing.T) {
+	var copies atomic.Int64
+	c, _ := New[string, []int](
+		WithMaxEntries(8),
+		WithCopyOnGet(func(s []int) []int {
+			copies.Add(1)
+			return append([]int(nil), s...)
+		}),
+	)
+	defer c.Close()
+	load := func(context.Context, string) ([]int, time.Duration, error) { return []int{1}, 0, nil }
+
+	miss, _ := c.GetOrLoadFn(context.Background(), "k", load)
+	miss[0] = 99
+	hit, _ := c.GetOrLoadFn(context.Background(), "k", load)
+	hit[0] = 99
+	exp, _, _ := c.GetWithExpiry("k")
+	exp[0] = 99
+	if got, _ := c.Get("k"); got[0] != 1 {
+		t.Fatalf("caller mutation reached the cache: %v", got)
+	}
+	if n := copies.Load(); n != 4 {
+		t.Fatalf("copy func ran %d times, want 4", n)
 	}
 }

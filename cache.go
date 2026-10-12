@@ -2,8 +2,11 @@ package memcache
 
 import (
 	"context"
+	cryptorand "crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"math/rand/v2"
 	"os"
 	"strings"
@@ -132,6 +135,14 @@ type Cache[K comparable, V any] struct {
 	// are off.
 	async *asyncWrites
 
+	// maxBytes is the live byte budget (0 = none), read on the hot
+	// path and changed by Resize. shedding guards [Cache.shedBytes]
+	// against concurrent or re-entrant sweeps; shedNext rotates the
+	// shard a sweep starts from so no shard is always drained first.
+	maxBytes atomic.Int64
+	shedding atomic.Bool
+	shedNext atomic.Uint64
+
 	closed atomic.Bool
 }
 
@@ -177,6 +188,7 @@ func Must[K comparable, V any](c *Cache[K, V], err error) *Cache[K, V] {
 const configFieldMaxBytes = "MaxBytes"
 
 func initShards[K comparable, V any](c *Cache[K, V], cfg *config, hasher func(K) uint64) {
+	c.maxBytes.Store(cfg.maxBytes)
 	perShard := perShardBudget(cfg.maxEntries, len(c.shards))
 	pcfg := policyConfig[K]{budget: perShard, hasher: hasher}
 	for i := range c.shards {
@@ -572,9 +584,18 @@ func resolveHasher[K comparable](raw any) (func(K) uint64, error) {
 // defaultHasher returns a hasher specialized for common K types: SipHash-2-4
 // for string and []byte keys, splitmix64 for integer/bool keys, and a
 // fmt-stringification fallback for anything else.
+//
+// Each call draws a fresh random key from crypto/rand (the SipHash key,
+// and a seed folded into integer keys before mixing), so key placement
+// differs per cache and an attacker can't pick keys that all land in
+// one shard or bucket. Hashes never leave the process (snapshots and
+// stores persist keys, not hashes), and snapshot loads bound the total
+// rather than each shard, so nothing needs them to be stable.
 func defaultHasher[K comparable]() func(K) uint64 {
-	const k0 = uint64(0x0706050403020100)
-	const k1 = uint64(0x0f0e0d0c0b0a0908)
+	var seed [16]byte
+	_, _ = cryptorand.Read(seed[:])
+	k0 := binary.LittleEndian.Uint64(seed[:8])
+	k1 := binary.LittleEndian.Uint64(seed[8:])
 	return func(k K) uint64 {
 		switch v := any(k).(type) {
 		case string:
@@ -582,32 +603,32 @@ func defaultHasher[K comparable]() func(K) uint64 {
 		case []byte:
 			return sketch.SipHash24(k0, k1, v)
 		case int:
-			return sketch.MixUint64(uint64(v))
+			return sketch.MixUint64(uint64(v) ^ k0)
 		case int8:
-			return sketch.MixUint64(uint64(v))
+			return sketch.MixUint64(uint64(v) ^ k0)
 		case int16:
-			return sketch.MixUint64(uint64(v))
+			return sketch.MixUint64(uint64(v) ^ k0)
 		case int32:
-			return sketch.MixUint64(uint64(v))
+			return sketch.MixUint64(uint64(v) ^ k0)
 		case int64:
-			return sketch.MixUint64(uint64(v))
+			return sketch.MixUint64(uint64(v) ^ k0)
 		case uint:
-			return sketch.MixUint64(uint64(v))
+			return sketch.MixUint64(uint64(v) ^ k0)
 		case uint8:
-			return sketch.MixUint64(uint64(v))
+			return sketch.MixUint64(uint64(v) ^ k0)
 		case uint16:
-			return sketch.MixUint64(uint64(v))
+			return sketch.MixUint64(uint64(v) ^ k0)
 		case uint32:
-			return sketch.MixUint64(uint64(v))
+			return sketch.MixUint64(uint64(v) ^ k0)
 		case uint64:
-			return sketch.MixUint64(v)
+			return sketch.MixUint64(v ^ k0)
 		case uintptr:
-			return sketch.MixUint64(uint64(v))
+			return sketch.MixUint64(uint64(v) ^ k0)
 		case bool:
 			if v {
-				return sketch.MixUint64(1)
+				return sketch.MixUint64(1 ^ k0)
 			}
-			return sketch.MixUint64(0)
+			return sketch.MixUint64(k0)
 		default:
 			s := fmt.Sprintf("%v", k)
 			return sketch.HashString(k0, k1, s)
@@ -987,9 +1008,9 @@ func (c *Cache[K, V]) GetWithExpiry(key K) (V, time.Time, bool) {
 	c.recordHit()
 	expNanos := e.expireAt.Load()
 	if expNanos == 0 {
-		return e.loadValue(), time.Time{}, true
+		return c.returnValue(e.loadValue()), time.Time{}, true
 	}
-	return e.loadValue(), time.Unix(0, expNanos), true
+	return c.returnValue(e.loadValue()), time.Unix(0, expNanos), true
 }
 
 // Set stores value under key with the cache's default TTL. If V
@@ -1588,19 +1609,74 @@ func (c *Cache[K, V]) weighOf(v V) int64 {
 }
 
 // evictWhileOverBudgetLocked evicts policy-chosen victims until the shard
-// is within its budget. Caller MUST hold s.mu.
+// is within its entry budget and the cache within its byte budget (or s
+// is down to one entry; [Cache.shedBytes] covers the rest). Caller MUST
+// hold s.mu.
 func (c *Cache[K, V]) evictWhileOverBudgetLocked(s *shard[K, V]) {
-	if s.budget <= 0 {
-		return
-	}
-	for s.storage.length() > s.budget {
-		victim := s.policy.Victim()
-		if victim == nil {
-			return
+	c.evictOverBudgetLocked(s, EvictReasonCapacity, 1)
+}
+
+// evictOverBudgetLocked evicts victims from s under reason while s holds
+// more than its entry budget, or while the cache weighs more than its
+// byte budget and s holds more than keep entries; it returns how many it
+// evicted. After a Set, keep is 1 so the byte budget is met from older
+// entries first ([Cache.shedBytes] takes the rest). Caller MUST hold s.mu.
+func (c *Cache[K, V]) evictOverBudgetLocked(s *shard[K, V], reason EvictionReason, keep int) int {
+	count := 0
+	for {
+		n := s.storage.length()
+		overEntries := s.budget > 0 && n > s.budget
+		mb := c.maxBytes.Load()
+		overBytes := mb > 0 && n > keep && c.counters.bytes.Load() > mb
+		var victim *entry[K, V]
+		if overEntries {
+			victim = s.policy.Victim()
 		}
-		c.removeLocked(s, victim, EvictReasonCapacity)
+		if victim == nil && overBytes {
+			victim = shedVictim(s.policy, keep > 0)
+		}
+		if victim == nil {
+			return count
+		}
+		c.removeLocked(s, victim, reason)
 		c.counters.evictions.Add(1)
+		count++
 	}
+}
+
+// shedBytes evicts across shards, one shard lock at a time, until the
+// cache is within its byte budget, and returns how many it evicted. It
+// covers what a single shard can't: an update that grew an entry, or an
+// insert into a shard holding too little to cover the overage. Shard
+// last, if non-nil, is visited after the others, so the shard just
+// written to gives up its newest entry only when nothing else is left.
+func (c *Cache[K, V]) shedBytes(reason EvictionReason, last *shard[K, V]) int {
+	mb := c.maxBytes.Load()
+	if mb <= 0 || c.counters.bytes.Load() <= mb || !c.shedding.CompareAndSwap(false, true) {
+		return 0
+	}
+	defer c.shedding.Store(false)
+	count := 0
+	shed := func(s *shard[K, V]) bool {
+		if c.counters.bytes.Load() <= c.maxBytes.Load() {
+			return false
+		}
+		s.mu.Lock()
+		count += c.evictOverBudgetLocked(s, reason, 0)
+		c.releaseShard(s)
+		return true
+	}
+	start := c.shedNext.Add(1)
+	for i := range uint64(len(c.shards)) {
+		s := c.shards[(start+i)&c.shardMask]
+		if s != last && !shed(s) {
+			return count
+		}
+	}
+	if last != nil {
+		shed(last)
+	}
+	return count
 }
 
 // entryExpiredLocked reports whether e is expired at now. Combines TTL
@@ -1729,9 +1805,19 @@ func (c *Cache[K, V]) removeCallbackFor(key K, value V, reason EvictionReason, t
 	}
 }
 
-// flushAndUnlock releases the shard lock and fires any callbacks deferred
-// by removeLocked on this shard. Caller MUST hold the shard lock.
+// flushAndUnlock releases the shard lock, fires any callbacks deferred
+// by removeLocked on this shard, and then brings the cache back within
+// its byte budget. Caller MUST hold the shard lock.
 func (c *Cache[K, V]) flushAndUnlock(s *shard[K, V]) {
+	c.releaseShard(s)
+	if c.maxBytes.Load() > 0 {
+		c.shedBytes(EvictReasonCapacity, s)
+	}
+}
+
+// releaseShard releases the shard lock and fires any callbacks deferred
+// by removeLocked on this shard. Caller MUST hold the shard lock.
+func (c *Cache[K, V]) releaseShard(s *shard[K, V]) {
 	cbs := s.pendingCallbacks
 	s.pendingCallbacks = nil
 	s.mu.Unlock()
@@ -2103,6 +2189,7 @@ func (c *Cache[K, V]) Resize(newSize int64) int {
 	// Bytes-bounded only if maxBytes was explicitly configured.
 	if c.cfg.maxBytes > 0 {
 		c.cfg.maxBytes = newSize
+		c.maxBytes.Store(newSize)
 	} else {
 		c.cfg.maxEntries = int(newSize)
 	}
@@ -2113,33 +2200,16 @@ func (c *Cache[K, V]) Resize(newSize int64) int {
 		s.mu.Lock()
 		s.budget = perShard
 		s.policy.SetBudget(perShard)
-		evicted += c.shrinkShardLocked(s)
-		c.flushAndUnlock(s)
+		// Entry budgets only; shedBytes spreads byte evictions below.
+		evicted += c.evictOverBudgetLocked(s, EvictReasonResize, math.MaxInt)
+		c.releaseShard(s)
 	}
+	evicted += c.shedBytes(EvictReasonResize, nil)
 	c.publishEvent(Event[K, V]{
 		Kind: EventResize,
 		At:   c.cfg.clock.Now(),
 	})
 	return evicted
-}
-
-// shrinkShardLocked evicts victims until the shard is within budget,
-// recording each eviction under [EvictReasonResize]. Caller MUST hold s.mu.
-func (c *Cache[K, V]) shrinkShardLocked(s *shard[K, V]) int {
-	if s.budget <= 0 {
-		return 0
-	}
-	count := 0
-	for s.storage.length() > s.budget {
-		victim := s.policy.Victim()
-		if victim == nil {
-			return count
-		}
-		c.removeLocked(s, victim, EvictReasonResize)
-		c.counters.evictions.Add(1)
-		count++
-	}
-	return count
 }
 
 // Sync drains pending background work (async tag cleanup, async writes)
@@ -2300,11 +2370,13 @@ func (c *Cache[K, V]) DeleteWhere(pred func(key K, value V) bool) int {
 // GetOrLoad returns the cached value for key, or invokes the configured
 // [Loader] when the key is absent or expired. Concurrent callers for the
 // same missing key share a single Loader invocation (singleflight).
-// Returns [ErrNoLoader], [ErrClosed], ctx.Err(), or any error from the
-// Loader. [ErrNotFound] with [WithNegativeCache] active records a
-// tombstone and returns the same error. The load runs on a context
-// detached from ctx: a caller whose ctx ends gets ctx.Err(), and the
-// load is canceled only once every waiting caller has given up.
+// Returns [ErrNoLoader], [ErrClosed], ctx.Err(), or a [*LoadError]
+// wrapping the Loader's error; match the underlying error with
+// [errors.Is]. A Loader's [ErrNotFound] with [WithNegativeCache] active
+// records a tombstone; later calls while it lives return [ErrNotFound]
+// itself. The load runs on a context detached from ctx: a caller whose
+// ctx ends gets ctx.Err(), and the load is canceled only once every
+// waiting caller has given up.
 func (c *Cache[K, V]) GetOrLoad(ctx context.Context, key K) (V, error) {
 	var zero V
 	if c.closed.Load() {
@@ -2385,10 +2457,10 @@ func (c *Cache[K, V]) RefreshAll(ctx context.Context) int {
 func (c *Cache[K, V]) loadOrJoin(
 	ctx context.Context, key K,
 	fn func(ctx context.Context, key K) (V, time.Duration, error),
-) (V, error) {
+) (_ V, err error) {
 	var zero V
 	ctx, span := c.tracer.Start(ctx, "memcache.load", Attr{Key: "key", Value: any(key)})
-	defer func() { span.End(nil) }()
+	defer func() { span.End(err) }()
 	s := c.shardFor(key)
 	s.mu.Lock()
 	now := c.cfg.clock.Now().UnixNano()
@@ -2403,7 +2475,7 @@ func (c *Cache[K, V]) loadOrJoin(
 		s.policy.OnAccess(e)
 		c.flushAndUnlock(s)
 		c.recordHit()
-		return v, nil
+		return c.returnValue(v), nil
 	}
 
 	// Negative-cache hit: short-circuit without invoking loader.
@@ -2477,7 +2549,7 @@ func (c *Cache[K, V]) waitOrLeave(ctx context.Context, s *shard[K, V], key K, fl
 		if flight.err != nil {
 			return zero, flight.err
 		}
-		return flight.val, nil
+		return c.returnValue(flight.val), nil
 	case <-ctx.Done():
 		s.mu.Lock()
 		if flight.refs.Add(-1) == 0 {
@@ -2550,7 +2622,9 @@ func (c *Cache[K, V]) runLoader(
 	err = c.tagLoaderTimeout(err)
 	flight.val = val
 	flight.ttl = ttl
-	flight.err = err
+	if err != nil {
+		flight.err = &LoadError{Key: key, Err: err}
+	}
 
 	s.mu.Lock()
 	delete(s.inflight, key)
@@ -2576,7 +2650,7 @@ func (c *Cache[K, V]) runLoader(
 		// and ctx errors (which would leak one caller's cancel to
 		// unrelated callers within errorTTL).
 		s.errors[key] = &cachedError{
-			err:      err,
+			err:      flight.err,
 			expireAt: c.cfg.clock.Now().UnixNano() + int64(c.cfg.errorTTL),
 		}
 		if c.cfg.statsEnabled {
@@ -2820,7 +2894,7 @@ func (c *Cache[K, V]) GetMultiOrLoad(ctx context.Context, keys []K) (map[K]V, er
 			c.cfg.logger.Debug("memcache: GetMultiOrLoad set failed",
 				"err", setErr)
 		}
-		out[k] = res.Value
+		out[k] = c.returnValue(res.Value)
 	}
 	return out, nil
 }

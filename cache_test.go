@@ -5,6 +5,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/go-rotini/memcache/internal/sketch"
 )
 
 func contextWithCancel() (context.Context, context.CancelFunc) {
@@ -761,7 +763,7 @@ func TestDeleteExpired(t *testing.T) {
 }
 
 func TestDeletePrefixOnStringKeys(t *testing.T) {
-	c, _ := New[string, int](WithMaxEntries(16))
+	c, _ := New[string, int](WithMaxEntries(16), WithShards(1))
 	defer c.Close()
 	for _, k := range []string{"user:42:name", "user:42:age", "user:7:name", "session:1"} {
 		_ = c.Set(k, 1)
@@ -861,5 +863,32 @@ func TestNextPowerOfTwo(t *testing.T) {
 		if got := nextPowerOfTwo(tc.in); got != tc.want {
 			t.Errorf("nextPowerOfTwo(%d) = %d, want %d", tc.in, got, tc.want)
 		}
+	}
+}
+
+func TestDefaultHasherIsKeyedPerCache(t *testing.T) {
+	// The published SipHash reference key must not be used: with it, an
+	// attacker can precompute keys that collide in one shard or bucket.
+	const refK0, refK1 = uint64(0x0706050403020100), uint64(0x0f0e0d0c0b0a0908)
+	a, b := defaultHasher[string](), defaultHasher[string]()
+	ai, bi := defaultHasher[int](), defaultHasher[int]()
+	sameStr, sameInt, ref := 0, 0, 0
+	for i := range 16 {
+		k := itoaSimple(i)
+		if a(k) == b(k) {
+			sameStr++
+		}
+		if a(k) == sketch.HashString(refK0, refK1, k) {
+			ref++
+		}
+		if ai(i) == bi(i) {
+			sameInt++
+		}
+	}
+	if sameStr == 16 || sameInt == 16 || ref == 16 {
+		t.Fatalf("default hasher is not randomly keyed: sameStr=%d sameInt=%d ref=%d", sameStr, sameInt, ref)
+	}
+	if x1, x2 := a("x"), a("x"); x1 != x2 {
+		t.Fatal("default hasher must be deterministic within one cache")
 	}
 }

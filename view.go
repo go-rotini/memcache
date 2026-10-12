@@ -97,15 +97,23 @@ func (v *CacheView[K, V]) Stats() Stats {
 	return v.cache.Stats()
 }
 
-// Clone returns a new [Cache], built with c's options, populated with a
-// snapshot of c's live entries. Hit counts and policy positioning are not
-// preserved. The snapshot is consistent per shard, not across the whole
-// cache, when c is modified concurrently.
+// Clone returns a new, independent [Cache], built with c's options and
+// populated with a snapshot of c's live entries. The clone shares no
+// outside wiring with c: it has no [WithStore] backend, no
+// [WithAutoLoad] or [WithAutoSave] path, and no
+// [WithInvalidationSubscriber] or [WithInvalidationPublisher]. Hit counts
+// and policy positioning are not preserved. The snapshot is consistent
+// per shard, not across the whole cache, when c is modified concurrently.
 func (c *Cache[K, V]) Clone() (*Cache[K, V], error) {
 	if c.closed.Load() {
 		return nil, ErrClosed
 	}
 	cfgCopy := *c.cfg
+	cfgCopy.store = nil
+	cfgCopy.autoLoadPath = ""
+	cfgCopy.autoSavePath = ""
+	cfgCopy.invalidationSubscriber = nil
+	cfgCopy.invalidationPublisher = nil
 	allowUnbounded := cfgCopy.maxEntries <= 0 && cfgCopy.maxBytes <= 0
 	clone, err := build[K, V](&cfgCopy, allowUnbounded)
 	if err != nil {
