@@ -301,7 +301,8 @@ func TestComputeOnExpiredEntryTreatsAsAbsent(t *testing.T) {
 }
 
 func TestComputeReentrancyPanic(t *testing.T) {
-	c, _ := New[string, int](WithMaxEntries(4))
+	// One shard, so "other" shares the shard of "k".
+	c, _ := New[string, int](WithMaxEntries(4), WithShards(1))
 	defer c.Close()
 	_ = c.Set("k", 1)
 

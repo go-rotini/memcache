@@ -8,6 +8,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -179,4 +181,104 @@ func TestFuzzSeedsDoNotPanic(t *testing.T) {
 		t.Skip("skipping fuzz seed sanity in -short mode")
 	}
 	_ = errors.New("placeholder")
+}
+
+// fuzzRecord is the value type FuzzLoad decodes snapshots into.
+type fuzzRecord struct {
+	Name string
+	N    []int
+	M    map[string]float64
+}
+
+// FuzzLoad feeds arbitrary bytes to Load and InspectSnapshot under each
+// codec. A load must either fail cleanly, leaving the cache untouched,
+// or succeed with the cache inside its bounds; it must never panic or
+// allocate far beyond its size limit.
+func FuzzLoad(f *testing.F) {
+	codecs := addLoadSeeds(f)
+	f.Fuzz(func(t *testing.T, which uint8, data []byte) {
+		checkLoad(t, codecs[int(which)%len(codecs)], data)
+	})
+}
+
+// FuzzLoadFixedCRC is FuzzLoad with the trailing CRC recomputed, so
+// mutations reach record decoding instead of stopping at the checksum.
+func FuzzLoadFixedCRC(f *testing.F) {
+	codecs := addLoadSeeds(f)
+	f.Fuzz(func(t *testing.T, which uint8, data []byte) {
+		if len(data) >= 4 {
+			data = fixCRC(data)
+		}
+		checkLoad(t, codecs[int(which)%len(codecs)], data)
+	})
+}
+
+// addLoadSeeds seeds f with snapshots this version writes and the
+// previous release's golden snapshots, and returns the codecs a seed's
+// index selects.
+func addLoadSeeds(f *testing.F) []Codec {
+	f.Helper()
+	golden := goldenCodecs(f)
+	names := []string{"gob", "json", "gz", "enc", "gz-enc"}
+	codecs := make([]Codec, len(names))
+	for i, name := range names {
+		codecs[i] = golden[name]
+		if data, err := os.ReadFile(filepath.Join("testdata", "v2", name+".v2")); err == nil {
+			f.Add(uint8(i), data)
+		}
+		src, _ := New[string, fuzzRecord](WithMaxEntries(32), WithCodec(codecs[i]))
+		for j := range 4 {
+			_ = src.SetWithTags(string(rune('a'+j)), fuzzRecord{Name: "x", N: []int{j}, M: map[string]float64{"a": 1}}, "t1", "t2")
+		}
+		_ = src.SetWithTTL("ttl", fuzzRecord{}, time.Hour)
+		_ = src.SetWithOptions("slide", fuzzRecord{Name: "s"}, SetTTL(time.Hour), SetSliding(true))
+		var buf bytes.Buffer
+		_ = src.Save(&buf)
+		_ = src.Close()
+		f.Add(uint8(i), buf.Bytes())
+		f.Add(uint8(i), buf.Bytes()[:buf.Len()/2])
+	}
+	return codecs
+}
+
+// checkLoad loads data into a cache that holds one entry and checks the
+// outcome: a failed load leaves the cache as it was; a successful one
+// leaves it within its bounds, with its byte count sane, and saveable.
+func checkLoad(t *testing.T, codec Codec, data []byte) {
+	t.Helper()
+	const limit = 1 << 20
+	c, err := New[string, fuzzRecord](WithMaxEntries(16), WithCodec(codec), WithMaxSnapshotBytes(limit))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_ = c.Set("keep", fuzzRecord{Name: "keep"})
+	_, lerr := c.Load(bytes.NewReader(data))
+	if lerr != nil {
+		if v, ok := c.Get("keep"); !ok || v.Name != "keep" || c.Len() != 1 {
+			t.Fatalf("failed Load (%v) changed the cache", lerr)
+		}
+	}
+	if n := c.Len(); n > 16 || c.Bytes() < 0 || c.Bytes() > int64(n)*maxEntryWeight {
+		t.Fatalf("after Load: Len=%d Bytes=%d", n, c.Bytes())
+	}
+	if len(c.Keys()) != c.Len() {
+		t.Fatalf("Len=%d but Keys has %d", c.Len(), len(c.Keys()))
+	}
+	c.Range(func(string, fuzzRecord) bool { return true })
+	if lerr == nil {
+		var buf bytes.Buffer
+		if err := c.Save(&buf); err != nil {
+			t.Fatalf("a loaded cache can't be saved: %v", err)
+		}
+		if _, err := c.Load(&buf); err != nil {
+			t.Fatalf("a loaded cache's snapshot doesn't load: %v", err)
+		}
+	}
+
+	path := t.TempDir() + "/snap"
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, _ = InspectSnapshot(path)
 }

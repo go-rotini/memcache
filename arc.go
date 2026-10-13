@@ -27,6 +27,12 @@ type arcPolicy[K comparable, V any] struct {
 	b2Head, b2Tail *arcGhostNode[K]
 	b2Size         int
 	b2Set          map[K]*arcGhostNode[K]
+
+	// recent is the node most recently inserted. Victim passes over it
+	// while another entry is resident, so a Set isn't undone by the
+	// eviction it triggers (the cache inserts before it evicts, where
+	// ARC's REPLACE runs before the insert).
+	recent *arcNode[K, V]
 }
 
 // arcNode is the intrusive list node attached to entry.policyData.
@@ -70,6 +76,7 @@ func (p *arcPolicy[K, V]) SetBudget(budget int) {
 func (p *arcPolicy[K, V]) OnInsert(e *entry[K, V]) {
 	n := &arcNode[K, V]{entry: e}
 	e.policyData = n
+	p.recent = n
 	switch {
 	case p.inB1(e.key):
 		delta := 1
@@ -127,6 +134,9 @@ func (p *arcPolicy[K, V]) OnRemove(e *entry[K, V]) {
 	} else {
 		p.unlinkT1(n)
 	}
+	if p.recent == n {
+		p.recent = nil
+	}
 	n.entry = nil
 	n.next, n.prev = nil, nil
 	e.policyData = nil
@@ -142,33 +152,28 @@ func (p *arcPolicy[K, V]) Victim() *entry[K, V] {
 		return nil
 	}
 	useT1 := p.t1Size > 0 && (p.t2Size == 0 || p.t1Size > p.p)
-	if useT1 {
+	// The other list gives up its LRU entry instead of the one just
+	// inserted, when it has one.
+	if useT1 && p.t1Tail == p.recent && p.t2Tail != nil {
+		useT1 = false
+	} else if !useT1 && p.t2Tail == p.recent && p.t1Tail != nil {
+		useT1 = true
+	}
+	if useT1 && p.t1Tail != nil {
 		n := p.t1Tail
-		if n == nil {
-			n = p.t2Tail
-			if n == nil {
-				return nil
-			}
-			p.unlinkT2(n)
-			p.recordB2(n.entry.key)
-			return n.entry
-		}
 		p.unlinkT1(n)
 		p.recordB1(n.entry.key)
 		return n.entry
 	}
-	n := p.t2Tail
-	if n == nil {
-		n = p.t1Tail
-		if n == nil {
-			return nil
-		}
-		p.unlinkT1(n)
-		p.recordB1(n.entry.key)
+	if p.t2Tail != nil {
+		n := p.t2Tail
+		p.unlinkT2(n)
+		p.recordB2(n.entry.key)
 		return n.entry
 	}
-	p.unlinkT2(n)
-	p.recordB2(n.entry.key)
+	n := p.t1Tail
+	p.unlinkT1(n)
+	p.recordB1(n.entry.key)
 	return n.entry
 }
 
@@ -202,6 +207,7 @@ func (p *arcPolicy[K, V]) Reset() {
 	p.b1Set = make(map[K]*arcGhostNode[K])
 	p.b2Set = make(map[K]*arcGhostNode[K])
 	p.p = 0
+	p.recent = nil
 }
 
 func (p *arcPolicy[K, V]) inB1(k K) bool { _, ok := p.b1Set[k]; return ok }

@@ -162,9 +162,10 @@ func (c *Cache[K, V]) tryServeFromReadSnapshot(s *shard[K, V], key K, now int64)
 // path (snapshot amended, entry invalidated/expired/negative/sliding,
 // refresh-ahead due, or policy promotion needed).
 //
-// e.flags is a non-atomic uint8; the read is tear-free on supported
-// architectures and gated to configurations where flag mutations are
-// extremely rare (S3-FIFO + no WithExpireFunc).
+// It reads only atomic entry state: the flags, the value, the expiry
+// and, through policyData, the S3-FIFO node's frequency. Under
+// [WithLockFreeRead] policyData is written once, before the entry
+// reaches a snapshot.
 func (c *Cache[K, V]) tryLockFreeGet(s *shard[K, V], key K, now int64) (V, bool, bool) {
 	var zero V
 	rm := s.read.Load()

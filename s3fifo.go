@@ -54,6 +54,12 @@ type s3fifoPolicy[K comparable, V any] struct {
 	// Cleared by OnRemove (if the recent node is itself removed) and
 	// by Reset; otherwise just overwritten by the next OnInsert.
 	recentInsert *s3Node[K, V]
+
+	// pinNodes is set under [WithLockFreeRead], where Get reads an
+	// entry's policyData without the shard lock. policyData is then
+	// written only by OnInsert, before the entry is visible to those
+	// readers, and a removed entry keeps pointing at its detached node.
+	pinNodes bool
 }
 
 // s3Node is the intrusive list node attached to an entry's
@@ -170,7 +176,7 @@ func (p *s3fifoPolicy[K, V]) OnUpdate(e *entry[K, V]) {
 // list pointers will be nil and the helper unlinks become no-ops.
 func (p *s3fifoPolicy[K, V]) OnRemove(e *entry[K, V]) {
 	n, ok := e.policyData.(*s3Node[K, V])
-	if !ok || n == nil {
+	if !ok || n == nil || n.entry == nil {
 		return
 	}
 	if n.inMain {
@@ -184,7 +190,9 @@ func (p *s3fifoPolicy[K, V]) OnRemove(e *entry[K, V]) {
 	n.entry = nil
 	n.next = nil
 	n.prev = nil
-	e.policyData = nil
+	if !p.pinNodes {
+		e.policyData = nil
+	}
 }
 
 // Victim runs S3-FIFO's promotion/demotion logic and returns the next
@@ -306,7 +314,7 @@ func (p *s3fifoPolicy[K, V]) Len() int {
 func (p *s3fifoPolicy[K, V]) Reset() {
 	for n := p.smallHead; n != nil; {
 		nxt := n.next
-		if n.entry != nil {
+		if n.entry != nil && !p.pinNodes {
 			n.entry.policyData = nil
 		}
 		n.entry = nil
@@ -315,7 +323,7 @@ func (p *s3fifoPolicy[K, V]) Reset() {
 	}
 	for n := p.mainHead; n != nil; {
 		nxt := n.next
-		if n.entry != nil {
+		if n.entry != nil && !p.pinNodes {
 			n.entry.policyData = nil
 		}
 		n.entry = nil

@@ -452,6 +452,7 @@ func TestTouchRefreshesTTL(t *testing.T) {
 		WithMaxEntries(4),
 		WithClock(clk),
 		WithDefaultTTL(10*time.Second),
+		WithTTLJitter(0),
 	)
 	defer c.Close()
 	_ = c.Set("k", 1)
@@ -475,7 +476,7 @@ func TestTouchOnAbsentReturnsFalse(t *testing.T) {
 
 func TestTouchWithTTL(t *testing.T) {
 	clk := NewFakeClock(time.Unix(0, 0))
-	c, _ := New[string, int](WithMaxEntries(4), WithClock(clk))
+	c, _ := New[string, int](WithMaxEntries(4), WithClock(clk), WithTTLJitter(0))
 	defer c.Close()
 	_ = c.SetWithTTL("k", 1, time.Second)
 	if !c.TouchWithTTL("k", time.Hour) {

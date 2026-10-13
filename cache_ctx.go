@@ -34,12 +34,5 @@ func (c *Cache[K, V]) DeleteCtx(ctx context.Context, key K) (bool, error) {
 	if c.async != nil {
 		return c.asyncDelete(key), nil
 	}
-	removed := c.deleteWithReason(key, EvictReasonDeleted)
-	if c.store == nil {
-		return removed, nil
-	}
-	if err := c.deleteThroughStore(ctx, key); err != nil {
-		return removed, err
-	}
-	return removed, nil
+	return c.deleteKey(ctx, key, EvictReasonDeleted, true)
 }

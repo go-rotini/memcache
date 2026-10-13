@@ -43,11 +43,7 @@ func (b *wheelBackend[K, V]) Remove(e *entry[K, V]) {
 	if e.wheelHandle == nil {
 		return
 	}
-	w, _ := e.wheelHandle.(*wheel.Entry[*entry[K, V]])
-	if w == nil {
-		return
-	}
-	b.wheel.Remove(w)
+	b.wheel.Remove(e.wheelHandle)
 	e.wheelHandle = nil
 }
 

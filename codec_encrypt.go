@@ -18,9 +18,15 @@ var errEncryptShortCiphertext = errors.New("memcache: encrypted snapshot ciphert
 var errEncryptKeyLength = errors.New("memcache: encrypted codec key must be 32 bytes (AES-256)")
 
 // EncryptedCodec wraps a base [Codec] with AES-256-GCM authenticated
-// encryption. Wire format: 12-byte nonce followed by GCM-sealed
-// ciphertext. Construct via [NewEncryptedCodec]; install via [WithCodec]
-// or [WithEncryptedCodec]. The package does not manage key rotation.
+// encryption. Marshal's output is a 12-byte nonce followed by the
+// GCM-sealed ciphertext. Construct via [NewEncryptedCodec]; install via
+// [WithCodec] or [WithEncryptedCodec]. The package does not manage key
+// rotation.
+//
+// As a snapshot codec it encrypts every record as one sealed block bound
+// to the snapshot header; the header itself (codec and cache names,
+// [WithSnapshotMetadata] entries, save time and record count) is
+// authenticated but not encrypted. See [Cache.Save].
 type EncryptedCodec struct {
 	base Codec
 	gcm  cipher.AEAD
@@ -51,12 +57,7 @@ func (c *EncryptedCodec) Marshal(v any) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	nonce := make([]byte, c.gcm.NonceSize())
-	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
-		return nil, &CodecError{Op: codecOpMarshal, Codec: c.Name(), Err: err}
-	}
-	out := c.gcm.Seal(nonce, nonce, plain, nil)
-	return out, nil
+	return c.seal(plain, nil)
 }
 
 // Unmarshal splits the leading nonce off data, decrypts the
@@ -64,16 +65,39 @@ func (c *EncryptedCodec) Marshal(v any) ([]byte, error) {
 // Returns an error when the ciphertext fails authentication
 // (wrong key, truncation, tampering).
 func (c *EncryptedCodec) Unmarshal(data []byte, v any) error {
-	ns := c.gcm.NonceSize()
-	if len(data) < ns {
-		return &CodecError{Op: codecOpUnmarshal, Codec: c.Name(), Err: errEncryptShortCiphertext}
-	}
-	nonce, ciphertext := data[:ns], data[ns:]
-	plain, err := c.gcm.Open(nil, nonce, ciphertext, nil)
+	plain, err := c.openField(data)
 	if err != nil {
-		return &CodecError{Op: codecOpUnmarshal, Codec: c.Name(), Err: err}
+		return err
 	}
 	return c.base.Unmarshal(plain, v)
+}
+
+// openField decrypts one nonce ‖ ciphertext value written by Marshal.
+func (c *EncryptedCodec) openField(data []byte) ([]byte, error) {
+	plain, err := c.open(data, nil)
+	if err != nil {
+		return nil, &CodecError{Op: codecOpUnmarshal, Codec: c.Name(), Err: err}
+	}
+	return plain, nil
+}
+
+// seal encrypts plain with a fresh nonce, authenticating ad with it,
+// and returns nonce ‖ ciphertext.
+func (c *EncryptedCodec) seal(plain, ad []byte) ([]byte, error) {
+	nonce := make([]byte, c.gcm.NonceSize(), c.gcm.NonceSize()+len(plain)+c.gcm.Overhead())
+	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
+		return nil, &CodecError{Op: codecOpMarshal, Codec: c.Name(), Err: err}
+	}
+	return c.gcm.Seal(nonce, nonce, plain, ad), nil
+}
+
+// open reverses seal; ad must match the value passed to seal.
+func (c *EncryptedCodec) open(data, ad []byte) ([]byte, error) {
+	ns := c.gcm.NonceSize()
+	if len(data) < ns {
+		return nil, errEncryptShortCiphertext
+	}
+	return c.gcm.Open(nil, data[:ns], data[ns:], ad) //nolint:wrapcheck // callers wrap
 }
 
 // Name reports `<base>+aes-256-gcm` so snapshot codec-mismatch

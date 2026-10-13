@@ -51,7 +51,10 @@ func WithSafeKeys(b bool) Option {
 
 // WithCallbackTimeout sets how long a synchronous hook may run before a
 // warning is logged. The hook is not interrupted. d <= 0 disables the
-// warning; the default is 100ms.
+// warning; the default is 100ms. Whatever the timeout, a hook (OnHit,
+// OnMiss, OnEvict, OnExpire, OnLoad, the purge visitor or the
+// invalidation publisher) that panics is recovered and the panic is
+// logged at Error level with its stack.
 func WithCallbackTimeout(d time.Duration) Option {
 	return func(c *config) { c.callbackTimeout = d }
 }

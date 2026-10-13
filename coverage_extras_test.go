@@ -1590,20 +1590,20 @@ func TestSnapshotReadStringEmptyAndError(t *testing.T) {
 	if err := writeString(&buf, ""); err != nil {
 		t.Fatal(err)
 	}
-	got, err := readString(&buf)
+	got, err := newSnapReader(&buf, nil, 1<<62).str()
 	if err != nil || got != "" {
-		t.Errorf("readString(empty) = (%q, %v), want (\"\", nil)", got, err)
+		t.Errorf("newSnapReader(empty, nil, 1<<62).str() = (%q, %v), want (\"\", nil)", got, err)
 	}
 	// readString from short buffer: error.
 	short := bytes.NewReader([]byte{1, 2})
-	if _, err := readString(short); err == nil {
+	if _, err := newSnapReader(short, nil, 1<<62).str(); err == nil {
 		t.Error("readString from short buffer should error")
 	}
 }
 
 func TestSnapshotReadMetadataError(t *testing.T) {
 	// readMetadata from buffer too short to read uint16 prefix.
-	if _, err := readMetadata(bytes.NewReader(nil)); err == nil {
+	if _, err := readMetadata(newSnapReader(bytes.NewReader(nil), nil, 1<<62)); err == nil {
 		t.Error("readMetadata empty should error")
 	}
 	// readMetadata where key payload is short (only count + partial key).
@@ -1611,7 +1611,7 @@ func TestSnapshotReadMetadataError(t *testing.T) {
 	var buf bytes.Buffer
 	buf.WriteByte(1)
 	buf.WriteByte(0)
-	if _, err := readMetadata(&buf); err == nil {
+	if _, err := readMetadata(newSnapReader(&buf, nil, 1<<62)); err == nil {
 		t.Error("readMetadata short key should error")
 	}
 	// readMetadata where value read fails.
@@ -1622,7 +1622,7 @@ func TestSnapshotReadMetadataError(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Don't write the value.
-	if _, err := readMetadata(&buf2); err == nil {
+	if _, err := readMetadata(newSnapReader(&buf2, nil, 1<<62)); err == nil {
 		t.Error("readMetadata short value should error")
 	}
 }
@@ -1630,13 +1630,13 @@ func TestSnapshotReadMetadataError(t *testing.T) {
 func TestSnapshotReadSnapshotHeaderTruncated(t *testing.T) {
 	// Truncated buffer ends after magic only.
 	short := []byte("RTNI")
-	if _, err := readSnapshotHeader(bytes.NewReader(short), nil); err == nil {
+	if _, err := readSnapshotHeader(newSnapReader(bytes.NewReader(short), nil, 1<<62)); err == nil {
 		t.Error("readSnapshotHeader truncated after magic should error")
 	}
 	// Truncated after magic + version, before codec.
 	v2 := append([]byte{}, snapshotMagic...)
 	v2 = append(v2, 2)
-	if _, err := readSnapshotHeader(bytes.NewReader(v2), nil); err == nil {
+	if _, err := readSnapshotHeader(newSnapReader(bytes.NewReader(v2), nil, 1<<62)); err == nil {
 		t.Error("readSnapshotHeader truncated before codec should error")
 	}
 	// Truncated after codec, before name.
@@ -1649,7 +1649,7 @@ func TestSnapshotReadSnapshotHeaderTruncated(t *testing.T) {
 	// before name; codec is "gob" so codec block = 4 bytes prefix + 3.
 	// magic(4) + ver(1) + codecLenU32(4) + "gob"(3) = 12.
 	if len(full) > 12 {
-		if _, err := readSnapshotHeader(bytes.NewReader(full[:12]), nil); err == nil {
+		if _, err := readSnapshotHeader(newSnapReader(bytes.NewReader(full[:12]), nil, 1<<62)); err == nil {
 			t.Error("readSnapshotHeader truncated before name should error")
 		}
 	}
@@ -3465,7 +3465,7 @@ func TestReadSnapshotHeaderTruncatedCount(t *testing.T) {
 	// Saving an empty cache writes header + CRC. Find a trim point that
 	// truncates inside count: try a few sizes.
 	for trim := 8; trim <= len(full)-1; trim++ {
-		if _, err := readSnapshotHeader(bytes.NewReader(full[:trim]), nil); err != nil {
+		if _, err := readSnapshotHeader(newSnapReader(bytes.NewReader(full[:trim]), nil, 1<<62)); err != nil {
 			return // hit the truncated-during-header path
 		}
 	}
@@ -3596,22 +3596,6 @@ func TestTagCleanupBacklogNoQueue(t *testing.T) {
 
 // Already exercises Sweep returning some entries; the empty-return path is
 // covered by TestWheelBackendSweepEmpty.
-
-// --- wheel_ttl.go: Remove with bad handle ---------------------------------
-
-func TestWheelBackendRemoveBadHandle(t *testing.T) {
-	cfg := defaultConfig()
-	cfg.ttlBuckets = 8
-	cfg.ttlBucketsTickPerBucket = 1
-	cfg.janitorInterval = time.Hour
-	b := newTTLBackend[string, int](cfg)
-	wb := b.(*wheelBackend[string, int])
-	e := &entry[string, int]{key: "k", heapIndex: -1}
-	// Set a non-wheel.Entry handle: the type assertion fails and Remove
-	// returns silently.
-	e.wheelHandle = "not-a-wheel-entry"
-	wb.Remove(e)
-}
 
 // --- flatstore.go: shouldCompactAfterDelete zero-tombstone short-circuit -
 
@@ -3750,7 +3734,7 @@ func TestReadSnapshotHeaderTruncatedMetadata(t *testing.T) {
 	raw := buf.Bytes()
 	// Walk truncations to hit metadata-read failure.
 	for trim := 8; trim < len(raw); trim++ {
-		_, _ = readSnapshotHeader(bytes.NewReader(raw[:trim]), nil)
+		_, _ = readSnapshotHeader(newSnapReader(bytes.NewReader(raw[:trim]), nil, 1<<62))
 	}
 }
 
@@ -3776,7 +3760,7 @@ func TestReadSnapshotHeaderNegativeCount(t *testing.T) {
 	if err := binaryWriteInt64(&buf, -1); err != nil {
 		t.Fatal(err)
 	}
-	_, err := readSnapshotHeader(&buf, nil)
+	_, err := readSnapshotHeader(newSnapReader(&buf, nil, 1<<62))
 	if err == nil {
 		t.Error("readSnapshotHeader with negative count should error")
 	}
@@ -3978,11 +3962,9 @@ func TestReadRecordWithMultipleEntriesAndTags(t *testing.T) {
 	}
 }
 
-// --- cache.go: GetMultiOrLoad — covers per-key Set log fallback path ----
+// --- cache.go: GetMultiOrLoad — a value too heavy to cache --------------
 
-func TestGetMultiOrLoadLogsSetFailure(t *testing.T) {
-	var buf syncBuffer
-	logger := slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+func TestGetMultiOrLoadReturnsUncacheableValue(t *testing.T) {
 	bl := bulkLoaderFunc[string, []byte](func(_ context.Context, keys []string) (map[string]LoadResult[[]byte], error) {
 		out := make(map[string]LoadResult[[]byte])
 		for _, k := range keys {
@@ -3995,19 +3977,18 @@ func TestGetMultiOrLoadLogsSetFailure(t *testing.T) {
 		WithWeigher(BytesWeigher()),
 		WithMaxValueWeight(8),
 		WithBulkLoader(bl),
-		WithLogger(logger),
 	)
 	defer c.Close()
 	got, err := c.GetMultiOrLoad(context.Background(), []string{"k"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Caller still sees the value even when Set fails.
+	// The caller still sees the value the cache can't hold.
 	if len(got["k"]) != 100 {
 		t.Errorf("got = %v, want 100-byte value", got)
 	}
-	if !strings.Contains(buf.String(), "GetMultiOrLoad set failed") {
-		t.Errorf("expected set-failed log, got %q", buf.String())
+	if _, ok := c.Peek("k"); ok {
+		t.Error("a value over MaxValueWeight was cached")
 	}
 }
 

@@ -80,8 +80,9 @@ func TestInvalidationSubscriber_ReceivesAndDeletes(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(publisherSeen) != 1 || publisherSeen[0] != EvictReasonRemote {
-		t.Errorf("publisher saw %v, want [Remote]", publisherSeen)
+	// A remote delete is not published again, or peers would echo it.
+	if len(publisherSeen) != 0 {
+		t.Errorf("publisher saw %v, want nothing", publisherSeen)
 	}
 }
 

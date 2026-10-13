@@ -5,6 +5,12 @@ package memcache
 // be told to drop the key. It runs on the goroutine that caused the
 // removal, after the shard lock is released and after the hook and
 // event; keep it fast. [WithCallbackTimeout] logs slow calls.
+//
+// Removals under [EvictReasonRemote] (those made for
+// [WithInvalidationSubscriber]) are not published, so two caches wired
+// to each other don't echo deletes back and forth. Capacity evictions
+// and expiries are published; a publisher that should only forward
+// explicit deletes can filter on reason.
 func WithInvalidationPublisher[K comparable](fn func(key K, reason EvictionReason)) Option {
 	return func(c *config) {
 		if fn != nil {

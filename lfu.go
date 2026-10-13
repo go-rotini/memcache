@@ -16,6 +16,11 @@ type lfuPolicy[K comparable, V any] struct {
 	buckets map[uint64]*lfuList[K, V]
 	minFreq uint64
 	size    int
+
+	// recent is the node most recently inserted. Victim passes over it
+	// while any other entry is left: as the only entry at frequency 1
+	// it would otherwise be evicted by the very Set that added it.
+	recent *lfuNode[K, V]
 }
 
 // lfuList is a doubly-linked list of entries at a single frequency
@@ -49,6 +54,7 @@ func (p *lfuPolicy[K, V]) OnInsert(e *entry[K, V]) {
 	p.bucket(1).pushTail(n)
 	p.minFreq = 1
 	p.size++
+	p.recent = n
 }
 
 // OnAccess promotes e to the next-higher frequency bucket.
@@ -88,16 +94,35 @@ func (p *lfuPolicy[K, V]) OnRemove(e *entry[K, V]) {
 			delete(p.buckets, n.freq)
 		}
 	}
+	if p.recent == n {
+		p.recent = nil
+	}
 	n.entry = nil
 	n.next, n.prev = nil, nil
 	e.policyData = nil
 	p.size--
 }
 
-// Victim returns the head of the lowest non-empty bucket. The node is
-// removed from its list before return; OnRemove will then clear the
+// Victim returns the head of the lowest non-empty bucket, passing over
+// the most recently inserted entry unless it is the only one. The node
+// is removed from its list before return; OnRemove will then clear the
 // entry's policyData reference.
 func (p *lfuPolicy[K, V]) Victim() *entry[K, V] {
+	n := p.pick()
+	if n == nil {
+		return nil
+	}
+	if list, ok := p.buckets[n.freq]; ok {
+		list.remove(n)
+	}
+	if p.bucketEmpty(n.freq) {
+		delete(p.buckets, n.freq)
+	}
+	return n.entry
+}
+
+// pick returns the node Victim evicts, or nil when the policy is empty.
+func (p *lfuPolicy[K, V]) pick() *lfuNode[K, V] {
 	for p.size > 0 {
 		list, ok := p.buckets[p.minFreq]
 		if !ok || list.head == nil {
@@ -110,11 +135,16 @@ func (p *lfuPolicy[K, V]) Victim() *entry[K, V] {
 			continue
 		}
 		n := list.head
-		list.remove(n)
-		if p.bucketEmpty(n.freq) {
-			delete(p.buckets, n.freq)
+		if n != p.recent {
+			return n
 		}
-		return n.entry
+		if n.next != nil {
+			return n.next
+		}
+		if next, found := p.nextNonEmpty(p.minFreq); found {
+			return p.buckets[next].head
+		}
+		return n
 	}
 	return nil
 }
@@ -142,6 +172,7 @@ func (p *lfuPolicy[K, V]) Reset() {
 	p.buckets = make(map[uint64]*lfuList[K, V])
 	p.minFreq = 0
 	p.size = 0
+	p.recent = nil
 }
 
 // bucket returns the list for freq, creating it on demand.

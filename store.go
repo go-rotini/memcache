@@ -44,14 +44,17 @@ type Store[K comparable, V any] interface {
 	Close() error
 }
 
-// MemoryStore is the default in-process [Store]. TTLs are enforced
-// lazily on Get. Safe for concurrent use; zero value is invalid (use
+// MemoryStore is the default in-process [Store]. Expired entries are
+// hidden from reads and removed by a sweep that Set runs once per
+// store-size Sets. Safe for concurrent use; zero value is invalid (use
 // [NewMemoryStore]).
 type MemoryStore[K comparable, V any] struct {
 	mu      sync.RWMutex
 	entries map[K]storedEntry[V]
 	clock   Clock
 	closed  bool
+	// sets counts Set calls since the last sweep of expired entries.
+	sets int
 }
 
 // storedEntry is the per-key bundle MemoryStore keeps internally.
@@ -111,6 +114,18 @@ func (m *MemoryStore[K, V]) Set(ctx context.Context, key K, value V, ttl time.Du
 		return ErrClosed
 	}
 	m.entries[key] = storedEntry[V]{value: value, expireAt: expireAt}
+	// Sweep expired entries once per len(entries) Sets, so their
+	// memory is reclaimed at an amortized O(1) cost per Set.
+	m.sets++
+	if m.sets >= max(len(m.entries), 64) {
+		m.sets = 0
+		now := m.clock.Now().UnixNano()
+		for k, e := range m.entries {
+			if e.expireAt != 0 && now >= e.expireAt {
+				delete(m.entries, k)
+			}
+		}
+	}
 	return nil
 }
 

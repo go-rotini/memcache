@@ -71,15 +71,18 @@ type cacheTypeMeta struct {
 // cacheTypeMetaCache memoizes cacheTypeMeta by reflect.Type.
 var cacheTypeMetaCache sync.Map // map[reflect.Type]*cacheTypeMeta
 
+// emptyMeta is the shared, read-only meta of every non-struct type.
+var emptyMeta = &cacheTypeMeta{}
+
 func metaFor(t reflect.Type) *cacheTypeMeta {
 	if t == nil {
-		return &cacheTypeMeta{}
+		return emptyMeta
 	}
 	for t.Kind() == reflect.Pointer {
 		t = t.Elem()
 	}
 	if t.Kind() != reflect.Struct {
-		return &cacheTypeMeta{}
+		return emptyMeta
 	}
 	if cached, ok := cacheTypeMetaCache.Load(t); ok {
 		if m, ok := cached.(*cacheTypeMeta); ok {
@@ -186,7 +189,7 @@ func applySnapshotFilter[V any](v V) V {
 		clone := reflect.New(src.Elem().Type())
 		clone.Elem().Set(src.Elem())
 		applyFilters(clone.Elem(), meta.filters)
-		out, _ := clone.Interface().(V)
+		out, _ := reflect.TypeAssert[V](clone)
 		return out
 	}
 	if src.Kind() != reflect.Struct {
@@ -195,14 +198,15 @@ func applySnapshotFilter[V any](v V) V {
 	clone := reflect.New(t).Elem()
 	clone.Set(src)
 	applyFilters(clone, meta.filters)
-	out, _ := clone.Interface().(V)
+	out, _ := reflect.TypeAssert[V](clone)
 	return out
 }
 
 func applyFilters(v reflect.Value, filters []fieldFilter) {
 	for _, f := range filters {
-		fv := v.FieldByIndex(f.path)
-		if !fv.CanSet() {
+		// A field inside a nil embedded pointer has nothing to zero.
+		fv, err := v.FieldByIndexErr(f.path)
+		if err != nil || !fv.CanSet() {
 			continue
 		}
 		switch {
@@ -275,8 +279,15 @@ func expandTemplate(template string, rv reflect.Value, fields map[string][]int) 
 			b.WriteByte('}')
 			continue
 		}
-		fv := rv.FieldByIndex(path)
-		fmt.Fprintf(&b, "%v", fv.Interface())
+		fv, err := rv.FieldByIndexErr(path)
+		if err != nil {
+			// The field sits inside a nil embedded pointer.
+			b.WriteString("<nil>")
+			continue
+		}
+		// fmt formats a reflect.Value by the value it holds, which
+		// also works for unexported fields.
+		fmt.Fprint(&b, fv)
 	}
 	return b.String()
 }

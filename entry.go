@@ -4,6 +4,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/go-rotini/memcache/internal/wheel"
 )
 
 // entry is the internal record stored in a shard. Field order is chosen
@@ -33,11 +35,6 @@ type entry[K comparable, V any] struct {
 	// Hit count since insertion. Atomic-updated.
 	hits atomic.Uint32
 
-	// Generation increments on every mutation that is not a pure read;
-	// used by refresh-ahead and singleflight to detect "value changed
-	// since I started loading."
-	generation atomic.Uint32
-
 	// Cost / weight of this entry per the cache's Weigher (clamped to
 	// >= 1). Captured at insert time; changes to the underlying value
 	// do not update this field.
@@ -55,10 +52,9 @@ type entry[K comparable, V any] struct {
 	// the wheel-based backend is active.
 	heapIndex int
 
-	// wheelHandle is the back-pointer to the wheel entry. Typed as any
-	// to keep entry independent of the wheel package; the wheel backend
-	// type-asserts to recover the *wheel.Entry.
-	wheelHandle any
+	// wheelHandle is the back-pointer to the wheel entry, used only by
+	// the wheel-based ttlBackend.
+	wheelHandle *wheel.Entry[*entry[K, V]]
 
 	// Tags (nil if untagged).
 	tags []string
@@ -67,8 +63,9 @@ type entry[K comparable, V any] struct {
 	// node pointer or index here. Opaque to the cache.
 	policyData any
 
-	// Bit flags (saves memory vs separate bool fields).
-	flags entryFlags
+	// Bit flags. Atomic because the [WithLockFreeRead] path reads them
+	// without the shard lock; writers still hold it.
+	flags atomicFlags
 
 	// invalidatedFlag is set atomically by removeLocked when
 	// [WithLockFreeRead] is on. Lives outside flags because it MUST be
@@ -103,6 +100,17 @@ func (e *entry[K, V]) markInvalidated() {
 
 // has reports whether all f bits are set.
 func (e entryFlags) has(f entryFlags) bool { return e&f == f }
+
+// atomicFlags holds an entry's [entryFlags]. Writers hold the shard
+// lock, so set and clear need no compare-and-swap loop; the atomic
+// load and store make the lock-free read path race-free.
+type atomicFlags struct{ v atomic.Uint32 }
+
+func (a *atomicFlags) load() entryFlags      { return entryFlags(a.v.Load()) }
+func (a *atomicFlags) store(f entryFlags)    { a.v.Store(uint32(f)) }
+func (a *atomicFlags) has(f entryFlags) bool { return a.load().has(f) }
+func (a *atomicFlags) set(f entryFlags)      { a.store(a.load() | f) }
+func (a *atomicFlags) clear(f entryFlags)    { a.store(a.load() &^ f) }
 
 // expired reports whether the entry's absolute expiry time has passed.
 // now is unix nanos. Returns false for entries with no TTL (expireAt == 0).
@@ -192,10 +200,9 @@ func (e *entry[K, V]) reset() {
 	e.inserted = 0
 	e.lastAccess.Store(0)
 	e.hits.Store(0)
-	e.generation.Store(0)
 	e.weight = 0
 	e.tags = nil
-	e.flags = 0
+	e.flags.store(0)
 	e.slidingTTL = 0
 	e.heapIndex = -1
 	e.policyData = nil

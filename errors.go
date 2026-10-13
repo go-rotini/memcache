@@ -40,6 +40,12 @@ var (
 	// malformed.
 	ErrSnapshotCorrupt = errors.New("memcache: snapshot corrupt")
 
+	// ErrSnapshotTooLarge is the Err of the [*SnapshotError] a save
+	// returns when the snapshot would pass [WithMaxSnapshotBytes], or
+	// its [CompressedCodec] fields would decompress past the limit Load
+	// allows, and of the one a load returns for the latter.
+	ErrSnapshotTooLarge = errors.New("memcache: snapshot exceeds size limit")
+
 	// ErrKeyTooLarge is the Cause of the [*CapacityError] a write
 	// returns when a key exceeds [WithMaxKeySize].
 	ErrKeyTooLarge = errors.New("memcache: key exceeds size limit")
@@ -61,6 +67,12 @@ var (
 	// Loader call exceeds [WithLoaderTimeout].
 	ErrLoaderTimeout = errors.New("memcache: loader timeout exceeded")
 
+	// ErrLoaderPanic is wrapped in the [*LoadError] that every waiter
+	// of a load receives when the Loader (or the GetOrLoadFn function)
+	// panics. The panic value is part of the error text; the stack is
+	// logged through [WithLogger].
+	ErrLoaderPanic = errors.New("memcache: loader panicked")
+
 	// ErrLoaderTooManyInFlight is returned by [Cache.GetOrLoad] when
 	// [WithMaxConcurrentLoads] is reached and no slot frees up before
 	// the load's context ends ([WithLoaderTimeout] expires, or every
@@ -69,8 +81,8 @@ var (
 
 	// ErrComputeReentrant is the panic value raised when a callback of
 	// [Cache.Compute], [Cache.ComputeIfAbsent], [Cache.ComputeIfPresent]
-	// or [Cache.Update] calls one of those methods again on the same
-	// goroutine, which would otherwise deadlock.
+	// or [Cache.Update] calls one of those methods again for a key on
+	// the same shard of the same cache, which would otherwise deadlock.
 	ErrComputeReentrant = errors.New("memcache: compute callback re-entered cache")
 )
 
@@ -94,7 +106,8 @@ func (e *ConfigError) Is(target error) bool {
 	return ok
 }
 
-// CapacityError describes a write rejected by a size or tag limit.
+// CapacityError describes a write rejected by a size or tag limit. Key
+// is the rejected key; Error leaves it out.
 type CapacityError struct {
 	Key        any
 	Reason     string
@@ -126,6 +139,8 @@ func (e *CapacityError) Is(target error) bool {
 // LoadError wraps an error returned by a [Loader] or a [Cache.GetOrLoadFn]
 // function, as returned from [Cache.GetOrLoad] and [Cache.GetOrLoadFn].
 // [errors.Is] and [errors.As] see the Loader's error through Unwrap.
+// Key is the key being loaded; Error leaves it out, since keys are often
+// tokens or personal data that shouldn't reach logs.
 type LoadError struct {
 	Key any
 	Err error
@@ -133,7 +148,10 @@ type LoadError struct {
 
 // Error implements the error interface.
 func (e *LoadError) Error() string {
-	return fmt.Sprintf("memcache: load %v: %v", e.Key, e.Err)
+	if e.Err == nil {
+		return "memcache: load failed"
+	}
+	return "memcache: load: " + e.Err.Error()
 }
 
 // Unwrap returns the underlying error.
@@ -147,19 +165,27 @@ func (e *LoadError) Is(target error) bool {
 
 // SnapshotError describes a snapshot save or load failure.
 type SnapshotError struct {
-	Op      string // "save" or "load"
-	Path    string
+	Op   string // "save" or "load"
+	Path string
+	// Offset is, for a load, the byte offset in the snapshot where the
+	// failure was found; for a failure inside an encrypted snapshot's
+	// records, the offset of the encrypted block.
 	Offset  int64
 	Message string
 	Err     error
 }
 
-// Error implements the error interface.
+// Error implements the error interface. It includes Err's text.
 func (e *SnapshotError) Error() string {
+	msg := "memcache: snapshot " + e.Op
 	if e.Path != "" {
-		return fmt.Sprintf("memcache: snapshot %s %s: %s", e.Op, e.Path, e.Message)
+		msg += " " + e.Path
 	}
-	return fmt.Sprintf("memcache: snapshot %s: %s", e.Op, e.Message)
+	msg += ": " + e.Message
+	if e.Err != nil {
+		msg += ": " + e.Err.Error()
+	}
+	return msg
 }
 
 // Unwrap returns the underlying error.

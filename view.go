@@ -109,6 +109,8 @@ func (c *Cache[K, V]) Clone() (*Cache[K, V], error) {
 		return nil, ErrClosed
 	}
 	cfgCopy := *c.cfg
+	cfgCopy.maxEntries = int(c.maxEntries.Load())
+	cfgCopy.maxBytes = c.maxBytes.Load()
 	cfgCopy.store = nil
 	cfgCopy.autoLoadPath = ""
 	cfgCopy.autoSavePath = ""
@@ -152,7 +154,7 @@ func (c *Cache[K, V]) Clone() (*Cache[K, V], error) {
 				lastAccess: e.lastAccess.Load(),
 				slidingTTL: e.slidingTTL,
 				tags:       tagsCopy,
-				flags:      e.flags,
+				flags:      e.flags.load(),
 			})
 			return true
 		})
@@ -172,10 +174,11 @@ func (c *Cache[K, V]) Clone() (*Cache[K, V], error) {
 		ne.inserted = ce.inserted
 		ne.lastAccess.Store(ce.lastAccess)
 		ne.expireAt.Store(ce.expireAt)
-		ne.flags = ce.flags
+		ne.flags.store(ce.flags)
 		ne.slidingTTL = ce.slidingTTL
 		ne.tags = ce.tags
 		ns.storage.set(ce.key, ne)
+		ns.markAmended()
 		// Register the entry with the shard's TTL backend so
 		// expirations are observable via the janitor (not just
 		// lazily on Get).

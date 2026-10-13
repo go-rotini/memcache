@@ -1,6 +1,9 @@
 package memcache
 
-import "time"
+import (
+	"errors"
+	"time"
+)
 
 // SetOption applies a per-call override to [Cache.SetWithOptions].
 // Options are applied in order; later options win for the same
@@ -22,6 +25,19 @@ type setConfig struct {
 	// nothing about tags" (auto-tag from CacheTagger) from "caller
 	// explicitly opted out of tags."
 	hasTags bool
+	// guard, when set, is checked under the shard lock just before the
+	// write; false drops the write with errWriteSuperseded. Used by
+	// [Tiered] promotion.
+	guard func() bool
+}
+
+// errWriteSuperseded reports a guarded write dropped because the data it
+// carried was superseded.
+var errWriteSuperseded = errors.New("memcache: write superseded")
+
+// setGuard sets setConfig.guard.
+func setGuard(fn func() bool) SetOption {
+	return func(s *setConfig) { s.guard = fn }
 }
 
 // defaultSetConfig returns a setConfig pre-populated from the cache's
@@ -45,8 +61,8 @@ func SetTTL(ttl time.Duration) SetOption {
 }
 
 // SetWeight overrides the per-call weight, ignoring the cache's
-// configured [Weigher] for this insert. Weights below 1 are clamped
-// to 1.
+// configured [Weigher] for this insert. Weights are clamped to the
+// range 1 to 1<<40.
 func SetWeight(w int64) SetOption {
 	return func(s *setConfig) {
 		s.weight = w

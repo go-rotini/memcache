@@ -38,19 +38,25 @@ func (AdmitAlways[K]) Reset() {}
 
 // Doorkeeper is a "seen-twice" admission filter backed by a bloom filter.
 // A candidate is admitted only after [Doorkeeper.Observe] has been called
-// for it at least once previously. Doorkeeper is safe for concurrent use.
+// for it at least once previously. The filter is cleared each time it has
+// recorded its expected number of distinct keys, so it keeps rejecting
+// one-hit keys rather than filling up. Doorkeeper is safe for concurrent
+// use.
 type Doorkeeper[K comparable] struct {
-	mu     sync.Mutex
-	bloom  *sketch.Bloom
-	hasher func(K) uint64
+	mu       sync.Mutex
+	bloom    *sketch.Bloom
+	hasher   func(K) uint64
+	expected int
+	added    int
 }
 
 // NewDoorkeeper builds a [Doorkeeper] sized for expected distinct keys,
 // hashing through fn.
 func NewDoorkeeper[K comparable](expected int, fn func(K) uint64) *Doorkeeper[K] {
 	return &Doorkeeper[K]{
-		bloom:  sketch.NewBloom(expected, []uint64{0xC0DECAFE, 0xBEEFFACE, 0xDEADBEEF, 0xFEEDFACE}),
-		hasher: fn,
+		bloom:    sketch.NewBloom(expected, []uint64{0xC0DECAFE, 0xBEEFFACE, 0xDEADBEEF, 0xFEEDFACE}),
+		hasher:   fn,
+		expected: max(expected, 1),
 	}
 }
 
@@ -62,11 +68,21 @@ func (d *Doorkeeper[K]) Admit(key K) bool {
 }
 
 // Observe records key so subsequent Admit calls return true for the same
-// key until [Doorkeeper.Reset].
+// key, until [Doorkeeper.Reset] or until the filter has recorded its
+// expected number of distinct keys and clears itself.
 func (d *Doorkeeper[K]) Observe(key K) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	d.bloom.Set(d.hasher(key))
+	h := d.hasher(key)
+	if d.bloom.Test(h) {
+		return
+	}
+	if d.added >= d.expected {
+		d.bloom.Reset()
+		d.added = 0
+	}
+	d.bloom.Set(h)
+	d.added++
 }
 
 // Reset clears the bloom so every key starts fresh.
@@ -74,6 +90,7 @@ func (d *Doorkeeper[K]) Reset() {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.bloom.Reset()
+	d.added = 0
 }
 
 // WithAdmissionPolicy installs a custom [AdmissionPolicy]. Composes freely

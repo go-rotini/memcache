@@ -44,10 +44,8 @@ func TestEntryExpired(t *testing.T) {
 }
 
 func TestEntryTouchAccessSliding(t *testing.T) {
-	e := &entry[string, int]{
-		flags:      flagSliding,
-		slidingTTL: int64(time.Minute),
-	}
+	e := &entry[string, int]{slidingTTL: int64(time.Minute)}
+	e.flags.store(flagSliding)
 	now := time.Now().UnixNano()
 	if shifted := e.touchAccess(now); !shifted {
 		t.Error("first sliding touch should shift expireAt")
@@ -64,10 +62,8 @@ func TestEntryTouchAccessSlidingCoalesces(t *testing.T) {
 	// Writes are skipped when the access is less than slidingTTL/4
 	// newer than the recorded lastAccess.
 	const slide = int64(time.Minute)
-	e := &entry[string, int]{
-		flags:      flagSliding,
-		slidingTTL: slide,
-	}
+	e := &entry[string, int]{slidingTTL: slide}
+	e.flags.store(flagSliding)
 	t0 := time.Now().UnixNano()
 	e.touchAccess(t0) // first touch always shifts
 
@@ -144,22 +140,21 @@ func TestEntryReset(t *testing.T) {
 		inserted:   1,
 		weight:     5,
 		tags:       []string{"x"},
-		flags:      flagSliding,
 		slidingTTL: int64(time.Minute),
 		policyData: "anything",
 	}
+	e.flags.store(flagSliding)
 	e.storeValue(new(int))
 	e.expireAt.Store(999)
 	e.lastAccess.Store(999)
 	e.hits.Store(7)
-	e.generation.Store(3)
 
 	e.reset()
 
 	if e.key != "" || e.value.Load() != nil {
 		t.Error("reset should zero key and value")
 	}
-	if e.weight != 0 || e.flags != 0 || e.slidingTTL != 0 {
+	if e.weight != 0 || e.flags.load() != 0 || e.slidingTTL != 0 {
 		t.Error("reset should zero scalar fields")
 	}
 	if e.tags != nil || e.policyData != nil {
@@ -168,7 +163,7 @@ func TestEntryReset(t *testing.T) {
 	if e.expireAt.Load() != 0 || e.lastAccess.Load() != 0 {
 		t.Error("reset should zero atomic timestamps")
 	}
-	if e.hits.Load() != 0 || e.generation.Load() != 0 {
+	if e.hits.Load() != 0 {
 		t.Error("reset should zero atomic counters")
 	}
 }

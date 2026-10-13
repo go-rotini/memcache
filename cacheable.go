@@ -1,6 +1,9 @@
 package memcache
 
-import "time"
+import (
+	"reflect"
+	"time"
+)
 
 // Cacheable is the umbrella interface for V types that participate in
 // cache-specific behaviors. Every method is independently optional; the
@@ -53,6 +56,51 @@ type SnapshotMarshaler interface {
 // implements it. Implementations almost always have a pointer receiver.
 type SnapshotUnmarshaler interface {
 	SnapshotUnmarshal(data []byte) error
+}
+
+// valueTraits records, per cache, which of the value hooks Set consults
+// V can have, so a V with none of them skips the checks. dynamic is set
+// when V is an interface type, whose values can have any of them.
+type valueTraits struct {
+	dynamic   bool
+	ttler     bool
+	tagger    bool
+	templates bool
+}
+
+var (
+	cacheTTLerType  = reflect.TypeFor[CacheTTLer]()
+	cacheTaggerType = reflect.TypeFor[CacheTagger]()
+)
+
+// valueTraitsOf works out V's [valueTraits].
+func valueTraitsOf[V any]() valueTraits {
+	t := reflect.TypeFor[V]()
+	if t.Kind() == reflect.Interface {
+		return valueTraits{dynamic: true}
+	}
+	pt := reflect.PointerTo(t)
+	return valueTraits{
+		ttler:     t.Implements(cacheTTLerType) || pt.Implements(cacheTTLerType),
+		tagger:    t.Implements(cacheTaggerType) || pt.Implements(cacheTaggerType),
+		templates: metaFor(t).hasTemplates,
+	}
+}
+
+// valueTTL is [extractCacheableTTL] for the cache's V.
+func (c *Cache[K, V]) valueTTL(value V, fallback time.Duration) time.Duration {
+	if !c.traits.dynamic && !c.traits.ttler {
+		return fallback
+	}
+	return extractCacheableTTL(value, fallback)
+}
+
+// autoTags is [deriveAutoTags] for the cache's V.
+func (c *Cache[K, V]) autoTags(value V) []string {
+	if !c.traits.dynamic && !c.traits.tagger && !c.traits.templates {
+		return nil
+	}
+	return deriveAutoTags(value)
 }
 
 func extractCacheableTTL[V any](value V, fallback time.Duration) time.Duration {

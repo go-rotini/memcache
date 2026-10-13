@@ -40,6 +40,8 @@ func TestClampWeight(t *testing.T) {
 		{1, 1},
 		{2, 2},
 		{100, 100},
+		{maxEntryWeight, maxEntryWeight},
+		{1 << 62, maxEntryWeight},
 	}
 	for _, c := range cases {
 		if got := clampWeight(c.in); got != c.want {

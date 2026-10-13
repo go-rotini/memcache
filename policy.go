@@ -133,6 +133,8 @@ type PolicyDetailARC struct {
 type policyConfig[K comparable] struct {
 	budget int
 	hasher func(K) uint64
+	// lockFreeRead is set under [WithLockFreeRead]; see s3fifoPolicy.pinNodes.
+	lockFreeRead bool
 }
 
 // newPolicy constructs the eviction policy implementation for the
@@ -146,7 +148,9 @@ func newPolicy[K comparable, V any](p Policy, cfg policyConfig[K]) evictionPolic
 	case PolicyFIFO:
 		return newFIFO[K, V]()
 	case PolicyS3FIFO:
-		return newS3FIFO[K, V](cfg.budget)
+		p := newS3FIFO[K, V](cfg.budget)
+		p.pinNodes = cfg.lockFreeRead
+		return p
 	case PolicyLFU:
 		return newLFU[K, V]()
 	case PolicyTinyLFU:
