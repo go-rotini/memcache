@@ -452,3 +452,14 @@ func TestTieredEvictHooksAcrossKeysDoNotDeadlock(t *testing.T) {
 		wg.Wait()
 	})
 }
+
+// Tiered must stay comparable: a map key of type Tiered fails to compile
+// otherwise.
+var _ = map[Tiered[string, int]]bool{}
+
+func TestTieredComparable(t *testing.T) {
+	var a, b Tiered[string, int]
+	if a != b {
+		t.Error("zero Tiered values should compare equal")
+	}
+}

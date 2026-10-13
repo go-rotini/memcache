@@ -43,7 +43,7 @@ type Tiered[K comparable, V any] struct {
 	promotions atomic.Uint64
 
 	// locks serializes Tiered writes of each key.
-	locks keyLockTable[K]
+	locks *keyLockTable[K]
 
 	closed atomic.Bool
 }
@@ -58,7 +58,7 @@ func NewTiered[K comparable, V any](l1, l2 *Cache[K, V]) *Tiered[K, V] {
 	if l2 == nil {
 		panic("memcache: NewTiered: l2 is nil")
 	}
-	return &Tiered[K, V]{l1: l1, l2: l2}
+	return &Tiered[K, V]{l1: l1, l2: l2, locks: &keyLockTable[K]{}}
 }
 
 // Get returns the cached value for key. Lookup order: L1, then L2 with
