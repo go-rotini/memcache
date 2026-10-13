@@ -35,8 +35,11 @@ type storeRead[V any] struct {
 	value V
 	ok    bool
 	err   error
-	// aborted is set when the Store call panicked; waiters read again.
-	aborted bool
+	// aborted is set when the Store call panicked, and canceled when
+	// the leader's ctx ended before the read finished; waiters read
+	// again rather than share a result that is the leader's alone.
+	aborted  bool
+	canceled bool
 }
 
 // readThroughStore is consulted by Get-style methods after an in-memory
@@ -62,9 +65,10 @@ func (c *Cache[K, V]) readThroughStore(ctx context.Context, key K) (V, bool, err
 			case <-ctx.Done():
 				return zero, false, ctx.Err() //nolint:wrapcheck // pass ctx.Err verbatim
 			}
-			if r.aborted || (r.err != nil && isContextErr(r.err) && ctx.Err() == nil) {
+			if r.aborted || (r.canceled && r.err != nil && ctx.Err() == nil) {
 				// The read ended for its leader's own reason, not this
-				// caller's; read again.
+				// caller's; read again. A Store error, including one
+				// from the Store's own deadline, is shared.
 				continue
 			}
 			if r.err != nil || !r.ok {
@@ -102,10 +106,10 @@ func (c *Cache[K, V]) leadStoreRead(ctx context.Context, s *shard[K, V], key K, 
 			}
 		}
 	}()
-	value, ok, err := c.store.Get(ctx, key)
+	value, ok, expireAt, err := c.storeGet(ctx, key)
 	var p promotion[V]
 	if err == nil && ok {
-		p = c.preparePromotion(key, value)
+		p = c.preparePromotion(key, value, expireAt)
 	}
 	var cbs []func()
 	s.mu.Lock()
@@ -113,6 +117,7 @@ func (c *Cache[K, V]) leadStoreRead(ctx context.Context, s *shard[K, V], key K, 
 		c.promoteLocked(s, key, &p)
 	}
 	r.value, r.ok, r.err = value, ok, err
+	r.canceled = ctx.Err() != nil
 	done := c.endStoreReadLocked(s, key, r)
 	finished = true
 	c.releaseShardInto(s, &cbs)
@@ -150,6 +155,34 @@ func (c *Cache[K, V]) freshEntryLocked(s *shard[K, V], key K) *entry[K, V] {
 	return e
 }
 
+// storeGet reads key from the Store with Get. On a hit from a
+// [TTLStore], expireAt is when the record expires on the cache's clock,
+// or 0 when it doesn't; otherwise, or when the TTL lookup fails or finds
+// no record, it is -1, for not known.
+func (c *Cache[K, V]) storeGet(ctx context.Context, key K) (value V, ok bool, expireAt int64, err error) {
+	value, ok, err = c.store.Get(ctx, key)
+	if err != nil || !ok {
+		return value, ok, -1, err
+	}
+	return value, true, c.storeExpireAt(ctx, key), nil
+}
+
+// storeExpireAt is the expiry of key's Store record as storeGet reports
+// it. A failed lookup only loses the expiry, so its error is dropped.
+func (c *Cache[K, V]) storeExpireAt(ctx context.Context, key K) int64 {
+	if c.ttlStore == nil {
+		return -1
+	}
+	ttl, found, err := c.ttlStore.TTL(ctx, key)
+	switch {
+	case err != nil || !found:
+		return -1
+	case ttl > 0:
+		return c.cfg.clock.Now().UnixNano() + int64(ttl)
+	}
+	return 0
+}
+
 // promotion is a Store value checked against the cache's limits, ready
 // to be inserted under the shard lock. err is why it can't be.
 type promotion[V any] struct {
@@ -157,12 +190,14 @@ type promotion[V any] struct {
 	weight int64
 	tags   []string
 	err    error
+	// expireAt is the Store record's expiry, as storeGet reports it.
+	expireAt int64
 }
 
 // preparePromotion weighs and tags a Store value outside the shard lock,
 // since both may run user code.
-func (c *Cache[K, V]) preparePromotion(key K, value V) promotion[V] {
-	p := promotion[V]{value: value, tags: c.autoTags(value)}
+func (c *Cache[K, V]) preparePromotion(key K, value V, expireAt int64) promotion[V] {
+	p := promotion[V]{value: value, tags: c.autoTags(value), expireAt: expireAt}
 	if p.err = c.checkKeySize(key); p.err != nil {
 		return p
 	}
@@ -173,12 +208,12 @@ func (c *Cache[K, V]) preparePromotion(key K, value V) promotion[V] {
 	return p
 }
 
-// promoteLocked inserts a Store value with [WithDefaultTTL] (a Store
-// does not return TTLs). Promotion is best-effort: a value over the
-// cache's limits, or one admission turns away, is not cached. Watches on
-// the key are left alone, since the value is the Store's current one
-// rather than a newer write. Eviction does not cascade to the Store.
-// Caller MUST hold s.mu (write).
+// promoteLocked inserts a Store value with [WithDefaultTTL], or, when
+// the Store record expires sooner, with the record's expiry. Promotion
+// is best-effort: a value over the cache's limits, or one admission
+// turns away, is not cached. Watches on the key are left alone, since
+// the value is the Store's current one rather than a newer write.
+// Eviction does not cascade to the Store. Caller MUST hold s.mu (write).
 func (c *Cache[K, V]) promoteLocked(s *shard[K, V], key K, p *promotion[V]) {
 	if p.err != nil || c.closed.Load() {
 		if p.err != nil && c.cfg.logger != nil {
@@ -190,9 +225,15 @@ func (c *Cache[K, V]) promoteLocked(s *shard[K, V], key K, p *promotion[V]) {
 	if w != nil {
 		delete(s.watches, key)
 	}
-	c.upsertLocked(s, key, p.value, p.weight,
-		c.effectiveTTL(c.cfg.defaultTTL),
-		c.cfg.slidingTTL, int64(c.cfg.defaultTTL), p.tags)
+	if left := time.Duration(p.expireAt - c.cfg.clock.Now().UnixNano()); p.expireAt > 0 &&
+		(c.cfg.defaultTTL <= 0 || left < c.cfg.defaultTTL) {
+		left = max(left, 1)
+		c.upsertLocked(s, key, p.value, p.weight, left, false, int64(left), p.tags)
+	} else {
+		c.upsertLocked(s, key, p.value, p.weight,
+			c.effectiveTTL(c.cfg.defaultTTL),
+			c.cfg.slidingTTL, int64(c.cfg.defaultTTL), p.tags)
+	}
 	if w != nil {
 		s.watches[key] = w
 	}
@@ -217,10 +258,10 @@ func (c *Cache[K, V]) currentLocked(
 		return nil, zero, false, nil
 	}
 	c.releaseShardInto(s, cbs)
-	value, ok, err := c.store.Get(context.Background(), key)
+	value, ok, expireAt, err := c.storeGet(context.Background(), key)
 	var p promotion[V]
 	if err == nil && ok {
-		p = c.preparePromotion(key, value)
+		p = c.preparePromotion(key, value, expireAt)
 	}
 	s.mu.Lock()
 	// An async write queued meanwhile is newer than the Store's value,
@@ -239,6 +280,7 @@ func (c *Cache[K, V]) currentLocked(
 	if !ok {
 		return nil, zero, false, nil
 	}
+	sm.fromStore, sm.storeExpireAt = true, expireAt
 	c.promoteLocked(s, key, &p)
 	if e, ok := s.storage.get(key); ok {
 		return e, value, true, nil
@@ -280,7 +322,7 @@ func (c *Cache[K, V]) deleteThroughStore(ctx context.Context, key K) error {
 	}
 	_, err := c.store.Delete(ctx, key)
 	if err != nil && c.cfg.logger != nil {
-		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		if isContextErr(err) {
 			c.cfg.logger.Debug("memcache: store Delete canceled", "err", err)
 		} else {
 			c.cfg.logger.Warn("memcache: store Delete failed", "err", err)
@@ -321,19 +363,40 @@ type storeMirror[K comparable, V any] struct {
 	// the Store first.
 	pending    pendingOp[K, V]
 	hasPending bool
+	// fromStore is set when the call read the key's value from the
+	// Store; storeExpireAt is then the record's expiry, as storeGet
+	// reports it.
+	fromStore     bool
+	storeExpireAt int64
 }
 
 // noteStoreSetLocked records that value was stored under key, with the
-// entry's remaining TTL. A no-op without a Store. Caller MUST hold s.mu.
+// entry's remaining TTL, or [WithDefaultTTL] when memory didn't keep the
+// entry. A no-op without a Store. Caller MUST hold s.mu.
 func (c *Cache[K, V]) noteStoreSetLocked(m *storeMirror[K, V], s *shard[K, V], key K, value V) {
 	if c.store == nil {
 		return
 	}
-	m.set, m.value, m.ttl = true, value, 0
+	m.set, m.value, m.ttl = true, value, c.cfg.defaultTTL
 	if e, ok := s.storage.get(key); ok {
+		m.ttl = 0
 		if exp := e.expireAt.Load(); exp > 0 {
 			m.ttl = max(time.Duration(exp-c.cfg.clock.Now().UnixNano()), 1)
 		}
+	}
+}
+
+// noteStoreKeepLocked is noteStoreSetLocked for a write that keeps the
+// key's expiry: a key read from a [TTLStore] by the same call keeps the
+// Store record's TTL, which may differ from the in-memory copy's.
+func (c *Cache[K, V]) noteStoreKeepLocked(m *storeMirror[K, V], s *shard[K, V], key K, value V) {
+	if !m.fromStore || m.storeExpireAt < 0 {
+		c.noteStoreSetLocked(m, s, key, value)
+		return
+	}
+	m.set, m.value, m.ttl = true, value, 0
+	if m.storeExpireAt > 0 {
+		m.ttl = max(time.Duration(m.storeExpireAt-c.cfg.clock.Now().UnixNano()), 1)
 	}
 }
 

@@ -64,6 +64,8 @@ type Cache[K comparable, V any] struct {
 	// through, and delete-through respectively. The in-memory
 	// shards behave as a write-through cache of this backend.
 	store Store[K, V]
+	// ttlStore is store when it implements [TTLStore], else nil.
+	ttlStore TTLStore[K, V]
 
 	// tags is the cache-level inverted index used by SetWithTags
 	// and InvalidateTag. Always non-nil; an empty index has zero
@@ -319,6 +321,7 @@ func build[K comparable, V any](cfg *config, allowUnbounded bool) (*Cache[K, V],
 		loadSlots:                  loadSlots,
 		expireFunc:                 expireFunc,
 		store:                      store,
+		ttlStore:                   asTTLStore(store),
 		tags:                       newTagIndex[K](),
 		events:                     newEventBus[K, V](),
 		onHit:                      hooks.onHit,
@@ -363,7 +366,8 @@ func (c *Cache[K, V]) maybeStartAsync(cfg *config) {
 }
 
 // applyAutoLoad attempts a one-shot LoadFile when [WithAutoLoad] is
-// configured. Missing files are not treated as errors.
+// configured. Missing files, and encrypted snapshots in an older format,
+// are not treated as errors.
 func (c *Cache[K, V]) applyAutoLoad() error {
 	if c.cfg.autoLoadPath == "" {
 		return nil
@@ -373,6 +377,13 @@ func (c *Cache[K, V]) applyAutoLoad() error {
 	}
 	_, err := c.LoadFile(c.cfg.autoLoadPath)
 	if err == nil {
+		return nil
+	}
+	if errors.Is(err, errEncryptedLegacy) {
+		if c.cfg.logger != nil {
+			c.cfg.logger.Warn("memcache: auto-load skipped an encrypted snapshot in an older format, continuing with empty cache",
+				"path", c.cfg.autoLoadPath, "err", err)
+		}
 		return nil
 	}
 	if c.cfg.autoLoadIgnore {
@@ -1080,19 +1091,26 @@ func (c *Cache[K, V]) GetWithExpiry(key K) (V, time.Time, bool) {
 // After insertion, [WithGroup]-bounded groups named by the entry's tags
 // are shrunk back to capacity.
 func (c *Cache[K, V]) Set(key K, value V) error {
-	return c.setCtx(context.Background(), key, value)
+	return c.setCtx(context.Background(), key, value, nil)
 }
 
-func (c *Cache[K, V]) setCtx(ctx context.Context, key K, value V) error {
-	ttl := c.valueTTL(value, c.cfg.defaultTTL)
+// setCtx is Set with a ctx for the Store write. When after is not nil,
+// the hooks the write fires, and the work that may fire more, are added
+// to it for the caller to run instead.
+func (c *Cache[K, V]) setCtx(ctx context.Context, key K, value V, after *[]func()) error {
+	return c.setTTLCtx(ctx, key, value, c.valueTTL(value, c.cfg.defaultTTL), after)
+}
+
+// setTTLCtx is setCtx with the given TTL.
+func (c *Cache[K, V]) setTTLCtx(ctx context.Context, key K, value V, ttl time.Duration, after *[]func()) error {
 	tags := c.autoTags(value)
 	if c.async != nil {
 		return c.asyncSet(key, value, ttl, c.cfg.slidingTTL, tags, nil)
 	}
-	if err := c.setAndStore(ctx, key, value, ttl, c.cfg.slidingTTL, tags); err != nil {
+	if err := c.setAndStore(ctx, key, value, ttl, c.cfg.slidingTTL, tags, after); err != nil {
 		return err
 	}
-	c.enforceGroupBudgets(tags)
+	c.settleGroups(after, tags)
 	return nil
 }
 
@@ -1100,42 +1118,67 @@ func (c *Cache[K, V]) setCtx(ctx context.Context, key K, value V) error {
 // lock, rolling memory back if the Store write fails. Hooks fire after
 // the lock is released, so a hook may write the same key.
 func (c *Cache[K, V]) setAndStore(
-	ctx context.Context, key K, value V, ttl time.Duration, sliding bool, tags []string,
+	ctx context.Context, key K, value V, ttl time.Duration, sliding bool, tags []string, after *[]func(),
 ) error {
 	var cbs []func()
 	s := c.shardFor(key)
-	unlock := c.lockKey(key)
-	err := c.setLockedInto(s, key, value, ttl, sliding, tags, &cbs)
-	if err == nil {
-		err = c.propagateSetToStore(ctx, key, value, ttl, &cbs)
+	defer func() { c.settle(after, cbs, s) }()
+	defer c.lockKey(key)()
+	if err := c.setLockedInto(s, key, value, ttl, sliding, tags, &cbs); err != nil {
+		return err
 	}
-	unlock()
-	c.runCallbacks(cbs, s)
-	return err
+	return c.propagateSetToStore(ctx, key, value, ttl, &cbs)
+}
+
+// settle fires cbs with [Cache.runCallbacks] or, when after is not nil,
+// adds that to after for a caller that fires it once its own lock is
+// released.
+func (c *Cache[K, V]) settle(after *[]func(), cbs []func(), s *shard[K, V]) {
+	if after == nil {
+		c.runCallbacks(cbs, s)
+		return
+	}
+	*after = append(*after, func() { c.runCallbacks(cbs, s) })
+}
+
+// settleGroups is [Cache.enforceGroupBudgets], deferred to after as
+// [Cache.settle] defers callbacks.
+func (c *Cache[K, V]) settleGroups(after *[]func(), tags []string) {
+	if len(c.cfg.groups) == 0 || len(tags) == 0 {
+		return
+	}
+	if after == nil {
+		c.enforceGroupBudgets(tags)
+		return
+	}
+	*after = append(*after, func() { c.enforceGroupBudgets(tags) })
 }
 
 // SetWithTTL stores value under key with the given TTL. A TTL of 0 means
 // no expiry; a negative TTL returns [ErrInvalidTTL]. Like every TTL, it
 // is jittered by ±5% unless [WithTTLJitter] says otherwise.
 func (c *Cache[K, V]) SetWithTTL(key K, value V, ttl time.Duration) error {
+	return c.setWithTTL(key, value, ttl, nil)
+}
+
+// setWithTTL is SetWithTTL that adds the hooks to after, as setCtx does.
+func (c *Cache[K, V]) setWithTTL(key K, value V, ttl time.Duration, after *[]func()) error {
 	if ttl < 0 {
 		return ErrInvalidTTL
 	}
-	tags := c.autoTags(value)
-	if c.async != nil {
-		return c.asyncSet(key, value, ttl, c.cfg.slidingTTL, tags, nil)
-	}
-	if err := c.setAndStore(context.Background(), key, value, ttl, c.cfg.slidingTTL, tags); err != nil {
-		return err
-	}
-	c.enforceGroupBudgets(tags)
-	return nil
+	return c.setTTLCtx(context.Background(), key, value, ttl, after)
 }
 
 // SetWithOptions stores value under key with per-call overrides supplied
 // via [SetOption]. Cache defaults apply to fields no option touches; when
 // they conflict, the per-call option wins.
 func (c *Cache[K, V]) SetWithOptions(key K, value V, opts ...SetOption) error {
+	return c.setWithOptions(key, value, nil, opts...)
+}
+
+// setWithOptions is SetWithOptions that adds the hooks to after, as
+// setCtx does.
+func (c *Cache[K, V]) setWithOptions(key K, value V, after *[]func(), opts ...SetOption) error {
 	if c.closed.Load() {
 		return ErrClosed
 	}
@@ -1188,44 +1231,44 @@ func (c *Cache[K, V]) SetWithOptions(key K, value V, opts ...SetOption) error {
 		}
 		return c.asyncSet(key, value, sc.ttl, sc.sliding, sc.tags, sc.guard)
 	}
+	if err := c.setOptionsAndStore(key, value, weight, &sc, after); err != nil {
+		return err
+	}
+	// Group enforcement runs OUTSIDE the shard lock to avoid inverting
+	// the standard shard-then-index lock order.
+	c.settleGroups(after, sc.tags)
+	return nil
+}
 
+// setOptionsAndStore is setAndStore for SetWithOptions.
+func (c *Cache[K, V]) setOptionsAndStore(key K, value V, weight int64, sc *setConfig, after *[]func()) (err error) {
 	var cbs []func()
 	s := c.shardFor(key)
-	unlock := c.lockKey(key)
+	defer func() { c.settle(after, cbs, s) }()
+	defer c.lockKey(key)()
 	s.mu.Lock()
 	if sc.guard != nil && !sc.guard() {
 		c.releaseShardInto(s, &cbs)
-		unlock()
-		c.runCallbacks(cbs, s)
 		return errWriteSuperseded
 	}
 	if sc.hasExpiry {
-		c.upsertWithAbsoluteExpiryLocked(s, key, value, weight, sc)
+		c.upsertWithAbsoluteExpiryLocked(s, key, value, weight, *sc)
 	} else {
 		c.upsertLocked(s, key, value, weight,
 			c.effectiveTTL(sc.ttl),
 			sc.sliding, int64(sc.ttl), sc.tags)
 	}
 	c.releaseShardInto(s, &cbs)
-	var err error
-	if c.store != nil {
-		if sc.hasExpiry && !sc.expireAt.IsZero() {
-			if err = c.writeThroughStoreUntil(context.Background(), key, value, sc.expireAt); err != nil {
-				c.rollbackInMemory(key, &cbs)
-			}
-		} else {
-			err = c.propagateSetToStore(context.Background(), key, value, sc.ttl, &cbs)
-		}
+	if c.store == nil {
+		return nil
 	}
-	unlock()
-	c.runCallbacks(cbs, s)
-	if err != nil {
+	if sc.hasExpiry && !sc.expireAt.IsZero() {
+		if err = c.writeThroughStoreUntil(context.Background(), key, value, sc.expireAt); err != nil {
+			c.rollbackInMemory(key, &cbs)
+		}
 		return err
 	}
-	// Group enforcement runs OUTSIDE the shard lock to avoid inverting
-	// the standard shard-then-index lock order.
-	c.enforceGroupBudgets(sc.tags)
-	return nil
+	return c.propagateSetToStore(context.Background(), key, value, sc.ttl, &cbs)
 }
 
 func (c *Cache[K, V]) upsertWithAbsoluteExpiryLocked(
@@ -1304,20 +1347,21 @@ func (c *Cache[K, V]) upsertWithAbsoluteExpiryLocked(
 // and the bool is true except on a closed cache; call [Cache.Sync] first
 // to observe the post-delete state.
 func (c *Cache[K, V]) Delete(key K) bool {
+	return c.deleteInto(key, nil)
+}
+
+// deleteInto is Delete that adds the hooks to after, as setCtx does.
+func (c *Cache[K, V]) deleteInto(key K, after *[]func()) bool {
 	if c.async != nil {
 		return c.asyncDelete(key)
 	}
-	return c.deleteCtx(context.Background(), key, EvictReasonDeleted)
-}
-
-func (c *Cache[K, V]) deleteCtx(ctx context.Context, key K, reason EvictionReason) bool {
-	removed, _ := c.deleteKey(ctx, key, reason, true) //nolint:errcheck // Store errors are logged; DeleteCtx returns them
+	removed, _ := c.deleteKey(context.Background(), key, EvictReasonDeleted, true, after) //nolint:errcheck // Store errors are logged; DeleteCtx returns them
 	return removed
 }
 
 // deleteWithReason removes key from memory only.
 func (c *Cache[K, V]) deleteWithReason(key K, reason EvictionReason) bool {
-	removed, _ := c.deleteKey(context.Background(), key, reason, false) //nolint:errcheck // no Store call, no error
+	removed, _ := c.deleteKey(context.Background(), key, reason, false, nil) //nolint:errcheck // no Store call, no error
 	return removed
 }
 
@@ -1325,36 +1369,36 @@ func (c *Cache[K, V]) deleteWithReason(key K, reason EvictionReason) bool {
 // for key, then (with throughStore) deletes from the Store, then from
 // memory. Store first: a Get between the two deletes still finds the
 // in-memory entry rather than reading the Store's copy back in. Hooks
-// fire after the lock is released, so a hook may write the same key.
-func (c *Cache[K, V]) deleteKey(ctx context.Context, key K, reason EvictionReason, throughStore bool) (bool, error) {
+// fire after the lock is released, so a hook may write the same key;
+// when after is not nil they are added to it instead.
+func (c *Cache[K, V]) deleteKey(
+	ctx context.Context, key K, reason EvictionReason, throughStore bool, after *[]func(),
+) (removed bool, err error) {
 	if c.closed.Load() {
 		return false, nil
 	}
 	var cbs []func()
 	s := c.shardFor(key)
-	unlock := c.lockKey(key)
+	defer func() { c.settle(after, cbs, s) }()
+	defer c.lockKey(key)()
 	s.mu.Lock()
 	op, queued := c.applyPendingKeyLocked(s, key)
 	if !throughStore || c.store == nil {
-		removed := c.removeKeyLocked(s, key, reason)
+		removed = c.removeKeyLocked(s, key, reason)
 		c.releaseShardInto(s, &cbs)
 		if queued {
 			c.asyncStoreEffect(op)
 		}
-		unlock()
-		c.runCallbacks(cbs, s)
 		return removed, nil
 	}
 	c.releaseShardInto(s, &cbs)
 	if queued {
 		c.asyncStoreEffect(op)
 	}
-	err := c.deleteThroughStore(ctx, key)
+	err = c.deleteThroughStore(ctx, key)
 	s.mu.Lock()
-	removed := c.removeKeyLocked(s, key, reason)
+	removed = c.removeKeyLocked(s, key, reason)
 	c.releaseShardInto(s, &cbs)
-	unlock()
-	c.runCallbacks(cbs, s)
 	return removed, err
 }
 
@@ -2358,27 +2402,38 @@ func (c *Cache[K, V]) DeleteIf(key K, pred func(V) bool) bool {
 // deleteIfThroughStore is DeleteIf for a cache with a Store.
 func (c *Cache[K, V]) deleteIfThroughStore(s *shard[K, V], key K, pred func(V) bool) bool {
 	var cbs []func()
-	unlock := c.lockKey(key)
-	s.mu.Lock()
+	defer func() { c.runCallbacks(cbs, s) }()
+	defer c.lockKey(key)()
 	var sm storeMirror[K, V]
-	sm.pending, sm.hasPending = c.applyPendingKeyLocked(s, key)
-	_, current, present, err := c.currentLocked(s, key, &sm, &cbs)
-	doomed := err == nil && present && pred(c.returnValue(current))
+	if !c.deleteIfMatches(s, key, pred, &sm, &cbs) {
+		return false
+	}
+	_ = c.deleteThroughStore(context.Background(), key) //nolint:errcheck // logged; the in-memory delete completes regardless, as in Delete
+	s.mu.Lock()
+	if !c.removeKeyLocked(s, key, EvictReasonDeleted) {
+		c.counters.deletes.Add(1)
+	}
 	c.releaseShardInto(s, &cbs)
-	if sm.hasPending {
-		c.asyncStoreEffect(sm.pending)
-	}
-	if doomed {
-		_ = c.deleteThroughStore(context.Background(), key) //nolint:errcheck // logged; the in-memory delete completes regardless, as in Delete
-		s.mu.Lock()
-		if !c.removeKeyLocked(s, key, EvictReasonDeleted) {
-			c.counters.deletes.Add(1)
+	return true
+}
+
+// deleteIfMatches reports whether pred matches key's current value,
+// read as currentLocked reads it. It takes and releases s.mu, adding the
+// callbacks to cbs, and then writes any async op it applied to the
+// Store. Caller MUST hold key's lock.
+func (c *Cache[K, V]) deleteIfMatches(
+	s *shard[K, V], key K, pred func(V) bool, sm *storeMirror[K, V], cbs *[]func(),
+) bool {
+	s.mu.Lock()
+	defer func() {
+		if sm.hasPending {
+			c.asyncStoreEffect(sm.pending)
 		}
-		c.releaseShardInto(s, &cbs)
-	}
-	unlock()
-	c.runCallbacks(cbs, s)
-	return doomed
+	}()
+	defer c.releaseShardInto(s, cbs)
+	sm.pending, sm.hasPending = c.applyPendingKeyLocked(s, key)
+	_, current, present, err := c.currentLocked(s, key, sm, cbs)
+	return err == nil && present && pred(c.returnValue(current))
 }
 
 // GetOrSet returns the cached value for key when present and fresh, or
@@ -2622,37 +2677,46 @@ func (c *Cache[K, V]) DeletePrefix(prefix string) int {
 	}
 	count := 0
 	for _, s := range c.shards {
-		s.mu.Lock()
-		for _, flights := range []map[K]*flightCall[V]{s.inflight, s.orphans} {
-			for k, f := range flights {
-				if matcher(k) {
-					f.superseded = true
-				}
-			}
-		}
-		var doomed []*entry[K, V]
-		s.storage.each(func(e *entry[K, V]) bool {
-			if matcher(e.key) {
-				doomed = append(doomed, e)
-			}
-			return true
-		})
-		if c.store != nil {
-			keys := make([]K, len(doomed))
-			for i, e := range doomed {
-				keys[i] = e.key
-			}
-			c.flushAndUnlock(s)
+		n, keys := c.deletePrefixShard(s, matcher)
+		count += n
+		if len(keys) > 0 {
 			count += c.deleteKeysThroughStore(keys, EvictReasonDeletedPrefix)
-			continue
 		}
-		for _, e := range doomed {
-			c.removeLocked(s, e, EvictReasonDeletedPrefix)
-			count++
-		}
-		c.flushAndUnlock(s)
 	}
 	return count
+}
+
+// deletePrefixShard removes s's entries whose keys match and returns how
+// many it removed. With a Store it removes none and returns the matching
+// keys instead, for [Cache.deleteKeysThroughStore].
+func (c *Cache[K, V]) deletePrefixShard(s *shard[K, V], matcher func(K) bool) (int, []K) {
+	s.mu.Lock()
+	defer c.flushAndUnlock(s)
+	for _, flights := range []map[K]*flightCall[V]{s.inflight, s.orphans} {
+		for k, f := range flights {
+			if matcher(k) {
+				f.superseded = true
+			}
+		}
+	}
+	var doomed []*entry[K, V]
+	s.storage.each(func(e *entry[K, V]) bool {
+		if matcher(e.key) {
+			doomed = append(doomed, e)
+		}
+		return true
+	})
+	if c.store != nil {
+		keys := make([]K, len(doomed))
+		for i, e := range doomed {
+			keys[i] = e.key
+		}
+		return 0, keys
+	}
+	for _, e := range doomed {
+		c.removeLocked(s, e, EvictReasonDeletedPrefix)
+	}
+	return len(doomed), nil
 }
 
 // deleteKeysThroughStore deletes each key from the Store and then from
@@ -2662,7 +2726,7 @@ func (c *Cache[K, V]) deleteKeysThroughStore(keys []K, reason EvictionReason) in
 	n := 0
 	for _, k := range keys {
 		//nolint:errcheck // logged; the in-memory delete completes regardless, as in Delete
-		if removed, _ := c.deleteKey(context.Background(), k, reason, true); removed {
+		if removed, _ := c.deleteKey(context.Background(), k, reason, true, nil); removed {
 			n++
 		}
 	}
@@ -3030,6 +3094,10 @@ func (c *Cache[K, V]) runLoader(
 		flight.err = &LoadError{Key: key, Err: err}
 	}
 
+	var lv loadedValue
+	if err == nil {
+		lv = c.prepareLoaded(key, val)
+	}
 	s.mu.Lock()
 	s.leaveInflight(key, flight)
 	if c.cfg.statsEnabled {
@@ -3043,7 +3111,7 @@ func (c *Cache[K, V]) runLoader(
 			c.counters.loadErrors.Add(1)
 		}
 	}
-	c.applyLoadResultLocked(s, key, flight, val, ttl, err)
+	c.applyLoadResultLocked(s, key, flight, val, ttl, err, lv)
 	c.flushAndUnlock(s)
 
 	// OnLoad / EventLoad fire AFTER the shard lock so callbacks can
@@ -3080,12 +3148,12 @@ func (c *Cache[K, V]) runLoader(
 // write, delete or invalidation of the key (or by Close) hands its
 // result to its waiters but stores nothing. Caller MUST hold s.mu.
 func (c *Cache[K, V]) applyLoadResultLocked(
-	s *shard[K, V], key K, flight *flightCall[V], val V, ttl time.Duration, err error,
+	s *shard[K, V], key K, flight *flightCall[V], val V, ttl time.Duration, err error, lv loadedValue,
 ) {
 	switch {
 	case flight.superseded || c.closed.Load():
 	case err == nil:
-		c.storeLoadedLocked(s, key, val, ttl)
+		c.storeLoadedLocked(s, key, val, ttl, lv)
 	case errors.Is(err, ErrNotFound):
 		if c.cfg.negativeTTL > 0 {
 			c.insertNegativeTombstoneLocked(s, key)
@@ -3146,12 +3214,29 @@ func (c *Cache[K, V]) callLoader(
 	return fn(ctx, key)
 }
 
-// storeLoadedLocked applies the Loader's result. ttl=0 inherits
-// [WithDefaultTTL]. Caller MUST hold s.mu.
-func (c *Cache[K, V]) storeLoadedLocked(s *shard[K, V], key K, val V, ttl time.Duration) {
+// loadedValue is a loaded value's weight and tags, worked out before
+// the shard lock is taken since both may run user code. ok is false when
+// the value is too large to cache.
+type loadedValue struct {
+	weight int64
+	tags   []string
+	ok     bool
+}
+
+// prepareLoaded weighs and tags a loaded value for storeLoadedLocked.
+func (c *Cache[K, V]) prepareLoaded(key K, val V) loadedValue {
 	weight, err := c.computeWeight(key, val)
 	if err != nil {
 		// Value too big to cache; the loader's val is still returned.
+		return loadedValue{}
+	}
+	return loadedValue{weight: weight, tags: c.autoTags(val), ok: true}
+}
+
+// storeLoadedLocked applies the Loader's result, prepared by
+// prepareLoaded. ttl=0 inherits [WithDefaultTTL]. Caller MUST hold s.mu.
+func (c *Cache[K, V]) storeLoadedLocked(s *shard[K, V], key K, val V, ttl time.Duration, lv loadedValue) {
+	if !lv.ok {
 		return
 	}
 	if ttl == 0 {
@@ -3159,11 +3244,11 @@ func (c *Cache[K, V]) storeLoadedLocked(s *shard[K, V], key K, val V, ttl time.D
 	}
 	// A refresh keeps the tags the entry already carries, unless the
 	// value derives its own.
-	tags := c.autoTags(val)
+	tags := lv.tags
 	if e, ok := s.storage.get(key); ok && len(tags) == 0 && len(e.tags) > 0 {
 		tags = append([]string(nil), e.tags...)
 	}
-	c.upsertLocked(s, key, val, weight,
+	c.upsertLocked(s, key, val, lv.weight,
 		c.effectiveTTL(ttl),
 		c.cfg.slidingTTL, int64(ttl), tags)
 }
@@ -3299,9 +3384,10 @@ func (c *Cache[K, V]) DeleteMulti(keys []K) int {
 // returned directly; misses are coalesced via [BulkLoader.LoadMulti] when
 // [WithBulkLoader] is configured, otherwise via per-key [Cache.GetOrLoad].
 // The map contains only successfully-resolved keys; the first transport
-// error from LoadMulti aborts. Bulk-loaded values are cached as
-// [Cache.GetOrLoad] caches a load: in memory only, and not for a key
-// written, deleted or invalidated while LoadMulti ran.
+// error from LoadMulti aborts. A bulk-loaded value is cached as a
+// [Cache.Set] with the result's TTL would cache it, and so with
+// [WithStore] is written to the Store too, unless its key was written,
+// deleted or invalidated while LoadMulti ran.
 func (c *Cache[K, V]) GetMultiOrLoad(ctx context.Context, keys []K) (map[K]V, error) {
 	if c.closed.Load() {
 		return nil, ErrClosed
@@ -3311,6 +3397,24 @@ func (c *Cache[K, V]) GetMultiOrLoad(ctx context.Context, keys []K) (map[K]V, er
 	}
 	if len(keys) == 0 {
 		return map[K]V{}, nil
+	}
+
+	// With a bulk loader, watch every key from before its lookup, so a
+	// result that a write, delete or invalidation of its key overtook
+	// is not stored.
+	var watches map[K]*watchToken
+	if c.bulkLoader != nil {
+		watches = make(map[K]*watchToken, len(keys))
+		for _, k := range keys {
+			if _, ok := watches[k]; !ok {
+				watches[k] = c.watchKey(k)
+			}
+		}
+		defer func() {
+			for k, w := range watches {
+				c.unwatchKey(k, w)
+			}
+		}()
 	}
 
 	out := make(map[K]V, len(keys))
@@ -3331,6 +3435,12 @@ func (c *Cache[K, V]) GetMultiOrLoad(ctx context.Context, keys []K) (map[K]V, er
 			missing = append(missing, k)
 		}
 	}
+	for k := range out {
+		if w, ok := watches[k]; ok {
+			c.unwatchKey(k, w)
+			delete(watches, k)
+		}
+	}
 	if len(missing) == 0 {
 		return out, nil
 	}
@@ -3349,19 +3459,6 @@ func (c *Cache[K, V]) GetMultiOrLoad(ctx context.Context, keys []K) (map[K]V, er
 		return out, nil
 	}
 
-	// Watch every missing key across the load, so a result that a
-	// write, delete or invalidation of its key overtook is not stored.
-	watches := make(map[K]*watchToken, len(missing))
-	for _, k := range missing {
-		if _, ok := watches[k]; !ok {
-			watches[k] = c.watchKey(k)
-		}
-	}
-	defer func() {
-		for k, w := range watches {
-			c.unwatchKey(k, w)
-		}
-	}()
 	loaded, err := c.bulkLoader.LoadMulti(ctx, missing)
 	if err != nil {
 		return out, err
@@ -3380,13 +3477,27 @@ func (c *Cache[K, V]) GetMultiOrLoad(ctx context.Context, keys []K) (map[K]V, er
 	return out, nil
 }
 
-// storeBulkLoaded caches a [BulkLoader] result in memory, as a [Loader]
-// result is, unless w says the key changed since the load began.
+// storeBulkLoaded caches a [BulkLoader] result, unless w says the key
+// changed since its lookup began. ttl=0 inherits [WithDefaultTTL]. With
+// a Store, it is written through as [Cache.SetWithOptions] writes, with
+// w checked under the key's lock.
 func (c *Cache[K, V]) storeBulkLoaded(key K, value V, ttl time.Duration, w *watchToken) {
+	if c.store != nil {
+		opts := []SetOption{setGuard(func() bool { return !w.superseded && !c.closed.Load() })}
+		if ttl > 0 {
+			opts = append(opts, SetTTL(ttl))
+		}
+		err := c.SetWithOptions(key, value, opts...)
+		if err != nil && !errors.Is(err, errWriteSuperseded) && c.cfg.logger != nil {
+			c.cfg.logger.Warn("memcache: caching a bulk-loaded value failed", "err", err)
+		}
+		return
+	}
+	lv := c.prepareLoaded(key, value)
 	s := c.shardFor(key)
 	s.mu.Lock()
+	defer c.flushAndUnlock(s)
 	if !w.superseded && !c.closed.Load() {
-		c.storeLoadedLocked(s, key, value, ttl)
+		c.storeLoadedLocked(s, key, value, ttl, lv)
 	}
-	c.flushAndUnlock(s)
 }

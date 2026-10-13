@@ -63,3 +63,22 @@ func TestPublishRejectsForeignNameAndBadArgs(t *testing.T) {
 		t.Error("Publish with a nil source succeeded")
 	}
 }
+
+func TestUnpublishDropsTheSource(t *testing.T) {
+	c := newCache(t)
+	_ = c.Set("a", 1)
+	if err := memexpvar.Publish("memexpvar_test_unpublish", c); err != nil {
+		t.Fatal(err)
+	}
+	memexpvar.Unpublish("memexpvar_test_unpublish")
+	if got := expvar.Get("memexpvar_test_unpublish").String(); got != "{}" {
+		t.Fatalf("after Unpublish got %s, want {}", got)
+	}
+	memexpvar.Unpublish("memexpvar_test_never_published")
+	if err := memexpvar.Publish("memexpvar_test_unpublish", c); err != nil {
+		t.Fatal(err)
+	}
+	if got := expvar.Get("memexpvar_test_unpublish").String(); !strings.Contains(got, `"entries":1`) {
+		t.Fatalf("after Publish again got %s", got)
+	}
+}

@@ -213,3 +213,189 @@ func TestMaxEntriesHoldsOnceConcurrentWritersReturn(t *testing.T) {
 		}
 	}
 }
+
+// panicStore is a MemoryStore whose Set and Delete panic on demand.
+type panicStore struct {
+	*MemoryStore[string, int]
+	panicSet, panicDel *atomic.Bool
+}
+
+func (p panicStore) Set(ctx context.Context, k string, v int, ttl time.Duration) error {
+	if p.panicSet.Load() {
+		panic("store Set")
+	}
+	return p.MemoryStore.Set(ctx, k, v, ttl)
+}
+
+func (p panicStore) Delete(ctx context.Context, k string) (bool, error) {
+	if p.panicDel.Load() {
+		panic("store Delete")
+	}
+	return p.MemoryStore.Delete(ctx, k)
+}
+
+// User code that panics while the cache holds a lock, recovered by the
+// caller as net/http recovers a handler, leaves the cache usable.
+func TestRecoveredPanicsInUserCodeReleaseLocks(t *testing.T) {
+	type knobs struct {
+		weigh, storeSet, storeDel atomic.Bool
+	}
+	cases := map[string]struct {
+		storeOnly bool
+		op        func(c *Cache[string, int], kn *knobs)
+	}{
+		"DeleteIf predicate": {op: func(c *Cache[string, int], _ *knobs) {
+			c.DeleteIf("k", func(int) bool { panic("pred") })
+		}},
+		"Compute fn": {op: func(c *Cache[string, int], _ *knobs) {
+			_, _ = c.Compute("k", func(int, bool) (int, ComputeAction, error) { panic("fn") })
+		}},
+		"Set weigher": {op: func(c *Cache[string, int], kn *knobs) {
+			kn.weigh.Store(true)
+			_ = c.Set("k", 2)
+		}},
+		"SetWithOptions weigher": {op: func(c *Cache[string, int], kn *knobs) {
+			kn.weigh.Store(true)
+			_ = c.SetWithOptions("k", 2)
+		}},
+		"CompareAndSwap weigher": {op: func(c *Cache[string, int], kn *knobs) {
+			kn.weigh.Store(true)
+			c.CompareAndSwap("k", 1, 2)
+		}},
+		"GetMultiOrLoad weigher": {op: func(c *Cache[string, int], kn *knobs) {
+			c.Delete("k")
+			kn.weigh.Store(true)
+			_, _ = c.GetMultiOrLoad(context.Background(), []string{"k"})
+		}},
+		"Store Set": {storeOnly: true, op: func(c *Cache[string, int], kn *knobs) {
+			kn.storeSet.Store(true)
+			_ = c.Set("k", 2)
+		}},
+		"Store Set from SetWithOptions": {storeOnly: true, op: func(c *Cache[string, int], kn *knobs) {
+			kn.storeSet.Store(true)
+			_ = c.SetWithOptions("k", 2)
+		}},
+		"Store Delete": {storeOnly: true, op: func(c *Cache[string, int], kn *knobs) {
+			kn.storeDel.Store(true)
+			c.Delete("k")
+		}},
+		"Store Delete from DeleteIf": {storeOnly: true, op: func(c *Cache[string, int], kn *knobs) {
+			kn.storeDel.Store(true)
+			c.DeleteIf("k", func(int) bool { return true })
+		}},
+	}
+	for name, tc := range cases {
+		for _, withStore := range []bool{false, true} {
+			if tc.storeOnly && !withStore {
+				continue
+			}
+			t.Run(fmt.Sprint(name, "/store=", withStore), func(t *testing.T) {
+				var kn knobs
+				bulk := bulkLoaderFunc[string, int](func(_ context.Context, keys []string) (map[string]LoadResult[int], error) {
+					out := make(map[string]LoadResult[int], len(keys))
+					for _, k := range keys {
+						out[k] = LoadResult[int]{Value: 3}
+					}
+					return out, nil
+				})
+				opts := []Option{WithMaxEntries(10), WithShards(1), WithBulkLoader(bulk),
+					WithWeigher(func(int) int64 {
+						if kn.weigh.Load() {
+							panic("weigher")
+						}
+						return 1
+					})}
+				if withStore {
+					opts = append(opts, WithStore[string, int](panicStore{
+						NewMemoryStore[string, int](nil), &kn.storeSet, &kn.storeDel,
+					}))
+				}
+				// Not closed on failure: Close would wait on the held lock.
+				c, _ := New[string, int](opts...)
+				_ = c.Set("k", 1)
+				finishes(t, "the panicking call", func() {
+					defer func() {
+						if recover() == nil {
+							t.Error("the user code didn't panic")
+						}
+					}()
+					tc.op(c, &kn)
+				})
+				kn.weigh.Store(false)
+				kn.storeSet.Store(false)
+				kn.storeDel.Store(false)
+				finishes(t, "using the cache after the panic", func() {
+					c.Get("k")
+					c.Get("other")
+					_ = c.Set("k", 5)
+					c.Delete("k")
+				})
+				_ = c.Close()
+			})
+		}
+	}
+}
+
+var prefixPanics atomic.Bool
+
+// panicPrefixKey is a Prefixer key whose HasPrefix panics on demand.
+type panicPrefixKey string
+
+func (k panicPrefixKey) HasPrefix(p string) bool {
+	if prefixPanics.Load() {
+		panic("HasPrefix")
+	}
+	return len(k) >= len(p) && string(k[:len(p)]) == p
+}
+
+func TestRecoveredDeletePrefixPanicReleasesLocks(t *testing.T) {
+	for _, withStore := range []bool{false, true} {
+		opts := []Option{WithMaxEntries(10), WithShards(1)}
+		if withStore {
+			opts = append(opts, WithStore[panicPrefixKey, int](NewMemoryStore[panicPrefixKey, int](nil)))
+		}
+		c, _ := New[panicPrefixKey, int](opts...)
+		_ = c.Set("ab", 1)
+		func() {
+			defer func() { _ = recover() }()
+			prefixPanics.Store(true)
+			defer prefixPanics.Store(false)
+			c.DeletePrefix("a")
+		}()
+		finishes(t, fmt.Sprint("using the cache after the panic, store=", withStore), func() {
+			c.Get("ab")
+			_ = c.Set("ab", 2)
+			if n := c.DeletePrefix("a"); n != 1 {
+				t.Errorf("DeletePrefix = %d, want 1", n)
+			}
+		})
+		_ = c.Close()
+	}
+}
+
+// Loaded values are weighed before the shard lock is taken, so a Weigher
+// may read the cache.
+func TestLoadWeigherMayReadTheCache(t *testing.T) {
+	var cp atomic.Pointer[Cache[string, int]]
+	loader := LoaderFunc[string, int](func(context.Context, string) (int, time.Duration, error) { return 1, 0, nil })
+	c, _ := New[string, int](WithMaxEntries(10), WithShards(1), WithLoader(loader), WithBulkLoader(constBulk(2)),
+		WithWeigher(func(int) int64 {
+			if c := cp.Load(); c != nil {
+				c.Get("other")
+			}
+			return 1
+		}))
+	cp.Store(c)
+	finishes(t, "loads with a Weigher that reads the cache", func() {
+		if _, err := c.GetMultiOrLoad(context.Background(), []string{"a", "b"}); err != nil {
+			t.Error(err)
+		}
+		if _, err := c.GetOrLoad(context.Background(), "c"); err != nil {
+			t.Error(err)
+		}
+	})
+	if v, ok := c.Peek("a"); !ok || v != 2 {
+		t.Fatalf("bulk-loaded a = %d, %v", v, ok)
+	}
+	_ = c.Close()
+}

@@ -44,6 +44,26 @@ type Store[K comparable, V any] interface {
 	Close() error
 }
 
+// TTLStore is a [Store] that can also report the TTL a record has left.
+// A Cache still reads values with Get; it calls TTL after a Get hit when
+// it copies the record into memory, and when a write that keeps a key's
+// expiry updates a key read from the Store, so it can keep the record's
+// expiry; see [WithStore]. That is one extra Store call per promotion and
+// per such write.
+type TTLStore[K comparable, V any] interface {
+	Store[K, V]
+
+	// TTL returns the time key's record has left before it expires, 0
+	// when it has no expiry, and false when there is no such record.
+	TTL(ctx context.Context, key K) (time.Duration, bool, error)
+}
+
+// asTTLStore returns s as a [TTLStore], or nil when it isn't one.
+func asTTLStore[K comparable, V any](s Store[K, V]) TTLStore[K, V] {
+	ts, _ := s.(TTLStore[K, V])
+	return ts
+}
+
 // MemoryStore is the default in-process [Store]. Expired entries are
 // hidden from reads and removed by a sweep that Set runs once per
 // store-size Sets. Safe for concurrent use; zero value is invalid (use
@@ -96,6 +116,32 @@ func (m *MemoryStore[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
 		return zero, false, nil
 	}
 	return e.value, true, nil
+}
+
+// TTL returns the time the record for key has left, 0 for a record
+// with no expiry, and false when there is none. It implements
+// [TTLStore].
+func (m *MemoryStore[K, V]) TTL(ctx context.Context, key K) (time.Duration, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, false, err //nolint:wrapcheck // pass ctx.Err verbatim
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.closed {
+		return 0, false, ErrClosed
+	}
+	e, ok := m.entries[key]
+	if !ok {
+		return 0, false, nil
+	}
+	if e.expireAt == 0 {
+		return 0, true, nil
+	}
+	left := e.expireAt - m.clock.Now().UnixNano()
+	if left <= 0 {
+		return 0, false, nil
+	}
+	return time.Duration(left), true, nil
 }
 
 // Set stores value with the given TTL. ttl <= 0 stores with no

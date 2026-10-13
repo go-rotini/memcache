@@ -207,35 +207,52 @@ func (t *Tiered[K, V]) promote(key K, v V, guard func() bool) error {
 // Set writes value to L1, then L2, and returns the first error. If the
 // L1 write fails, L2 is not written; if only the L2 write fails, L1
 // holds a newer value than L2. Tiered writes of one key run one at a
-// time, so concurrent writers leave both tiers with the same value.
+// time, so concurrent writers leave both tiers with the same value. The
+// tiers' hooks fire once both writes are done, so a hook may call
+// Tiered for any key.
 func (t *Tiered[K, V]) Set(key K, value V) error {
 	if t.closed.Load() {
 		return ErrClosed
 	}
-	return t.write(key, func(c *Cache[K, V]) error { return c.Set(key, value) })
+	return t.write(key, func(c *Cache[K, V], after *[]func()) error {
+		return c.setCtx(context.Background(), key, value, after)
+	})
 }
 
 // write applies set to L1 and then, when that succeeds, to L2, holding
-// key's Tiered write lock.
-func (t *Tiered[K, V]) write(key K, set func(*Cache[K, V]) error) error {
+// key's Tiered write lock. The hooks both writes fire run after the lock
+// is released.
+func (t *Tiered[K, V]) write(key K, set func(c *Cache[K, V], after *[]func()) error) error {
+	var after []func()
+	defer runAll(&after)
 	defer t.locks.lock(key)()
-	if err := set(t.l1); err != nil {
+	if err := set(t.l1, &after); err != nil {
 		return err
 	}
-	return set(t.l2)
+	return set(t.l2, &after)
+}
+
+// runAll calls each function in *fns in order.
+func runAll(fns *[]func()) {
+	for _, fn := range *fns {
+		fn()
+	}
 }
 
 // Delete removes key from BOTH tiers. Returns true when at least
-// one tier had an entry to remove.
+// one tier had an entry to remove. As with [Tiered.Set], the tiers'
+// hooks fire once both deletes are done.
 func (t *Tiered[K, V]) Delete(key K) bool {
 	if t.closed.Load() {
 		return false
 	}
+	var after []func()
+	defer runAll(&after)
 	defer t.locks.lock(key)()
 	// L2 first, so a concurrent Get can't promote the old L2 value
 	// back into an already-cleared L1.
-	d2 := t.l2.Delete(key)
-	d1 := t.l1.Delete(key)
+	d2 := t.l2.deleteInto(key, &after)
+	d1 := t.l1.deleteInto(key, &after)
 	return d1 || d2
 }
 
@@ -281,7 +298,9 @@ func (t *Tiered[K, V]) SetWithTTL(key K, value V, ttl time.Duration) error {
 	if t.closed.Load() {
 		return ErrClosed
 	}
-	return t.write(key, func(c *Cache[K, V]) error { return c.SetWithTTL(key, value, ttl) })
+	return t.write(key, func(c *Cache[K, V], after *[]func()) error {
+		return c.setWithTTL(key, value, ttl, after)
+	})
 }
 
 // SetWithOptions is [Tiered.Set] with the same per-call options for
@@ -291,7 +310,9 @@ func (t *Tiered[K, V]) SetWithOptions(key K, value V, opts ...SetOption) error {
 	if t.closed.Load() {
 		return ErrClosed
 	}
-	return t.write(key, func(c *Cache[K, V]) error { return c.SetWithOptions(key, value, opts...) })
+	return t.write(key, func(c *Cache[K, V], after *[]func()) error {
+		return c.setWithOptions(key, value, after, opts...)
+	})
 }
 
 // InvalidateTag removes every entry tagged with tag from both tiers and

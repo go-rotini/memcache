@@ -20,7 +20,7 @@ func (c *Cache[K, V]) SetCtx(ctx context.Context, key K, value V) error {
 	if err := ctx.Err(); err != nil {
 		return err //nolint:wrapcheck // sentinel surfaces unwrapped for errors.Is
 	}
-	return c.setCtx(ctx, key, value)
+	return c.setCtx(ctx, key, value, nil)
 }
 
 // DeleteCtx is the context-aware variant of [Cache.Delete]. The boolean
@@ -34,5 +34,5 @@ func (c *Cache[K, V]) DeleteCtx(ctx context.Context, key K) (bool, error) {
 	if c.async != nil {
 		return c.asyncDelete(key), nil
 	}
-	return c.deleteKey(ctx, key, EvictReasonDeleted, true)
+	return c.deleteKey(ctx, key, EvictReasonDeleted, true, nil)
 }

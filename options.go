@@ -462,9 +462,22 @@ func WithAsyncWrites() Option {
 // a hook may write the key whose write fired it.
 //
 // Some operations act on memory only: eviction, expiry, [Cache.Clear],
-// [Cache.Reset], [Cache.InvalidateTag], snapshot loads, and loads
-// ([Cache.GetOrLoad], [Cache.GetMultiOrLoad], refresh-ahead and
-// stale-while-revalidate), which neither read nor write the Store.
+// [Cache.Reset], [Cache.InvalidateTag], snapshot loads, and [Loader]
+// loads ([Cache.GetOrLoad], refresh-ahead and stale-while-revalidate),
+// which neither read nor write the Store. [Cache.GetMultiOrLoad] reads
+// each key as [Cache.GetCtx] does, and writes [BulkLoader] results to
+// the Store as [Cache.SetWithOptions] does.
+//
+// A Store hit is promoted with [WithDefaultTTL], since [Store.Get]
+// returns no TTL. For a Store that also implements [TTLStore], the cache
+// asks for the record's remaining TTL after the Get, one extra Store
+// call: the promoted copy then expires no later than the record, and a
+// write that keeps a key's expiry (the Compute family, [Cache.Update],
+// [Cache.CompareAndSwap], [Increment]) on a key read from the Store
+// keeps the record's TTL. Without TTLStore, or when the TTL lookup fails,
+// such a write gives the record the promoted copy's TTL. [MemoryStore]
+// implements TTLStore.
+//
 // Iteration helpers ([Cache.Range], [Cache.Keys]) walk only the
 // in-memory portion. The cache does NOT close the Store on
 // [Cache.Close]. A Store whose K/V do not match the cache parameters is
@@ -682,9 +695,11 @@ func WithSnapshotMetadata(meta map[string]string) Option {
 // WithMaxSnapshotBytes caps snapshots accepted by [Cache.Load] /
 // [Cache.LoadFile]. A non-positive value falls back to the default
 // (256 MiB). The fields of a [CompressedCodec] snapshot may decompress
-// to at most 16 times the cap in total. [Cache.Save] and
-// [Cache.SaveFile] fail with [ErrSnapshotTooLarge] rather than write a
-// snapshot past either bound.
+// to at most 16 times the cap in total. With the option set,
+// [Cache.Save] and [Cache.SaveFile] fail with [ErrSnapshotTooLarge]
+// rather than write a snapshot past either bound. Without it, they have
+// no size limit, except that SaveFile and auto-save to the [WithAutoLoad]
+// path apply the default one.
 func WithMaxSnapshotBytes(n int64) Option {
 	return func(c *config) { c.maxSnapshotBytes = n }
 }
@@ -701,8 +716,12 @@ func WithAutoSave(path string, interval time.Duration) Option {
 }
 
 // WithAutoLoad populates the cache from a snapshot at path during [New].
-// A missing file is not an error; any other load error fails [New]
-// unless [WithAutoLoadIgnoreErrors] is also set.
+// A missing file is not an error, and neither is an encrypted snapshot
+// written by memcache v1.0.2 or earlier: [Cache.Load] refuses those with
+// [ErrSnapshotIncompatible], so auto-load logs a warning and the cache
+// starts empty, as with no file, until the next save replaces it. Any
+// other load error fails [New] unless [WithAutoLoadIgnoreErrors] is also
+// set.
 func WithAutoLoad(path string) Option {
 	return func(c *config) { c.autoLoadPath = path }
 }

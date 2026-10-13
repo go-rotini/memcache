@@ -31,17 +31,28 @@ const (
 )
 
 // defaultMaxSnapshotBytes caps Load input when [WithMaxSnapshotBytes] is
-// not set.
-const defaultMaxSnapshotBytes = int64(256 << 20) // 256 MiB
+// not set, and SaveFile output to the [WithAutoLoad] path. A variable so
+// tests can lower it.
+var defaultMaxSnapshotBytes = int64(256 << 20) // 256 MiB
 
 var crcTable = crc32.MakeTable(crc32.Castagnoli)
 
 var (
-	errFieldTooBig     = errors.New("memcache: snapshot field exceeds 2 GiB")
-	errTooManyTags     = errors.New("memcache: more than 255 tags per entry")
-	errFieldPastEnd    = errors.New("field length runs past the end of the snapshot or its size limit")
-	errInflateTooLarge = errors.New("decompressed data exceeds the decompression limit")
+	// errEncryptedLegacy is the Err of a load refused because the
+	// snapshot is an encrypted one in an older format.
+	errEncryptedLegacy error = encryptedLegacyError{}
+	errFieldTooBig           = errors.New("memcache: snapshot field exceeds 2 GiB")
+	errTooManyTags           = errors.New("memcache: more than 255 tags per entry")
+	errFieldPastEnd          = errors.New("field length runs past the end of the snapshot or its size limit")
+	errInflateTooLarge       = errors.New("decompressed data exceeds the decompression limit")
 )
+
+// encryptedLegacyError is [ErrSnapshotIncompatible], told apart so
+// auto-load can skip the file.
+type encryptedLegacyError struct{}
+
+func (encryptedLegacyError) Error() string { return ErrSnapshotIncompatible.Error() }
+func (encryptedLegacyError) Unwrap() error { return ErrSnapshotIncompatible }
 
 // snapshotSchemaVersionKey is the reserved metadata key for versioned
 // struct fingerprints; Load refuses mismatches with [ErrSnapshotIncompatible].
@@ -70,18 +81,23 @@ type entrySnapshot[K comparable, V any] struct {
 // (keys, values, expiry, weights, flags and tags) are encrypted and
 // authenticated as one unit bound to that header, so neither can be
 // changed, reordered or swapped without Load failing.
+//
+// With [WithMaxSnapshotBytes], Save fails with [ErrSnapshotTooLarge]
+// rather than write a snapshot that a Load with the same limit would
+// refuse; without it, Save has no size limit. A failed Save may leave
+// partial output in w.
 func (c *Cache[K, V]) Save(w io.Writer) (err error) {
 	if c.closed.Load() {
 		return ErrClosed
 	}
 	_, span := c.tracer.Start(context.Background(), "memcache.snapshot.save")
 	defer func() { span.End(err) }()
-	return c.saveTo(w)
+	return c.saveTo(w, c.cfg.maxSnapshotBytes)
 }
 
-// saveTo is the closed-check-free Save implementation. Called by Close
-// so the final auto-save runs even with closed already flipped.
-func (c *Cache[K, V]) saveTo(w io.Writer) error {
+// saveTo writes a snapshot to w without checking for Close, so Close's
+// final auto-save works. A limit <= 0 means no size limit.
+func (c *Cache[K, V]) saveTo(w io.Writer, limit int64) error {
 	staged := c.snapshotEntries()
 	recCodec, enc := splitEncryption(c.cfg.codec)
 
@@ -90,8 +106,10 @@ func (c *Cache[K, V]) saveTo(w io.Writer) error {
 		return err
 	}
 
-	// Refuse to write what Load would refuse to read.
-	limit := c.snapshotLimit()
+	// Refuse to write what a Load with this limit would refuse to read.
+	if limit <= 0 {
+		limit = math.MaxInt64
+	}
 	ss := &saveState{inflateLeft: inflateLimit(limit)}
 	lw := &limitWriter{w: w, left: limit}
 	crc := crc32.New(crcTable)
@@ -134,7 +152,10 @@ func (c *Cache[K, V]) saveTo(w io.Writer) error {
 }
 
 // SaveFile writes a snapshot to path atomically via temp file + fsync +
-// rename. Readers see either the prior or new snapshot, never torn.
+// rename. Readers see either the prior or new snapshot, never torn. It
+// applies the size limit [Cache.Save] does, and when path is the
+// [WithAutoLoad] path, the default limit auto-load reads with, so a
+// failed SaveFile keeps the old file.
 func (c *Cache[K, V]) SaveFile(path string) error {
 	if c.closed.Load() {
 		return ErrClosed
@@ -156,7 +177,7 @@ func (c *Cache[K, V]) saveFileTo(path string) (err error) {
 	cleanup := func() { _ = os.Remove(tmpPath) }
 
 	bw := bufio.NewWriter(tmp)
-	if err := c.saveTo(bw); err != nil {
+	if err := c.saveTo(bw, c.saveFileLimit(path)); err != nil {
 		_ = tmp.Close()
 		cleanup()
 		return err
@@ -196,7 +217,10 @@ func (c *Cache[K, V]) saveFileTo(path string) (err error) {
 // [WithMaxTagsPerEntry] or [WithMaxTagsTotal], are skipped. With a [Weigher], each value is
 // weighed again rather than trusting the weight in the snapshot. The
 // cache's entry and byte bounds apply to the loaded total. Load reads
-// snapshots written by this and the previous format version.
+// snapshots written by this and the previous format version, except
+// encrypted ones in the previous format (written by memcache v1.0.2 or
+// earlier), which fail with [ErrSnapshotIncompatible]: their records
+// can't be checked against tampering.
 func (c *Cache[K, V]) Load(r io.Reader) (n int, err error) {
 	_, span := c.tracer.Start(context.Background(), "memcache.snapshot.load")
 	defer func() { span.End(err) }()
@@ -208,6 +232,19 @@ func (c *Cache[K, V]) Load(r io.Reader) (n int, err error) {
 // of entries written.
 func (c *Cache[K, V]) Merge(r io.Reader) (int, error) {
 	return c.loadInto(r, false)
+}
+
+// saveFileLimit returns SaveFile's size limit for path: the
+// [WithMaxSnapshotBytes] limit, else the default one when the cache
+// auto-loads path, else none (0).
+func (c *Cache[K, V]) saveFileLimit(path string) int64 {
+	if c.cfg.maxSnapshotBytes > 0 {
+		return c.cfg.maxSnapshotBytes
+	}
+	if c.cfg.autoLoadPath != "" && filepath.Clean(path) == filepath.Clean(c.cfg.autoLoadPath) {
+		return defaultMaxSnapshotBytes
+	}
+	return 0
 }
 
 // snapshotLimit returns the [WithMaxSnapshotBytes] limit, or the default.
@@ -289,7 +326,7 @@ func (c *Cache[K, V]) readSnapshot(r io.Reader) ([]entrySnapshot[K, V], error) {
 			return nil, &SnapshotError{
 				Op:      "load",
 				Message: fmt.Sprintf("encrypted version %d snapshots are not supported", info.Version),
-				Err:     ErrSnapshotIncompatible,
+				Err:     errEncryptedLegacy,
 			}
 		}
 		recCodec, enc = c.cfg.codec, nil

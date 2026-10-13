@@ -162,7 +162,7 @@ func (c *Cache[K, V]) Compute(
 			return zero, werr
 		}
 		c.replaceOrStoreLocked(s, e, key, newValue, weight)
-		c.noteStoreSetLocked(&sm, s, key, newValue)
+		c.noteStoreKeepLocked(&sm, s, key, newValue)
 		return newValue, nil
 	case ComputeDelete:
 		// Only fire EvictReasonComputed when fn saw the entry as
@@ -290,7 +290,7 @@ func (c *Cache[K, V]) ComputeIfPresent(
 			return zero, werr
 		}
 		c.replaceOrStoreLocked(s, e, key, newValue, weight)
-		c.noteStoreSetLocked(&sm, s, key, newValue)
+		c.noteStoreKeepLocked(&sm, s, key, newValue)
 		return newValue, nil
 	case ComputeDelete:
 		if e != nil {
@@ -344,7 +344,7 @@ func (c *Cache[K, V]) Update(key K, fn func(cur V) V) (_ V, err error) {
 		return zero, werr
 	}
 	c.replaceOrStoreLocked(s, e, key, newValue, weight)
-	c.noteStoreSetLocked(&sm, s, key, newValue)
+	c.noteStoreKeepLocked(&sm, s, key, newValue)
 	return newValue, nil
 }
 
@@ -381,7 +381,7 @@ func (c *Cache[K, V]) CompareAndSwap(key K, old, newValue V) (swapped bool) {
 		return false
 	}
 	c.replaceOrStoreLocked(s, e, key, newValue, weight)
-	c.noteStoreSetLocked(&sm, s, key, newValue)
+	c.noteStoreKeepLocked(&sm, s, key, newValue)
 	return true
 }
 

@@ -325,15 +325,14 @@ func (c *Cache[K, V]) applyPendingKey(s *shard[K, V], key K) {
 		return
 	}
 	var cbs []func()
-	unlock := c.lockKey(key)
+	defer func() { c.runCallbacks(cbs, s) }()
+	defer c.lockKey(key)()
 	s.mu.Lock()
 	op, ok := c.applyPendingKeyLocked(s, key)
 	c.releaseShardInto(s, &cbs)
 	if ok {
 		c.asyncStoreEffect(op)
 	}
-	unlock()
-	c.runCallbacks(cbs, s)
 }
 
 // applyAllPending applies every queued op before a method that works

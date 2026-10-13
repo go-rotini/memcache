@@ -3,6 +3,8 @@ package memcache
 import (
 	"context"
 	"errors"
+	"fmt"
+	"math/rand/v2"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -358,29 +360,357 @@ func TestTieredPromotesAStoreReadOfL2(t *testing.T) {
 	}
 }
 
-func TestLoadsDoNotWriteTheStore(t *testing.T) {
+func TestGetOrLoadDoesNotWriteTheStore(t *testing.T) {
 	ts := newTrackingStore(NewMemoryStore[string, int](nil))
 	loader := LoaderFunc[string, int](func(context.Context, string) (int, time.Duration, error) { return 1, 0, nil })
-	bulk := bulkLoaderFunc[string, int](func(_ context.Context, keys []string) (map[string]LoadResult[int], error) {
-		out := make(map[string]LoadResult[int], len(keys))
-		for _, k := range keys {
-			out[k] = LoadResult[int]{Value: 2}
-		}
-		return out, nil
-	})
-	c, _ := New[string, int](WithMaxEntries(10), WithStore(ts),
-		WithLoader(loader), WithBulkLoader(bulk))
+	c, _ := New[string, int](WithMaxEntries(10), WithStore(ts), WithLoader(loader))
 	defer c.Close()
 	if _, err := c.GetOrLoad(context.Background(), "a"); err != nil {
 		t.Fatal(err)
 	}
+	if n := ts.setCalls.Load(); n != 0 {
+		t.Fatalf("GetOrLoad wrote the Store %d times", n)
+	}
+}
+
+func constBulk(v int) BulkLoader[string, int] {
+	return bulkLoaderFunc[string, int](func(_ context.Context, keys []string) (map[string]LoadResult[int], error) {
+		out := make(map[string]LoadResult[int], len(keys))
+		for _, k := range keys {
+			out[k] = LoadResult[int]{Value: v, TTL: time.Minute}
+		}
+		return out, nil
+	})
+}
+
+func TestBulkLoadsWriteThroughToTheStore(t *testing.T) {
+	clk := NewFakeClock(time.Unix(1_000_000, 0))
+	st := NewMemoryStore[string, int](clk)
+	c, _ := New[string, int](WithMaxEntries(10), WithClock(clk), WithStore(st), WithBulkLoader(constBulk(2)))
+	defer c.Close()
 	if _, err := c.GetMultiOrLoad(context.Background(), []string{"b", "c"}); err != nil {
 		t.Fatal(err)
 	}
-	if n := ts.setCalls.Load(); n != 0 {
-		t.Fatalf("loads wrote the Store %d times", n)
+	for _, k := range []string{"b", "c"} {
+		v, ttl, ok, err := recordTTL(st, k)
+		if err != nil || !ok || v != 2 || ttl != time.Minute {
+			t.Fatalf("Store %s = %d, %v, %v, %v; want 2 with the result's 1m TTL", k, v, ttl, ok, err)
+		}
 	}
-	if v, ok := c.Peek("b"); !ok || v != 2 {
-		t.Fatalf("bulk-loaded value not cached: %d, %v", v, ok)
+	c.Clear()
+	if v, ok := c.Get("b"); !ok || v != 2 {
+		t.Fatalf("Get after Clear = %d, %v; want the Store's copy", v, ok)
+	}
+}
+
+// Bulk loads racing Sets and Deletes of the same keys: memory and the
+// Store must agree afterwards for every key.
+func TestBulkLoadWriteThroughKeepsOrder(t *testing.T) {
+	for _, async := range []bool{false, true} {
+		t.Run(fmt.Sprint("async=", async), func(t *testing.T) {
+			for round := range 20 {
+				st := NewMemoryStore[string, int](nil)
+				opts := []Option{WithMaxEntries(1000), WithStore(st), WithBulkLoader(constBulk(-1))}
+				if async {
+					opts = append(opts, WithAsyncWrites())
+				}
+				c, _ := New[string, int](opts...)
+				keys := []string{"a", "b", "c", "d", "e", "f"}
+				var wg sync.WaitGroup
+				for range 4 {
+					wg.Go(func() {
+						for range 200 {
+							_, _ = c.GetMultiOrLoad(context.Background(), keys)
+						}
+					})
+				}
+				for range 2 {
+					wg.Go(func() {
+						for i := range 200 {
+							k := keys[rand.IntN(len(keys))]
+							if rand.IntN(2) == 0 {
+								_ = c.Set(k, i)
+							} else {
+								c.Delete(k)
+							}
+						}
+					})
+				}
+				wg.Wait()
+				_ = c.Sync(context.Background())
+				for _, k := range keys {
+					mv, mok := c.Peek(k)
+					sv, sok, _ := st.Get(context.Background(), k)
+					if mok && (!sok || mv != sv) {
+						t.Fatalf("round %d key %s: memory=%d store=%d,%v", round, k, mv, sv, sok)
+					}
+				}
+				_ = c.Close()
+			}
+		})
+	}
+}
+
+// A Set that lands while GetMultiOrLoad is still looking the key up
+// (here, in a slow Store read) is newer than the bulk load that follows.
+func TestBulkLoadDoesNotOverwriteAWriteDuringTheLookup(t *testing.T) {
+	gs := newGateStore()
+	bulk := bulkLoaderFunc[string, string](func(_ context.Context, keys []string) (map[string]LoadResult[string], error) {
+		out := make(map[string]LoadResult[string], len(keys))
+		for _, k := range keys {
+			out[k] = LoadResult[string]{Value: "loaded"}
+		}
+		return out, nil
+	})
+	c, _ := New[string, string](WithMaxEntries(10), WithStore(gs), WithBulkLoader(bulk))
+	defer c.Close()
+	done := make(chan map[string]string, 1)
+	go func() {
+		out, _ := c.GetMultiOrLoad(context.Background(), []string{"k"})
+		done <- out
+	}()
+	<-gs.entered // the lookup's Store read found nothing and is held
+	if err := c.Set("k", "new"); err != nil {
+		t.Fatal(err)
+	}
+	close(gs.release)
+	if out := <-done; out["k"] != "loaded" {
+		t.Fatalf("GetMultiOrLoad = %v; want the loaded value returned", out)
+	}
+	if v, ok := c.Peek("k"); !ok || v != "new" {
+		t.Fatalf("memory holds %q, %v; want the newer Set", v, ok)
+	}
+	if v, _, _ := gs.MemoryStore.Get(context.Background(), "k"); v != "new" {
+		t.Fatalf("Store holds %q; want the newer Set", v)
+	}
+}
+
+// errGateStore is a gateStore whose reads fail with the Store's own
+// deadline once released, while the callers' contexts are fine.
+type errGateStore struct{ *gateStore }
+
+func (g errGateStore) Get(ctx context.Context, key string) (string, bool, error) {
+	if _, _, err := g.gateStore.Get(ctx, key); err != nil {
+		return "", false, err
+	}
+	return "", false, context.DeadlineExceeded
+}
+
+func TestReadThroughSharesAStoreTimeout(t *testing.T) {
+	gs := errGateStore{newGateStore()}
+	c, _ := New[string, string](WithMaxEntries(10), WithStore[string, string](gs))
+	defer c.Close()
+	const readers = 20
+	errs := make(chan error, readers)
+	go func() {
+		_, _, err := c.GetCtx(context.Background(), "k")
+		errs <- err
+	}()
+	<-gs.entered
+	for range readers - 1 {
+		go func() {
+			_, _, err := c.GetCtx(context.Background(), "k")
+			errs <- err
+		}()
+	}
+	time.Sleep(50 * time.Millisecond) // let the other readers join the read
+	close(gs.release)
+	for range readers {
+		if err := <-errs; !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("err = %v, want the Store's DeadlineExceeded", err)
+		}
+	}
+	if n := gs.gets.Load(); n != 1 {
+		t.Fatalf("%d readers made %d Store reads; a Store timeout should be shared, not retried", readers, n)
+	}
+}
+
+// hideTTL is a Store that doesn't implement TTLStore.
+type hideTTL[K comparable, V any] struct{ Store[K, V] }
+
+func TestKeepWritesKeepTheStoreRecordTTL(t *testing.T) {
+	writes := map[string]func(c *Cache[string, int]) error{
+		"Increment": func(c *Cache[string, int]) error { _, err := Increment(c, "rl"); return err },
+		"Compute": func(c *Cache[string, int]) error {
+			_, err := c.Compute("rl", func(v int, _ bool) (int, ComputeAction, error) { return v + 1, ComputeStore, nil })
+			return err
+		},
+		"Update": func(c *Cache[string, int]) error {
+			_, err := c.Update("rl", func(v int) int { return v + 1 })
+			return err
+		},
+		"CompareAndSwap": func(c *Cache[string, int]) error {
+			if !c.CompareAndSwap("rl", 1, 2) {
+				return errors.New("no swap")
+			}
+			return nil
+		},
+	}
+	for name, write := range writes {
+		for _, defTTL := range []time.Duration{0, time.Hour} {
+			t.Run(fmt.Sprint(name, "/default=", defTTL), func(t *testing.T) {
+				clk := NewFakeClock(time.Unix(1_000_000, 0))
+				st := NewMemoryStore[string, int](clk)
+				c, _ := New[string, int](WithMaxEntries(10), WithClock(clk), WithStore(st),
+					WithDefaultTTL(defTTL), WithTTLJitter(0))
+				defer c.Close()
+				if err := c.SetWithTTL("rl", 1, time.Minute); err != nil {
+					t.Fatal(err)
+				}
+				clk.Advance(10 * time.Second)
+				c.Clear() // memory only: the Store keeps the record and its TTL
+				if err := write(c); err != nil {
+					t.Fatal(err)
+				}
+				v, ttl, ok, _ := recordTTL(st, "rl")
+				if !ok || v != 2 || ttl != 50*time.Second {
+					t.Fatalf("Store = %d, %v, %v; want 2 with the record's 50s left", v, ttl, ok)
+				}
+				if left, ok := c.TTL("rl"); !ok || left <= 0 || left > 50*time.Second {
+					t.Fatalf("memory TTL = %v, %v; want no later than the Store record", left, ok)
+				}
+			})
+		}
+	}
+}
+
+func TestStorePromotionExpiresWithTheStoreRecord(t *testing.T) {
+	clk := NewFakeClock(time.Unix(1_000_000, 0))
+	st := NewMemoryStore[string, int](clk)
+	_ = st.Set(context.Background(), "short", 1, time.Minute)
+	_ = st.Set(context.Background(), "long", 1, 2*time.Hour)
+	_ = st.Set(context.Background(), "forever", 1, 0)
+	c, _ := New[string, int](WithMaxEntries(10), WithClock(clk), WithStore(st),
+		WithDefaultTTL(time.Hour), WithTTLJitter(0))
+	defer c.Close()
+	for key, want := range map[string]time.Duration{"short": time.Minute, "long": time.Hour, "forever": time.Hour} {
+		if _, ok := c.Get(key); !ok {
+			t.Fatalf("Get(%s) missed", key)
+		}
+		if got, _ := c.TTL(key); got != want {
+			t.Errorf("%s: promoted TTL = %v, want %v", key, got, want)
+		}
+	}
+}
+
+func TestKeepWriteWithoutTTLStoreUsesTheCopysTTL(t *testing.T) {
+	clk := NewFakeClock(time.Unix(1_000_000, 0))
+	st := NewMemoryStore[string, int](clk)
+	c, _ := New[string, int](WithMaxEntries(10), WithClock(clk), WithStore[string, int](hideTTL[string, int]{st}),
+		WithDefaultTTL(time.Hour), WithTTLJitter(0))
+	defer c.Close()
+	_ = c.SetWithTTL("rl", 1, time.Minute)
+	c.Clear()
+	if _, err := Increment(c, "rl"); err != nil {
+		t.Fatal(err)
+	}
+	if v, ttl, ok, _ := recordTTL(st, "rl"); !ok || v != 2 || ttl != time.Hour {
+		t.Fatalf("Store = %d, %v, %v; want 2 with the promoted copy's 1h", v, ttl, ok)
+	}
+}
+
+// recordTTL reads key's value and remaining TTL from st.
+func recordTTL[V any](st *MemoryStore[string, V], key string) (V, time.Duration, bool, error) {
+	v, ok, err := st.Get(context.Background(), key)
+	if err != nil || !ok {
+		return v, 0, ok, err
+	}
+	ttl, ok, err := st.TTL(context.Background(), key)
+	return v, ttl, ok, err
+}
+
+func TestMemoryStoreTTLLookup(t *testing.T) {
+	clk := NewFakeClock(time.Unix(1_000_000, 0))
+	st := NewMemoryStore[string, int](clk)
+	ctx := context.Background()
+	_ = st.Set(ctx, "ttl", 1, time.Minute)
+	_ = st.Set(ctx, "none", 2, 0)
+	clk.Advance(20 * time.Second)
+	if ttl, ok, err := st.TTL(ctx, "ttl"); err != nil || !ok || ttl != 40*time.Second {
+		t.Fatalf("ttl = %v, %v, %v", ttl, ok, err)
+	}
+	if ttl, ok, err := st.TTL(ctx, "none"); err != nil || !ok || ttl != 0 {
+		t.Fatalf("none = %v, %v, %v", ttl, ok, err)
+	}
+	if _, ok, _ := st.TTL(ctx, "absent"); ok {
+		t.Fatal("absent key found")
+	}
+	clk.Advance(time.Minute)
+	if _, ok, _ := st.TTL(ctx, "ttl"); ok {
+		t.Fatal("expired record found")
+	}
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, _, err := st.TTL(canceled, "none"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled ctx err = %v", err)
+	}
+	_ = st.Close()
+	if _, _, err := st.TTL(ctx, "none"); !errors.Is(err, ErrClosed) {
+		t.Fatalf("closed err = %v", err)
+	}
+}
+
+// countingGetStore embeds MemoryStore and overrides only Get, as a
+// metrics or auth wrapper would.
+type countingGetStore struct {
+	*MemoryStore[string, int]
+	gets atomic.Int32
+}
+
+func (s *countingGetStore) Get(ctx context.Context, key string) (int, bool, error) {
+	s.gets.Add(1)
+	return s.MemoryStore.Get(ctx, key)
+}
+
+// The cache reads values with Get even from a TTLStore, so a Get
+// override on a type embedding MemoryStore is still called, and the
+// inherited TTL lookup still keeps the record's expiry.
+func TestTTLStoreValuesAreReadWithGet(t *testing.T) {
+	clk := NewFakeClock(time.Unix(1_000_000, 0))
+	st := &countingGetStore{MemoryStore: NewMemoryStore[string, int](clk)}
+	_ = st.MemoryStore.Set(context.Background(), "k", 1, time.Minute)
+	c, _ := New[string, int](WithMaxEntries(10), WithClock(clk), WithStore[string, int](st), WithTTLJitter(0))
+	defer c.Close()
+	if v, ok := c.Get("k"); !ok || v != 1 {
+		t.Fatalf("Get = %d, %v", v, ok)
+	}
+	c.Clear()
+	if _, err := Increment(c, "k"); err != nil {
+		t.Fatal(err)
+	}
+	if n := st.gets.Load(); n != 2 {
+		t.Fatalf("the Store's Get was called %d times, want 2", n)
+	}
+	if v, ttl, ok, _ := recordTTL(st.MemoryStore, "k"); !ok || v != 2 || ttl != time.Minute {
+		t.Fatalf("Store = %d, %v, %v; want 2 with the record's 1m", v, ttl, ok)
+	}
+}
+
+// failTTLStore is a TTLStore whose TTL lookup fails.
+type failTTLStore struct{ *MemoryStore[string, int] }
+
+func (failTTLStore) TTL(context.Context, string) (time.Duration, bool, error) {
+	return 0, false, errors.New("ttl down")
+}
+
+func TestFailedTTLLookupFallsBackToTheDefaultTTL(t *testing.T) {
+	clk := NewFakeClock(time.Unix(1_000_000, 0))
+	ms := NewMemoryStore[string, int](clk)
+	_ = ms.Set(context.Background(), "k", 1, time.Minute)
+	c, _ := New[string, int](WithMaxEntries(10), WithClock(clk), WithStore[string, int](failTTLStore{ms}),
+		WithDefaultTTL(time.Hour), WithTTLJitter(0))
+	defer c.Close()
+	if v, ok := c.Get("k"); !ok || v != 1 {
+		t.Fatalf("Get = %d, %v; a failed TTL lookup must not fail the read", v, ok)
+	}
+	if ttl, _ := c.TTL("k"); ttl != time.Hour {
+		t.Fatalf("promoted TTL = %v, want the default 1h", ttl)
+	}
+	c.Clear()
+	if _, err := Increment(c, "k"); err != nil {
+		t.Fatal(err)
+	}
+	if v, ttl, ok, _ := recordTTL(ms, "k"); !ok || v != 2 || ttl != time.Hour {
+		t.Fatalf("Store = %d, %v, %v; want 2 with the promoted copy's 1h", v, ttl, ok)
 	}
 }

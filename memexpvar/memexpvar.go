@@ -43,6 +43,10 @@ type slot struct {
 // reports the new src from then on, so a cache that replaces a closed
 // one can take over its name. A name that something other than Publish
 // registered in expvar is an error.
+//
+// The name keeps reporting src, and holds a reference to it, until it is
+// published again or [Unpublish] is called; call Unpublish when closing
+// a cache that nothing replaces.
 func Publish(name string, src Source) error {
 	if name == "" || src == nil {
 		return errNoSource
@@ -62,6 +66,22 @@ func Publish(name string, src Source) error {
 	s.src = src
 	s.mu.Unlock()
 	return nil
+}
+
+// Unpublish stops name reporting the source Publish gave it and drops
+// the reference to it; the name then reports {}. expvar can't remove a
+// name, so it stays listed, and a later Publish under it reports again.
+// Unpublish of a name Publish never registered does nothing.
+func Unpublish(name string) {
+	mu.Lock()
+	s := slots[name]
+	mu.Unlock()
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.src = nil
+	s.mu.Unlock()
 }
 
 // statsJSON is the published form of [memcache.Stats].
@@ -89,6 +109,9 @@ func (s *slot) String() string {
 	s.mu.Lock()
 	src := s.src
 	s.mu.Unlock()
+	if src == nil {
+		return "{}"
+	}
 	st := src.Stats()
 	b, err := json.Marshal(statsJSON{
 		Hits:            st.Hits,

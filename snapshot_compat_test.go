@@ -3,10 +3,14 @@ package memcache
 import (
 	"bytes"
 	"errors"
+	"io"
+	"log/slog"
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 // goldenRec is the value type of the testdata/v2 snapshots, which the
@@ -138,5 +142,92 @@ func TestSnapshotWeightsAreClamped(t *testing.T) {
 	_ = c.SetWithOptions("c", "3", SetWeight(math.MaxInt64))
 	if got := c.Bytes(); got <= 0 {
 		t.Fatalf("Bytes overflowed to %d", got)
+	}
+}
+
+// An encrypted v2 snapshot at the auto-load path, as v1.0.2 left it, is
+// skipped with a warning: New starts empty and the next save replaces it.
+func TestAutoLoadSkipsAnEncryptedV2Snapshot(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("testdata", "v2", "enc.v2"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "cache.snap")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var logs bytes.Buffer
+	codec := goldenCodecs(t)["enc"]
+	c, err := New[string, goldenRec](WithMaxEntries(100), WithCodec(codec),
+		WithLogger(slog.New(slog.NewTextHandler(&logs, nil))),
+		WithAutoLoad(path), WithAutoSave(path, time.Hour))
+	if err != nil {
+		t.Fatalf("New = %v; want an encrypted v2 snapshot skipped", err)
+	}
+	if c.Len() != 0 || !strings.Contains(logs.String(), "level=WARN") {
+		t.Fatalf("Len = %d, log %q; want an empty cache and a warning", c.Len(), logs.String())
+	}
+	_ = c.Set("k", goldenRec{Name: "n"})
+	if err := c.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if info, err := InspectSnapshot(path); err != nil || info.Version != snapshotVersion {
+		t.Fatalf("after Close the file is %+v, %v; want a v%d snapshot", info, err, snapshotVersion)
+	}
+	c2, err := New[string, goldenRec](WithMaxEntries(100), WithCodec(codec), WithAutoLoad(path))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+	if v, ok := c2.Get("k"); !ok || v.Name != "n" {
+		t.Fatalf("restart Get = %+v, %v", v, ok)
+	}
+	// Other load errors still fail New.
+	if err := os.WriteFile(path, []byte("not a snapshot"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New[string, goldenRec](WithMaxEntries(100), WithCodec(codec), WithAutoLoad(path)); err == nil {
+		t.Fatal("New with a corrupt auto-load file succeeded")
+	}
+}
+
+func TestSaveSizeLimitAppliesOnlyWhenAsked(t *testing.T) {
+	defer func(old int64) { defaultMaxSnapshotBytes = old }(defaultMaxSnapshotBytes)
+	defaultMaxSnapshotBytes = 1 << 10
+	dir := t.TempDir()
+	autoPath := filepath.Join(dir, "auto.snap")
+	fill := func(c *Cache[int, []byte]) {
+		for i := range 8 {
+			_ = c.Set(i, bytes.Repeat([]byte{'x'}, 512))
+		}
+	}
+	c, _ := New[int, []byte](WithMaxEntries(100), WithCodec(RawCodec{}), WithAutoLoad(autoPath))
+	defer c.Close()
+	fill(c)
+	var buf bytes.Buffer
+	if err := c.Save(&buf); err != nil || buf.Len() <= 1<<10 {
+		t.Fatalf("Save past the default limit = %d bytes, %v; want no limit", buf.Len(), err)
+	}
+	if err := c.SaveFile(filepath.Join(dir, "other.snap")); err != nil {
+		t.Fatalf("SaveFile to another path = %v; want no limit", err)
+	}
+	if err := os.WriteFile(autoPath, []byte("old"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.SaveFile(autoPath); !errors.Is(err, ErrSnapshotTooLarge) {
+		t.Fatalf("SaveFile to the auto-load path = %v; want ErrSnapshotTooLarge", err)
+	}
+	if b, _ := os.ReadFile(autoPath); string(b) != "old" {
+		t.Fatal("a failed SaveFile replaced the old file")
+	}
+
+	limited, _ := New[int, []byte](WithMaxEntries(100), WithCodec(RawCodec{}), WithMaxSnapshotBytes(2<<10))
+	defer limited.Close()
+	fill(limited)
+	if err := limited.Save(io.Discard); !errors.Is(err, ErrSnapshotTooLarge) {
+		t.Fatalf("Save past WithMaxSnapshotBytes = %v; want ErrSnapshotTooLarge", err)
+	}
+	if err := limited.SaveFile(filepath.Join(dir, "limited.snap")); !errors.Is(err, ErrSnapshotTooLarge) {
+		t.Fatalf("SaveFile past WithMaxSnapshotBytes = %v; want ErrSnapshotTooLarge", err)
 	}
 }
