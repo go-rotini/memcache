@@ -46,10 +46,9 @@ type Store[K comparable, V any] interface {
 
 // TTLStore is a [Store] that can also report the TTL a record has left.
 // A Cache still reads values with Get; it calls TTL after a Get hit when
-// it copies the record into memory, and when a write that keeps a key's
-// expiry updates a key read from the Store, so it can keep the record's
-// expiry; see [WithStore]. That is one extra Store call per promotion and
-// per such write.
+// it copies the record into memory, and before a write that keeps a
+// key's expiry, so it can keep the record's expiry; see [WithStore].
+// That is one extra Store call per promotion and per such write.
 type TTLStore[K comparable, V any] interface {
 	Store[K, V]
 

@@ -336,6 +336,87 @@ func TestRecoveredPanicsInUserCodeReleaseLocks(t *testing.T) {
 	}
 }
 
+// readPanicStore is a MemoryStore whose Get and TTL panic on demand.
+type readPanicStore struct {
+	*MemoryStore[string, int]
+	panicGet, panicTTL *atomic.Bool
+}
+
+func (p readPanicStore) Get(ctx context.Context, k string) (int, bool, error) {
+	if p.panicGet.Load() {
+		panic("store Get")
+	}
+	return p.MemoryStore.Get(ctx, k)
+}
+
+func (p readPanicStore) TTL(ctx context.Context, k string) (time.Duration, bool, error) {
+	if p.panicTTL.Load() {
+		panic("store TTL")
+	}
+	return p.MemoryStore.TTL(ctx, k)
+}
+
+// A conditional write reads a key only the Store holds with the shard
+// unlocked; a panic from the Store or the Weigher there, recovered by the
+// caller, leaves the shard usable.
+func TestRecoveredPanicsWhileReadingTheStoreReleaseLocks(t *testing.T) {
+	ops := map[string]func(c *Cache[string, int]){
+		"Compute": func(c *Cache[string, int]) {
+			_, _ = c.Compute("s", func(v int, _ bool) (int, ComputeAction, error) { return v + 1, ComputeStore, nil })
+		},
+		"ComputeIfAbsent": func(c *Cache[string, int]) {
+			_, _, _ = c.ComputeIfAbsent("s", func() (int, time.Duration, error) { return 1, 0, nil })
+		},
+		"ComputeIfPresent": func(c *Cache[string, int]) {
+			_, _ = c.ComputeIfPresent("s", func(v int) (int, ComputeAction, error) { return v + 1, ComputeStore, nil })
+		},
+		"Update":         func(c *Cache[string, int]) { _, _ = c.Update("s", func(v int) int { return v + 1 }) },
+		"CompareAndSwap": func(c *Cache[string, int]) { c.CompareAndSwap("s", 1, 2) },
+		"Increment":      func(c *Cache[string, int]) { _, _ = Increment(c, "s") },
+		"SetIfAbsent":    func(c *Cache[string, int]) { _, _ = c.SetIfAbsent("s", 2) },
+		"SetIfPresent":   func(c *Cache[string, int]) { _, _ = c.SetIfPresent("s", 2) },
+		"GetOrSet":       func(c *Cache[string, int]) { _, _, _ = c.GetOrSet("s", 2) },
+		"PeekOrAdd":      func(c *Cache[string, int]) { _, _, _ = c.PeekOrAdd("s", 2) },
+		"DeleteIf":       func(c *Cache[string, int]) { c.DeleteIf("s", func(int) bool { return true }) },
+	}
+	for _, source := range []string{"Get", "TTL", "Weigher"} {
+		for name, op := range ops {
+			t.Run(source+"/"+name, func(t *testing.T) {
+				var panicGet, panicTTL, panicWeigh atomic.Bool
+				st := NewMemoryStore[string, int](nil)
+				c, _ := New[string, int](WithMaxEntries(10), WithShards(1),
+					WithStore[string, int](readPanicStore{st, &panicGet, &panicTTL}),
+					WithWeigher(func(int) int64 {
+						if panicWeigh.Load() {
+							panic("weigher")
+						}
+						return 1
+					}))
+				_ = st.Set(context.Background(), "s", 1, time.Hour)
+				map[string]*atomic.Bool{"Get": &panicGet, "TTL": &panicTTL, "Weigher": &panicWeigh}[source].Store(true)
+				finishes(t, "the panicking call", func() {
+					defer func() {
+						if recover() == nil {
+							t.Error("nothing panicked")
+						}
+					}()
+					op(c)
+				})
+				panicGet.Store(false)
+				panicTTL.Store(false)
+				panicWeigh.Store(false)
+				finishes(t, "using the shard after the panic", func() {
+					c.Get("s")
+					_ = c.Set("x", 5)
+					op(c)
+					c.Delete("x")
+				})
+				_ = c.Close()
+			})
+		}
+	}
+}
+
 var prefixPanics atomic.Bool
 
 // panicPrefixKey is a Prefixer key whose HasPrefix panics on demand.

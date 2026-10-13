@@ -241,10 +241,21 @@ func (c *Cache[K, V]) saveFileLimit(path string) int64 {
 	if c.cfg.maxSnapshotBytes > 0 {
 		return c.cfg.maxSnapshotBytes
 	}
-	if c.cfg.autoLoadPath != "" && filepath.Clean(path) == filepath.Clean(c.cfg.autoLoadPath) {
+	if c.cfg.autoLoadPath != "" && samePath(path, c.cfg.autoLoadPath) {
 		return defaultMaxSnapshotBytes
 	}
 	return 0
+}
+
+// samePath reports whether a and b name the same file path, relative
+// paths taken from the working directory.
+func samePath(a, b string) bool {
+	if filepath.Clean(a) == filepath.Clean(b) {
+		return true
+	}
+	absA, errA := filepath.Abs(a)
+	absB, errB := filepath.Abs(b)
+	return errA == nil && errB == nil && absA == absB
 }
 
 // snapshotLimit returns the [WithMaxSnapshotBytes] limit, or the default.

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math/rand/v2"
 	"sync"
 	"sync/atomic"
@@ -574,6 +575,57 @@ func TestKeepWritesKeepTheStoreRecordTTL(t *testing.T) {
 	}
 }
 
+// A Get that promotes a key gives the copy the shorter default TTL; a
+// later keep-expiry write still keeps the Store record's longer TTL.
+func TestKeepWritesAfterPromotionKeepTheStoreRecordTTL(t *testing.T) {
+	writes := map[string]func(c *Cache[string, int], key string) error{
+		"Increment": func(c *Cache[string, int], key string) error { _, err := Increment(c, key); return err },
+		"Compute": func(c *Cache[string, int], key string) error {
+			_, err := c.Compute(key, func(v int, _ bool) (int, ComputeAction, error) { return v + 1, ComputeStore, nil })
+			return err
+		},
+		"ComputeIfPresent": func(c *Cache[string, int], key string) error {
+			_, err := c.ComputeIfPresent(key, func(v int) (int, ComputeAction, error) { return v + 1, ComputeStore, nil })
+			return err
+		},
+		"Update": func(c *Cache[string, int], key string) error {
+			_, err := c.Update(key, func(v int) int { return v + 1 })
+			return err
+		},
+		"CompareAndSwap": func(c *Cache[string, int], key string) error {
+			if !c.CompareAndSwap(key, 1, 2) {
+				return errors.New("no swap")
+			}
+			return nil
+		},
+	}
+	for name, write := range writes {
+		for record, want := range map[time.Duration]time.Duration{time.Hour: time.Hour - 10*time.Second, 0: 0} {
+			t.Run(fmt.Sprint(name, "/record=", record), func(t *testing.T) {
+				clk := NewFakeClock(time.Unix(1_000_000, 0))
+				st := NewMemoryStore[string, int](clk)
+				c, _ := New[string, int](WithMaxEntries(10), WithClock(clk), WithStore(st),
+					WithDefaultTTL(time.Minute), WithTTLJitter(0))
+				defer c.Close()
+				_ = st.Set(context.Background(), "rl", 1, record)
+				if _, ok := c.Get("rl"); !ok {
+					t.Fatal("Get missed")
+				}
+				clk.Advance(10 * time.Second)
+				if err := write(c, "rl"); err != nil {
+					t.Fatal(err)
+				}
+				if v, ttl, ok, _ := recordTTL(st, "rl"); !ok || v != 2 || ttl != want {
+					t.Fatalf("Store = %d, %v, %v; want 2 with %v left", v, ttl, ok, want)
+				}
+				if left, ok := c.TTL("rl"); !ok || left != 50*time.Second {
+					t.Fatalf("memory TTL = %v, %v; want the copy's 50s", left, ok)
+				}
+			})
+		}
+	}
+}
+
 func TestStorePromotionExpiresWithTheStoreRecord(t *testing.T) {
 	clk := NewFakeClock(time.Unix(1_000_000, 0))
 	st := NewMemoryStore[string, int](clk)
@@ -693,6 +745,33 @@ func (failTTLStore) TTL(context.Context, string) (time.Duration, bool, error) {
 	return 0, false, errors.New("ttl down")
 }
 
+// goneTTLStore is a TTLStore whose records are gone by the TTL lookup.
+type goneTTLStore struct{ *MemoryStore[string, int] }
+
+func (goneTTLStore) TTL(context.Context, string) (time.Duration, bool, error) {
+	return 0, false, nil
+}
+
+// A record that expires between the Get and the TTL lookup is returned
+// but not copied into memory.
+func TestStoreRecordGoneAtTheTTLLookupIsNotPromoted(t *testing.T) {
+	ms := NewMemoryStore[string, int](nil)
+	_ = ms.Set(context.Background(), "k", 1, time.Minute)
+	_ = ms.Set(context.Background(), "n", 1, time.Minute)
+	c, _ := New[string, int](WithMaxEntries(10), WithStore[string, int](goneTTLStore{ms}),
+		WithDefaultTTL(time.Hour))
+	defer c.Close()
+	if v, ok := c.Get("k"); !ok || v != 1 {
+		t.Fatalf("Get = %d, %v; want the value the Store returned", v, ok)
+	}
+	if v, ok, err := c.GetOrSet("n", 5); err != nil || !ok || v != 1 {
+		t.Fatalf("GetOrSet = %d, %v, %v; want the Store's value", v, ok, err)
+	}
+	if n := c.Len(); n != 0 {
+		t.Fatalf("Len = %d; a record the Store reports gone was promoted", n)
+	}
+}
+
 func TestFailedTTLLookupFallsBackToTheDefaultTTL(t *testing.T) {
 	clk := NewFakeClock(time.Unix(1_000_000, 0))
 	ms := NewMemoryStore[string, int](clk)
@@ -712,5 +791,19 @@ func TestFailedTTLLookupFallsBackToTheDefaultTTL(t *testing.T) {
 	}
 	if v, ttl, ok, _ := recordTTL(ms, "k"); !ok || v != 2 || ttl != time.Hour {
 		t.Fatalf("Store = %d, %v, %v; want 2 with the promoted copy's 1h", v, ttl, ok)
+	}
+}
+
+// A bulk-loaded value that reaches a cache closed meanwhile is dropped
+// without a warning.
+func TestBulkLoadedValueAfterCloseIsNotWarned(t *testing.T) {
+	var buf syncBuffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	c, _ := New[string, int](WithMaxEntries(10), WithLogger(logger),
+		WithStore[string, int](NewMemoryStore[string, int](nil)))
+	_ = c.Close()
+	c.storeBulkLoaded("k", 1, 0, &watchToken{})
+	if out := buf.String(); out != "" {
+		t.Fatalf("logged %q; want nothing", out)
 	}
 }

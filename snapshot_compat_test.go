@@ -137,7 +137,7 @@ func TestSnapshotWeightsAreClamped(t *testing.T) {
 		t.Fatalf("Load = %d, %v", n, err)
 	}
 	if got := c.Bytes(); got != 2*maxEntryWeight {
-		t.Fatalf("Bytes = %d, want %d", got, 2*maxEntryWeight)
+		t.Fatalf("Bytes = %d, want %d", got, int64(2*maxEntryWeight))
 	}
 	_ = c.SetWithOptions("c", "3", SetWeight(math.MaxInt64))
 	if got := c.Bytes(); got <= 0 {
@@ -229,5 +229,31 @@ func TestSaveSizeLimitAppliesOnlyWhenAsked(t *testing.T) {
 	}
 	if err := limited.SaveFile(filepath.Join(dir, "limited.snap")); !errors.Is(err, ErrSnapshotTooLarge) {
 		t.Fatalf("SaveFile past WithMaxSnapshotBytes = %v; want ErrSnapshotTooLarge", err)
+	}
+}
+
+// The auto-load path and a SaveFile path match when one is relative and
+// the other absolute.
+func TestSaveFileLimitMatchesRelativeAndAbsolutePaths(t *testing.T) {
+	defer func(old int64) { defaultMaxSnapshotBytes = old }(defaultMaxSnapshotBytes)
+	defaultMaxSnapshotBytes = 1 << 10
+	dir := t.TempDir()
+	t.Chdir(dir)
+	abs := func(name string) string {
+		p, err := filepath.Abs(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	for _, paths := range [][2]string{{"a.snap", abs("a.snap")}, {abs("b.snap"), "./b.snap"}} {
+		c, _ := New[int, []byte](WithMaxEntries(100), WithCodec(RawCodec{}), WithAutoLoad(paths[0]))
+		for i := range 8 {
+			_ = c.Set(i, bytes.Repeat([]byte{'x'}, 512))
+		}
+		if err := c.SaveFile(paths[1]); !errors.Is(err, ErrSnapshotTooLarge) {
+			t.Errorf("auto-load %q, SaveFile(%q) = %v; want ErrSnapshotTooLarge", paths[0], paths[1], err)
+		}
+		_ = c.Close()
 	}
 }

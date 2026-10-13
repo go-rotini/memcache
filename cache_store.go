@@ -157,8 +157,9 @@ func (c *Cache[K, V]) freshEntryLocked(s *shard[K, V], key K) *entry[K, V] {
 
 // storeGet reads key from the Store with Get. On a hit from a
 // [TTLStore], expireAt is when the record expires on the cache's clock,
-// or 0 when it doesn't; otherwise, or when the TTL lookup fails or finds
-// no record, it is -1, for not known.
+// 0 when it doesn't, or storeRecordGone when the TTL lookup finds no
+// record; otherwise, or when the TTL lookup fails, it is -1, for not
+// known.
 func (c *Cache[K, V]) storeGet(ctx context.Context, key K) (value V, ok bool, expireAt int64, err error) {
 	value, ok, err = c.store.Get(ctx, key)
 	if err != nil || !ok {
@@ -175,13 +176,23 @@ func (c *Cache[K, V]) storeExpireAt(ctx context.Context, key K) int64 {
 	}
 	ttl, found, err := c.ttlStore.TTL(ctx, key)
 	switch {
-	case err != nil || !found:
+	case err != nil:
 		return -1
+	case !found:
+		return storeRecordGone
 	case ttl > 0:
 		return c.cfg.clock.Now().UnixNano() + int64(ttl)
 	}
 	return 0
 }
+
+// storeRecordGone is storeExpireAt's result when the record expired or
+// was deleted between the Get and the TTL lookup.
+const storeRecordGone = -2
+
+// errStoreRecordGone declines the promotion of a value whose Store record
+// is gone.
+var errStoreRecordGone = errors.New("memcache: store record expired before promotion")
 
 // promotion is a Store value checked against the cache's limits, ready
 // to be inserted under the shard lock. err is why it can't be.
@@ -197,6 +208,9 @@ type promotion[V any] struct {
 // preparePromotion weighs and tags a Store value outside the shard lock,
 // since both may run user code.
 func (c *Cache[K, V]) preparePromotion(key K, value V, expireAt int64) promotion[V] {
+	if expireAt == storeRecordGone {
+		return promotion[V]{value: value, expireAt: -1, err: errStoreRecordGone}
+	}
 	p := promotion[V]{value: value, tags: c.autoTags(value), expireAt: expireAt}
 	if p.err = c.checkKeySize(key); p.err != nil {
 		return p
@@ -258,12 +272,21 @@ func (c *Cache[K, V]) currentLocked(
 		return nil, zero, false, nil
 	}
 	c.releaseShardInto(s, cbs)
+	// The caller's deferred release unlocks s.mu, so a panic in the
+	// Store or in user code must not leave it unlocked.
+	relocked := false
+	defer func() {
+		if !relocked {
+			s.mu.Lock()
+		}
+	}()
 	value, ok, expireAt, err := c.storeGet(context.Background(), key)
 	var p promotion[V]
 	if err == nil && ok {
 		p = c.preparePromotion(key, value, expireAt)
 	}
 	s.mu.Lock()
+	relocked = true
 	// An async write queued meanwhile is newer than the Store's value,
 	// and so is anything a loader stored.
 	sm.pending, sm.hasPending = c.applyPendingKeyLocked(s, key)
@@ -368,6 +391,10 @@ type storeMirror[K comparable, V any] struct {
 	// reports it.
 	fromStore     bool
 	storeExpireAt int64
+	// keepStoreTTL is set for a keep-expiry write of a key this call
+	// didn't read from the [TTLStore]: the set keeps the record's TTL,
+	// looked up before the write.
+	keepStoreTTL bool
 }
 
 // noteStoreSetLocked records that value was stored under key, with the
@@ -387,11 +414,14 @@ func (c *Cache[K, V]) noteStoreSetLocked(m *storeMirror[K, V], s *shard[K, V], k
 }
 
 // noteStoreKeepLocked is noteStoreSetLocked for a write that keeps the
-// key's expiry: a key read from a [TTLStore] by the same call keeps the
-// Store record's TTL, which may differ from the in-memory copy's.
+// key's expiry: with a [TTLStore], the write keeps the Store record's
+// TTL, which may differ from the in-memory copy's. A key the same call
+// read from the Store uses the TTL it read; otherwise mirrorToStore
+// looks the TTL up.
 func (c *Cache[K, V]) noteStoreKeepLocked(m *storeMirror[K, V], s *shard[K, V], key K, value V) {
 	if !m.fromStore || m.storeExpireAt < 0 {
 		c.noteStoreSetLocked(m, s, key, value)
+		m.keepStoreTTL = !m.fromStore && c.ttlStore != nil
 		return
 	}
 	m.set, m.value, m.ttl = true, value, 0
@@ -409,6 +439,12 @@ func (c *Cache[K, V]) mirrorToStore(key K, m *storeMirror[K, V], cbs *[]func()) 
 	}
 	switch {
 	case m.set:
+		if m.keepStoreTTL {
+			// A missing record or a failed lookup keeps the in-memory TTL.
+			if ttl, found, err := c.ttlStore.TTL(context.Background(), key); err == nil && found {
+				m.ttl = ttl
+			}
+		}
 		return c.propagateSetToStore(context.Background(), key, m.value, m.ttl, cbs)
 	case m.del:
 		return c.deleteThroughStore(context.Background(), key)

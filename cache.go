@@ -3488,7 +3488,7 @@ func (c *Cache[K, V]) storeBulkLoaded(key K, value V, ttl time.Duration, w *watc
 			opts = append(opts, SetTTL(ttl))
 		}
 		err := c.SetWithOptions(key, value, opts...)
-		if err != nil && !errors.Is(err, errWriteSuperseded) && c.cfg.logger != nil {
+		if err != nil && !errors.Is(err, errWriteSuperseded) && !errors.Is(err, ErrClosed) && c.cfg.logger != nil {
 			c.cfg.logger.Warn("memcache: caching a bulk-loaded value failed", "err", err)
 		}
 		return

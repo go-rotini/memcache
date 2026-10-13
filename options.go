@@ -471,12 +471,15 @@ func WithAsyncWrites() Option {
 // A Store hit is promoted with [WithDefaultTTL], since [Store.Get]
 // returns no TTL. For a Store that also implements [TTLStore], the cache
 // asks for the record's remaining TTL after the Get, one extra Store
-// call: the promoted copy then expires no later than the record, and a
-// write that keeps a key's expiry (the Compute family, [Cache.Update],
-// [Cache.CompareAndSwap], [Increment]) on a key read from the Store
-// keeps the record's TTL. Without TTLStore, or when the TTL lookup fails,
-// such a write gives the record the promoted copy's TTL. [MemoryStore]
-// implements TTLStore.
+// call: the promoted copy then expires no later than the record, and is
+// not kept when the lookup finds the record gone. A write that keeps a
+// key's expiry (the Compute family, [Cache.Update],
+// [Cache.CompareAndSwap], [Increment]) keeps the Store record's TTL; it
+// looks that TTL up first unless the same call just read the key from the
+// Store. Without TTLStore, or when the TTL lookup fails or finds no
+// record, such a write gives the record the in-memory copy's TTL, or
+// [WithDefaultTTL] when memory keeps no copy. [MemoryStore] implements
+// TTLStore.
 //
 // Iteration helpers ([Cache.Range], [Cache.Keys]) walk only the
 // in-memory portion. The cache does NOT close the Store on
