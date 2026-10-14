@@ -366,7 +366,8 @@ func TestRangeSkipsExpired(t *testing.T) {
 }
 
 func TestKeysReturnsSnapshot(t *testing.T) {
-	c, _ := New[string, int](WithMaxEntries(8))
+	// One shard, so no key is evicted by its shard's share of the cap (see TestDeleteWhere).
+	c, _ := New[string, int](WithMaxEntries(8), WithShards(1))
 	defer c.Close()
 	for _, k := range []string{"a", "b", "c"} {
 		_ = c.Set(k, 0)
@@ -383,7 +384,7 @@ func TestKeysReturnsSnapshot(t *testing.T) {
 }
 
 func TestClearRecordsClearReason(t *testing.T) {
-	c, _ := New[string, int](WithMaxEntries(8))
+	c, _ := New[string, int](WithMaxEntries(8), WithShards(1))
 	defer c.Close()
 	for _, k := range []string{"a", "b", "c"} {
 		_ = c.Set(k, 0)
@@ -795,7 +796,9 @@ func TestDeletePrefixUnsupportedKeyType(t *testing.T) {
 }
 
 func TestDeleteWhere(t *testing.T) {
-	c, _ := New[string, int](WithMaxEntries(8))
+	// One shard: with the default count, three of the five keys can hash to one shard and
+	// evict one before DeleteWhere runs.
+	c, _ := New[string, int](WithMaxEntries(8), WithShards(1))
 	defer c.Close()
 	for i := range 5 {
 		_ = c.Set(itoaSimple(i), i)

@@ -67,7 +67,7 @@ func TestItemMetadataMissingKey(t *testing.T) {
 }
 
 func TestHottest(t *testing.T) {
-	c, _ := New[string, int](WithMaxEntries(8))
+	c, _ := New[string, int](WithMaxEntries(8), WithShards(1))
 	defer c.Close()
 	for k, v := range map[string]int{"a": 1, "b": 2, "c": 3} {
 		_ = c.Set(k, v)
@@ -119,7 +119,7 @@ func TestHottestNZeroReturnsAll(t *testing.T) {
 
 func TestLongestLived(t *testing.T) {
 	clk := NewFakeClock(time.Unix(0, 0))
-	c, _ := New[string, int](WithMaxEntries(8), WithClock(clk))
+	c, _ := New[string, int](WithMaxEntries(8), WithShards(1), WithClock(clk))
 	defer c.Close()
 	_ = c.Set("first", 1)
 	clk.Advance(time.Second)

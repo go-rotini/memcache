@@ -199,7 +199,7 @@ func TestGetMultiEmptyReturnsEmptyMap(t *testing.T) {
 }
 
 func TestSetMulti(t *testing.T) {
-	c, _ := New[string, int](WithMaxEntries(8))
+	c, _ := New[string, int](WithMaxEntries(8), WithShards(1))
 	defer c.Close()
 	if err := c.SetMulti(map[string]int{"a": 1, "b": 2, "c": 3}); err != nil {
 		t.Fatalf("SetMulti: %v", err)
