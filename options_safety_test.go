@@ -121,7 +121,7 @@ func TestWithCallbackTimeout_NoWarningWhenWithinBudget(t *testing.T) {
 func TestWithPurgeVisitor_FiresOnClear(t *testing.T) {
 	visited := map[string]int{}
 	c, _ := New[string, int](
-		WithMaxEntries(8),
+		WithMaxEntries(8), WithShards(1),
 		WithPurgeVisitor(func(k string, v int) error {
 			visited[k] = v
 			return nil

@@ -420,7 +420,7 @@ func TestRefreshAll(t *testing.T) {
 		return 0, 0, nil
 	})
 	c, _ := New[string, int](
-		WithMaxEntries(8),
+		WithMaxEntries(8), WithShards(1),
 		WithLoader(loader),
 	)
 	defer c.Close()
@@ -616,7 +616,7 @@ func TestGetMultiOrLoadCoalescesMisses(t *testing.T) {
 		return out, nil
 	})
 	c, _ := New[string, int](
-		WithMaxEntries(8),
+		WithMaxEntries(8), WithShards(1),
 		WithBulkLoader(bl),
 	)
 	defer c.Close()

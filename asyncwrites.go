@@ -19,7 +19,9 @@ const (
 // from. Ops coalesce by key: a second op on the same key replaces the
 // first.
 type pendingOp[K comparable, V any] struct {
-	kind         pendingOpKind
+	kind pendingOpKind
+	// stored is set on a Delete that has already reached the Store.
+	stored       bool
 	key          K
 	value        V
 	weight       int64
@@ -286,8 +288,12 @@ func (c *Cache[K, V]) applyPendingOpLocked(s *shard[K, V], op pendingOp[K, V]) {
 // method that works on storage sees what Get sees and the op can't
 // overwrite that method's result later. It returns the op: with a
 // Store, the caller writes it through with [Cache.asyncStoreEffect]
-// while holding the key's lock. Group budgets and the backlog count are
-// settled once s is unlocked. Caller MUST hold s.mu (write).
+// while holding the key's lock. A queued Delete goes to the Store first,
+// as [Cache.Delete] does: s.mu is released for that Store call, and the
+// op stays queued meanwhile, so a read misses rather than reading the
+// Store's copy back into memory. Group budgets and the backlog count are
+// settled once s is unlocked. Caller MUST hold s.mu (write) and, with a
+// Store, the key's lock.
 func (c *Cache[K, V]) applyPendingKeyLocked(s *shard[K, V], key K) (pendingOp[K, V], bool) {
 	if len(s.pending) == 0 {
 		return pendingOp[K, V]{}, false
@@ -295,6 +301,16 @@ func (c *Cache[K, V]) applyPendingKeyLocked(s *shard[K, V], key K) (pendingOp[K,
 	op, ok := s.pending[key]
 	if !ok {
 		return op, false
+	}
+	if op.kind == pendingOpDelete && c.store != nil {
+		c.storeDeleteUnlocked(s, key)
+		// An op queued during the Store call may have replaced this
+		// one. A Delete needs no second Store call: under the key's
+		// lock, nothing else wrote the key to the Store since.
+		if op, ok = s.pending[key]; !ok {
+			return op, false
+		}
+		op.stored = op.kind == pendingOpDelete
 	}
 	delete(s.pending, key)
 	n := len(s.pendingCallbacks)
@@ -383,9 +399,26 @@ func (c *Cache[K, V]) asyncStoreEffect(op pendingOp[K, V]) {
 			c.cfg.logger.Warn("memcache: async write-through to store failed", "err", err)
 		}
 	case pendingOpDelete:
-		if _, err := c.store.Delete(context.Background(), op.key); err != nil && c.cfg.logger != nil {
-			c.cfg.logger.Warn("memcache: async delete-through to store failed", "err", err)
+		if !op.stored {
+			c.storeDeleteQueued(op.key)
 		}
+	}
+}
+
+// storeDeleteUnlocked is storeDeleteQueued with s.mu released for the
+// Store call. Caller MUST hold s.mu (write), which is held again on
+// return, even if the Store panics.
+func (c *Cache[K, V]) storeDeleteUnlocked(s *shard[K, V], key K) {
+	s.mu.Unlock()
+	defer s.mu.Lock()
+	c.storeDeleteQueued(key)
+}
+
+// storeDeleteQueued deletes key from the Store for a queued Delete; an
+// error is logged, as the caller has already returned.
+func (c *Cache[K, V]) storeDeleteQueued(key K) {
+	if _, err := c.store.Delete(context.Background(), key); err != nil && c.cfg.logger != nil {
+		c.cfg.logger.Warn("memcache: async delete-through to store failed", "err", err)
 	}
 }
 
