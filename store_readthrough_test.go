@@ -452,6 +452,51 @@ func TestBulkLoadWriteThroughKeepsOrder(t *testing.T) {
 	}
 }
 
+// deleteGateStore blocks each Delete until released, so a test can act
+// while a Store delete is in flight.
+type deleteGateStore struct {
+	*MemoryStore[string, int]
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (g *deleteGateStore) Delete(ctx context.Context, key string) (bool, error) {
+	g.entered <- struct{}{}
+	<-g.release
+	return g.MemoryStore.Delete(ctx, key)
+}
+
+// A queued Delete reaches the Store before memory, as a synchronous one
+// does: a read while the Store delete is in flight misses rather than
+// reading the Store's copy back into memory.
+func TestAsyncDeleteReachesTheStoreFirst(t *testing.T) {
+	st := &deleteGateStore{
+		MemoryStore: NewMemoryStore[string, int](nil),
+		entered:     make(chan struct{}, 1),
+		release:     make(chan struct{}),
+	}
+	_ = st.MemoryStore.Set(context.Background(), "k", 57, 0)
+	c, err := New[string, int](WithMaxEntries(10), WithStore(st), WithAsyncWrites())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	c.Delete("k")
+	<-st.entered
+	v, ok := c.Get("k")
+	close(st.release)
+	if ok {
+		t.Fatalf("Get while the queued Delete reaches the Store = %d; want a miss", v)
+	}
+	_ = c.Sync(context.Background())
+	if v, ok := c.Peek("k"); ok {
+		t.Fatalf("memory holds %d after the Delete; want it gone", v)
+	}
+	if v, ok, _ := st.Get(context.Background(), "k"); ok {
+		t.Fatalf("Store holds %d after the Delete; want it gone", v)
+	}
+}
+
 // A Set that lands while GetMultiOrLoad is still looking the key up
 // (here, in a slow Store read) is newer than the bulk load that follows.
 func TestBulkLoadDoesNotOverwriteAWriteDuringTheLookup(t *testing.T) {

@@ -302,7 +302,7 @@ func (p prefixerKey) HasPrefix(s string) bool {
 }
 
 func TestDeletePrefixUsesPrefixerInterface(t *testing.T) {
-	c, _ := New[prefixerKey, int](WithMaxEntries(8))
+	c, _ := New[prefixerKey, int](WithMaxEntries(8), WithShards(1))
 	defer c.Close()
 	_ = c.Set(prefixerKey{val: "alpha:1"}, 1)
 	_ = c.Set(prefixerKey{val: "alpha:2"}, 2)

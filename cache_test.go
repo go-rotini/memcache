@@ -746,7 +746,7 @@ func TestSyncReturnsCtxErr(t *testing.T) {
 
 func TestDeleteExpired(t *testing.T) {
 	clk := NewFakeClock(time.Unix(0, 0))
-	c, _ := New[string, int](WithMaxEntries(8), WithClock(clk))
+	c, _ := New[string, int](WithMaxEntries(8), WithShards(1), WithClock(clk))
 	defer c.Close()
 	_ = c.SetWithTTL("a", 1, time.Second)
 	_ = c.SetWithTTL("b", 2, time.Hour)

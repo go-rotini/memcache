@@ -106,7 +106,7 @@ func TestColdest(t *testing.T) {
 }
 
 func TestHottestNZeroReturnsAll(t *testing.T) {
-	c, _ := New[string, int](WithMaxEntries(8))
+	c, _ := New[string, int](WithMaxEntries(8), WithShards(1))
 	defer c.Close()
 	for _, k := range []string{"a", "b", "c"} {
 		_ = c.Set(k, 0)
