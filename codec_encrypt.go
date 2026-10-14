@@ -7,7 +7,16 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 )
+
+// errEncryptTooLarge fires when a value is too large to seal: above
+// AES-GCM's per-message limit, or too large to hold with its nonce and
+// tag in one slice.
+var errEncryptTooLarge = errors.New("memcache: value too large to encrypt")
+
+// maxGCMPlaintext is AES-GCM's per-message plaintext limit.
+const maxGCMPlaintext = (1<<32 - 2) * aes.BlockSize
 
 // errEncryptShortCiphertext fires when an encrypted blob is shorter
 // than the AES-GCM nonce (12 bytes); the format is malformed.
@@ -84,7 +93,11 @@ func (c *EncryptedCodec) openField(data []byte) ([]byte, error) {
 // seal encrypts plain with a fresh nonce, authenticating ad with it,
 // and returns nonce ‖ ciphertext.
 func (c *EncryptedCodec) seal(plain, ad []byte) ([]byte, error) {
-	nonce := make([]byte, c.gcm.NonceSize(), c.gcm.NonceSize()+len(plain)+c.gcm.Overhead())
+	ns, overhead := c.gcm.NonceSize(), c.gcm.Overhead()
+	if uint64(len(plain)) > maxGCMPlaintext || len(plain) > math.MaxInt-ns-overhead {
+		return nil, &CodecError{Op: codecOpMarshal, Codec: c.Name(), Err: errEncryptTooLarge}
+	}
+	nonce := make([]byte, ns, ns+len(plain)+overhead)
 	if _, err := io.ReadFull(rand.Reader, nonce); err != nil {
 		return nil, &CodecError{Op: codecOpMarshal, Codec: c.Name(), Err: err}
 	}
