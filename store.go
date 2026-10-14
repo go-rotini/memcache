@@ -7,20 +7,16 @@ import (
 )
 
 // Store is the pluggable backend interface. The package ships
-// [MemoryStore] as the default; disk-backed (BoltDB-style),
-// Redis-backed, and other adapters are intended to be third-party
-// implementations layered behind this contract.
+// [MemoryStore]; disk, network and other backends implement the same
+// interface.
 //
-// Every method takes a [context.Context] so backends can support
-// per-call deadlines, cancellation, and tracing without
-// retrofitting them later. Implementations of in-process stores
-// (like [MemoryStore]) can choose to honor only ctx.Err() at entry.
+// Every method takes a [context.Context] for deadlines, cancellation
+// and tracing; in-process stores may check only ctx.Err() at entry.
 //
-// Store implementations MUST be safe for concurrent use.
+// Store implementations must be safe for concurrent use.
 //
 // A Cache built with [WithStore] treats the Store as its source of
 // truth (read-through with promotion, write-through, delete-through).
-// Store also serves as L2 for [Tiered].
 type Store[K comparable, V any] interface {
 	// Get returns the value stored for key. Missing keys produce
 	// (zero V, false, nil); only I/O failures populate err.
@@ -48,14 +44,36 @@ type Store[K comparable, V any] interface {
 	Close() error
 }
 
-// MemoryStore is the default in-process [Store]. TTLs are enforced
-// lazily on Get. Safe for concurrent use; zero value is invalid (use
+// TTLStore is a [Store] that can also report the TTL a record has left.
+// A Cache still reads values with Get; it calls TTL after a Get hit when
+// it copies the record into memory, and before a write that keeps a
+// key's expiry, so it can keep the record's expiry; see [WithStore].
+// That is one extra Store call per promotion and per such write.
+type TTLStore[K comparable, V any] interface {
+	Store[K, V]
+
+	// TTL returns the time key's record has left before it expires, 0
+	// when it has no expiry, and false when there is no such record.
+	TTL(ctx context.Context, key K) (time.Duration, bool, error)
+}
+
+// asTTLStore returns s as a [TTLStore], or nil when it isn't one.
+func asTTLStore[K comparable, V any](s Store[K, V]) TTLStore[K, V] {
+	ts, _ := s.(TTLStore[K, V])
+	return ts
+}
+
+// MemoryStore is the default in-process [Store]. Expired entries are
+// hidden from reads and removed by a sweep that Set runs once per
+// store-size Sets. Safe for concurrent use; zero value is invalid (use
 // [NewMemoryStore]).
 type MemoryStore[K comparable, V any] struct {
 	mu      sync.RWMutex
 	entries map[K]storedEntry[V]
 	clock   Clock
 	closed  bool
+	// sets counts Set calls since the last sweep of expired entries.
+	sets int
 }
 
 // storedEntry is the per-key bundle MemoryStore keeps internally.
@@ -65,9 +83,7 @@ type storedEntry[V any] struct {
 }
 
 // NewMemoryStore constructs an empty in-memory [Store]. clock
-// controls TTL evaluation; passing nil falls back to [RealClock]
-// so callers can inline `NewMemoryStore[K, V](nil)` for typical
-// production use.
+// controls TTL evaluation; nil means [RealClock].
 func NewMemoryStore[K comparable, V any](clock Clock) *MemoryStore[K, V] {
 	if clock == nil {
 		clock = RealClock{}
@@ -101,6 +117,32 @@ func (m *MemoryStore[K, V]) Get(ctx context.Context, key K) (V, bool, error) {
 	return e.value, true, nil
 }
 
+// TTL returns the time the record for key has left, 0 for a record
+// with no expiry, and false when there is none. It implements
+// [TTLStore].
+func (m *MemoryStore[K, V]) TTL(ctx context.Context, key K) (time.Duration, bool, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, false, err //nolint:wrapcheck // pass ctx.Err verbatim
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	if m.closed {
+		return 0, false, ErrClosed
+	}
+	e, ok := m.entries[key]
+	if !ok {
+		return 0, false, nil
+	}
+	if e.expireAt == 0 {
+		return 0, true, nil
+	}
+	left := e.expireAt - m.clock.Now().UnixNano()
+	if left <= 0 {
+		return 0, false, nil
+	}
+	return time.Duration(left), true, nil
+}
+
 // Set stores value with the given TTL. ttl <= 0 stores with no
 // expiry.
 func (m *MemoryStore[K, V]) Set(ctx context.Context, key K, value V, ttl time.Duration) error {
@@ -117,6 +159,18 @@ func (m *MemoryStore[K, V]) Set(ctx context.Context, key K, value V, ttl time.Du
 		return ErrClosed
 	}
 	m.entries[key] = storedEntry[V]{value: value, expireAt: expireAt}
+	// Sweep expired entries once per len(entries) Sets, so their
+	// memory is reclaimed at an amortized O(1) cost per Set.
+	m.sets++
+	if m.sets >= max(len(m.entries), 64) {
+		m.sets = 0
+		now := m.clock.Now().UnixNano()
+		for k, e := range m.entries {
+			if e.expireAt != 0 && now >= e.expireAt {
+				delete(m.entries, k)
+			}
+		}
+	}
 	return nil
 }
 

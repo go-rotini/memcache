@@ -2,10 +2,10 @@ package memcache
 
 import "context"
 
-// Tracer emits observability spans. Spans: memcache.load (Loader runs
-// from [Cache.GetOrLoad]), memcache.snapshot.save, memcache.snapshot.load.
-// Get/Set/Delete do NOT emit spans (per-call cost would dominate).
-// Implementations must be thread-safe.
+// Tracer emits observability spans. Spans: memcache.load (every
+// [Cache.GetOrLoad] and [Cache.GetOrLoadFn] call, hit or miss),
+// memcache.snapshot.save and memcache.snapshot.load. Get, Set and
+// Delete emit no spans. Implementations must be safe for concurrent use.
 type Tracer interface {
 	// Start begins a span for op. The returned context carries
 	// span data so child spans can chain via ctx; the returned

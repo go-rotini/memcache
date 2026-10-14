@@ -2,7 +2,7 @@ package memcache
 
 // Weigher returns the weight of a value, used with WithMaxBytes to bound
 // the cache by total weight rather than entry count. Implementations must
-// be deterministic; weights below 1 are clamped to 1.
+// be deterministic; weights are clamped to the range 1 to 1<<40.
 type Weigher[V any] func(V) int64
 
 // UnitWeigher returns a Weigher that reports 1 for every value.
@@ -20,9 +20,11 @@ func BytesWeigher() Weigher[[]byte] {
 	return func(b []byte) int64 { return int64(len(b)) }
 }
 
+// maxEntryWeight caps one entry's weight, so that summing weights into
+// [Cache.Bytes] cannot overflow for any cache that fits in memory.
+const maxEntryWeight = 1 << 40
+
+// clampWeight bounds w to [1, maxEntryWeight].
 func clampWeight(w int64) int64 {
-	if w < 1 {
-		return 1
-	}
-	return w
+	return min(max(w, 1), maxEntryWeight)
 }

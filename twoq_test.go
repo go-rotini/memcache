@@ -162,10 +162,24 @@ func TestTwoQSnapshot(t *testing.T) {
 	}
 }
 
-func TestTwoQPromotionNeededAlwaysTrue(t *testing.T) {
-	p := newTwoQ[string, int](4)
-	if !p.PromotionNeeded(nil) {
-		t.Error("2Q PromotionNeeded should always return true")
+func TestTwoQPromotionNeededOnlyForAmNonHead(t *testing.T) {
+	p := newTwoQ[string, int](8)
+	in := &entry[string, int]{key: "in", heapIndex: -1}
+	p.OnInsert(in)
+	if p.PromotionNeeded(in) {
+		t.Error("an A1in hit changes nothing and needs no promotion")
+	}
+	p.recordGhost("a")
+	p.recordGhost("b")
+	a := &entry[string, int]{key: "a", heapIndex: -1}
+	b := &entry[string, int]{key: "b", heapIndex: -1}
+	p.OnInsert(a) // ghost hit: straight into Am
+	p.OnInsert(b) // now the Am head
+	if !p.PromotionNeeded(a) {
+		t.Error("an Am entry behind the head needs promotion")
+	}
+	if p.PromotionNeeded(b) {
+		t.Error("the Am head needs no promotion")
 	}
 }
 

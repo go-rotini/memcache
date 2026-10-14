@@ -114,6 +114,8 @@ func TestLFUVictimAfterEmptyBucket(t *testing.T) {
 	// a goes to freq=3, b stays at freq=1.
 	p.OnAccess(a)
 	p.OnAccess(a)
+	// c is the newest insert, which Victim passes over.
+	p.OnInsert(makeLFUEntry("c"))
 	v := p.Victim()
 	if v == nil || v.key != "b" {
 		t.Errorf("Victim = %v, want b (lowest freq)", v)

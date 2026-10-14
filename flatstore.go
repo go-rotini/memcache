@@ -1,5 +1,7 @@
 package memcache
 
+import "math/bits"
+
 import "sync/atomic"
 
 // flatStoreInitialCap is the starting slot count of a freshly-
@@ -69,7 +71,10 @@ func newFlatStore[K comparable, V any](hasher func(K) uint64, initialCap int) *f
 // tombstone) slot per the linear-probing invariant.
 func (s *flatStore[K, V]) probe(key K) (idx int, found bool) {
 	mask := uint64(len(s.slots) - 1)
-	start := s.hasher(key) & mask
+	// The cache picks the shard from the hash's low bits, so every key
+	// here shares them. Fibonacci hashing takes the start slot from
+	// the high bits of the product, which depend on all bits of h.
+	start := (s.hasher(key) * 0x9E3779B97F4A7C15) >> bits.LeadingZeros64(mask)
 	insertIdx := -1
 	i := start
 	for {

@@ -54,6 +54,12 @@ type s3fifoPolicy[K comparable, V any] struct {
 	// Cleared by OnRemove (if the recent node is itself removed) and
 	// by Reset; otherwise just overwritten by the next OnInsert.
 	recentInsert *s3Node[K, V]
+
+	// pinNodes is set under [WithLockFreeRead], where Get reads an
+	// entry's policyData without the shard lock. policyData is then
+	// written only by OnInsert, before the entry is visible to those
+	// readers, and a removed entry keeps pointing at its detached node.
+	pinNodes bool
 }
 
 // s3Node is the intrusive list node attached to an entry's
@@ -170,7 +176,7 @@ func (p *s3fifoPolicy[K, V]) OnUpdate(e *entry[K, V]) {
 // list pointers will be nil and the helper unlinks become no-ops.
 func (p *s3fifoPolicy[K, V]) OnRemove(e *entry[K, V]) {
 	n, ok := e.policyData.(*s3Node[K, V])
-	if !ok || n == nil {
+	if !ok || n == nil || n.entry == nil {
 		return
 	}
 	if n.inMain {
@@ -184,7 +190,9 @@ func (p *s3fifoPolicy[K, V]) OnRemove(e *entry[K, V]) {
 	n.entry = nil
 	n.next = nil
 	n.prev = nil
-	e.policyData = nil
+	if !p.pinNodes {
+		e.policyData = nil
+	}
 }
 
 // Victim runs S3-FIFO's promotion/demotion logic and returns the next
@@ -203,8 +211,8 @@ func (p *s3fifoPolicy[K, V]) Victim() *entry[K, V] {
 	// inserted node and rotates it instead, costing one iteration
 	// per cycle). A tighter bound (smallSize+mainSize+1) can exit
 	// early with both queues still over budget when freqs are
-	// saturated, which previously fell through to the defensive
-	// fallback and evicted the wrong queue.
+	// saturated, falling through to the defensive fallback and
+	// evicting from the wrong queue.
 	maxRotations := (p.smallSize+p.mainSize+1)*(int(s3FreqMax)+1) + 1
 	for range maxRotations {
 		if p.smallSize > p.smallBudget && p.smallHead != nil {
@@ -306,7 +314,7 @@ func (p *s3fifoPolicy[K, V]) Len() int {
 func (p *s3fifoPolicy[K, V]) Reset() {
 	for n := p.smallHead; n != nil; {
 		nxt := n.next
-		if n.entry != nil {
+		if n.entry != nil && !p.pinNodes {
 			n.entry.policyData = nil
 		}
 		n.entry = nil
@@ -315,7 +323,7 @@ func (p *s3fifoPolicy[K, V]) Reset() {
 	}
 	for n := p.mainHead; n != nil; {
 		nxt := n.next
-		if n.entry != nil {
+		if n.entry != nil && !p.pinNodes {
 			n.entry.policyData = nil
 		}
 		n.entry = nil
@@ -467,4 +475,30 @@ func (p *s3fifoPolicy[K, V]) PromotionNeeded(e *entry[K, V]) bool {
 		return true
 	}
 	return n.freq.Load() < s3FreqMax
+}
+
+// shed picks a victim regardless of the Small/Main budgets: the oldest
+// Small entry (recorded in Ghost), else the oldest Main entry. With
+// keepRecent the just-inserted entry is skipped.
+func (p *s3fifoPolicy[K, V]) shed(keepRecent bool) *entry[K, V] {
+	if n := p.firstSmallNotRecent(); n != nil {
+		p.unlinkSmall(n)
+		p.recordGhost(n.entry.key)
+		return n.entry
+	}
+	if n := p.firstMainNotRecent(); n != nil {
+		p.unlinkMain(n)
+		return n.entry
+	}
+	if keepRecent || p.recentInsert == nil {
+		return nil
+	}
+	n := p.recentInsert
+	if n.inMain {
+		p.unlinkMain(n)
+	} else {
+		p.unlinkSmall(n)
+		p.recordGhost(n.entry.key)
+	}
+	return n.entry
 }

@@ -46,6 +46,11 @@ func (c CompressedCodec) Marshal(v any) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	return c.compress(raw)
+}
+
+// compress gzip-compresses raw at the codec's level.
+func (c CompressedCodec) compress(raw []byte) ([]byte, error) {
 	var buf bytes.Buffer
 	level := c.level
 	if level < gzip.HuffmanOnly || level > gzip.BestCompression {
@@ -78,6 +83,24 @@ func (c CompressedCodec) Unmarshal(data []byte, v any) error {
 		return &CodecError{Op: codecOpUnmarshal, Codec: c.Name(), Err: err}
 	}
 	return c.base.Unmarshal(raw, v)
+}
+
+// inflate gunzips data, failing with errInflateTooLarge once the output
+// would pass limit bytes.
+func inflate(data []byte, limit int64) ([]byte, error) {
+	gr, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return nil, err //nolint:wrapcheck // caller wraps in a CodecError
+	}
+	defer gr.Close()
+	raw, err := io.ReadAll(io.LimitReader(gr, max(limit, 0)+1))
+	if err != nil {
+		return nil, err //nolint:wrapcheck // caller wraps in a CodecError
+	}
+	if int64(len(raw)) > limit {
+		return nil, errInflateTooLarge
+	}
+	return raw, nil
 }
 
 // Name reports `<base>+gzip` (e.g. `gob+gzip`, `json+gzip`).

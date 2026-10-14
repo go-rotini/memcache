@@ -85,7 +85,7 @@ type janitorState struct {
 // Caller must hold s.mu so the start/stop transition is observed
 // atomically with whichever insert demanded the janitor.
 func (c *Cache[K, V]) startJanitorLocked(s *shard[K, V]) {
-	if c.cfg.janitorInterval <= 0 {
+	if c.cfg.janitorInterval <= 0 || c.sealed.Load() {
 		return
 	}
 	if !s.janitor.running.CompareAndSwap(false, true) {
@@ -111,10 +111,13 @@ func (c *Cache[K, V]) startJanitorLocked(s *shard[K, V]) {
 // stopJanitor signals the janitor to exit. Idempotent. Acquires s.mu
 // so reads of janitor.stop/timer are serialized with startJanitorLocked.
 func (c *Cache[K, V]) stopJanitor(s *shard[K, V]) {
+	// Clear running under the lock, so an insert can't start a second
+	// janitor in between and leave this one without a stop signal.
+	s.mu.Lock()
 	if !s.janitor.running.CompareAndSwap(true, false) {
+		s.mu.Unlock()
 		return
 	}
-	s.mu.Lock()
 	timer := s.janitor.timer
 	stop := s.janitor.stop
 	s.mu.Unlock()
@@ -127,9 +130,8 @@ func (c *Cache[K, V]) stopJanitor(s *shard[K, V]) {
 }
 
 // janitorIdleShutdownTicks is how many consecutive idle ticks the
-// janitor must observe before exiting. Per spec §7.3 the
-// recommendation is 5; matches the "no TTL entries for 5 ×
-// JanitorInterval" formulation.
+// janitor must observe before exiting: a shard with no TTL entries for
+// 5 × JanitorInterval stops its janitor goroutine.
 const janitorIdleShutdownTicks = 5
 
 // runJanitor is the per-shard sweep loop. It wakes every configured

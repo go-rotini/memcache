@@ -11,7 +11,8 @@ import (
 
 // Stats is a point-in-time snapshot of per-cache statistics.
 //
-// All counters are monotonic and are reset only by [Cache.ResetStats].
+// Counter fields only grow until [Cache.ResetStats] zeroes them; Entries,
+// Bytes, Capacity, TagsTracked and TagCleanupBacklog report live state.
 // Each field is loaded atomically; the snapshot as a whole may straddle
 // concurrent operations.
 type Stats struct {
@@ -41,8 +42,8 @@ type Stats struct {
 	// expiry (lazy or via the janitor).
 	Expirations uint64
 
-	// EvictionsByReason counts the per-reason eviction breakdown,
-	// indexed by [EvictionReason].
+	// EvictionsByReason counts removals of every kind (including
+	// deletes and Clear), indexed by [EvictionReason].
 	EvictionsByReason [numEvictionReasons]uint64
 
 	// LoadsTotal is the number of Loader invocations.
@@ -67,9 +68,7 @@ type Stats struct {
 	HashCollisions uint64
 
 	// AdmissionRejects counts inserts dropped by the admission
-	// policy ([WithAdmissionPolicy] / [WithDoorkeeper]). Each
-	// rejection means a [Cache.Set] call returned without storing
-	// the value because the policy refused the candidate.
+	// policy ([WithAdmissionPolicy] / [WithDoorkeeper]).
 	AdmissionRejects uint64
 
 	// LoadTimeouts counts loader invocations that exceeded
@@ -107,11 +106,10 @@ type Stats struct {
 	// TagsTracked is the live tag-index size (distinct tag count).
 	TagsTracked int
 
-	// TagCleanupBacklog is the depth of the per-cache async untag
-	// queue. A persistently-positive value indicates the eviction
-	// rate is outpacing the index drainer; consider raising the
-	// queue capacity (compile-time `tagCleanupBuffer` constant) or
-	// reducing tag churn.
+	// TagCleanupBacklog is the number of removed entries whose tags
+	// are still queued for removal from the tag index. A persistently
+	// positive value means removals of tagged entries are outpacing
+	// the background cleanup.
 	TagCleanupBacklog int
 
 	// Compactions counts cumulative storage rebuilds across shards;
@@ -129,25 +127,22 @@ type Stats struct {
 	// [Cache.ResetStats]. Zero when never reset.
 	LastResetAt time.Time
 
-	// PolicyName is the canonical name of the configured eviction
-	// policy (e.g. "S3FIFO", "LRU"). Filled from
-	// [Policy.String].
+	// PolicyName is the [Policy.String] name of the configured
+	// eviction policy (e.g. "s3fifo", "lru").
 	PolicyName string
 
-	// PolicyDetail is the per-policy diagnostic struct returned by
-	// [evictionPolicy.Snapshot] for shard 0; concrete type depends
-	// on the configured policy ([PolicyDetailLRU] / [PolicyDetailS3FIFO]
-	// / etc.). Use a type switch or assertion when consuming.
-	// nil when the cache has no shards (degenerate state).
+	// PolicyDetail is the policy's diagnostic state for shard 0, as a
+	// value of the matching PolicyDetail type ([PolicyDetailS3FIFO],
+	// [PolicyDetailLRU], ...). Use a type switch to read it.
 	PolicyDetail any
 
 	// LoadLatency is the arithmetic mean of every Loader call that
 	// completed since the last [Cache.ResetStats].
 	LoadLatency time.Duration
 
-	// LoadLatencyP50 is the median Loader-call duration. Computed
-	// from a fixed-bucket log-spaced histogram with roughly half-
-	// bucket precision (see [internal/tdigest]).
+	// LoadLatencyP50 is the median Loader-call duration, estimated
+	// from a fixed log-spaced histogram (100ns to 5s, three buckets
+	// per decade) to within about half a bucket.
 	LoadLatencyP50 time.Duration
 
 	// LoadLatencyP99 is the 99th-percentile Loader-call duration.
@@ -163,8 +158,7 @@ type Stats struct {
 	// Weigher is configured.
 	Bytes int64
 
-	// Capacity is the cache's current configured bound (entries when
-	// MaxEntries is set, bytes otherwise).
+	// Capacity is [Cache.Capacity].
 	Capacity int64
 
 	// At is the wall-clock time at which the snapshot was taken.

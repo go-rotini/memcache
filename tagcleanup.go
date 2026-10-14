@@ -1,5 +1,7 @@
 package memcache
 
+import "slices"
+
 // untagOp is a queued tag-removal request from removeLocked, consumed
 // by the drainer. Carries the tag slice by value so entry pool recycle
 // is independent of queue drain order.
@@ -31,9 +33,7 @@ func (c *Cache[K, V]) startTagCleanup() {
 	go c.runTagCleanup()
 }
 
-// runTagCleanup batches incoming untag ops under a single
-// tagIndex.mu acquisition per batch. Batching keeps the per-eviction
-// fixed cost low without holding the index lock for the whole drain.
+// runTagCleanup applies queued untag ops in batches of up to 64.
 //
 // `tagCleanupInflight` is incremented by [Cache.enqueueUntag]
 // before the channel send and decremented here after each batch
@@ -97,15 +97,28 @@ func (c *Cache[K, V]) drainRemaining() {
 	}
 }
 
-// applyUntagBatch updates the tag index for every op under one
-// idx.mu acquisition.
+// applyUntagBatch updates the tag index for every op. The key may have
+// been set again, with some of the same tags, since the op was queued,
+// so each op runs under the key's shard read lock and skips any tag the
+// key's current entry carries. The shard lock is taken before idx.mu,
+// the standard order, and keeps a concurrent Set from tagging the key
+// between the check and the removal.
 func (c *Cache[K, V]) applyUntagBatch(batch []untagOp[K]) {
 	if c.tags == nil || len(batch) == 0 {
 		return
 	}
-	c.tags.mu.Lock()
 	for _, op := range batch {
+		s := c.shardFor(op.key)
+		s.mu.RLock()
+		var current []string
+		if e, ok := s.storage.get(op.key); ok {
+			current = e.tags
+		}
+		c.tags.mu.Lock()
 		for _, t := range op.tags {
+			if slices.Contains(current, t) {
+				continue
+			}
 			set, ok := c.tags.keysByTag[t]
 			if !ok {
 				continue
@@ -115,8 +128,9 @@ func (c *Cache[K, V]) applyUntagBatch(batch []untagOp[K]) {
 				delete(c.tags.keysByTag, t)
 			}
 		}
+		c.tags.mu.Unlock()
+		s.mu.RUnlock()
 	}
-	c.tags.mu.Unlock()
 }
 
 // enqueueUntag tries to push the op onto the async drainer; on a

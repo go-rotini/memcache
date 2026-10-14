@@ -44,7 +44,13 @@ type eventBus[K comparable, V any] struct {
 	subs   map[uint64]*subscription[K, V]
 	nextID atomic.Uint64
 	closed atomic.Bool
+	// count is the number of subscribers, so writers can skip building
+	// events nobody receives.
+	count atomic.Int64
 }
+
+// active reports whether the bus has any subscriber.
+func (b *eventBus[K, V]) active() bool { return b != nil && b.count.Load() > 0 }
 
 // newEventBus constructs an empty bus.
 func newEventBus[K comparable, V any]() *eventBus[K, V] {
@@ -63,6 +69,7 @@ func (b *eventBus[K, V]) subscribe(sub *subscription[K, V]) uint64 {
 	id := b.nextID.Add(1)
 	b.mu.Lock()
 	b.subs[id] = sub
+	b.count.Store(int64(len(b.subs)))
 	b.mu.Unlock()
 	return id
 }
@@ -77,6 +84,7 @@ func (b *eventBus[K, V]) unsubscribe(id uint64) {
 	b.mu.Lock()
 	sub, ok := b.subs[id]
 	delete(b.subs, id)
+	b.count.Store(int64(len(b.subs)))
 	b.mu.Unlock()
 	if ok {
 		close(sub.ch)
@@ -117,6 +125,7 @@ func (b *eventBus[K, V]) close() {
 		close(sub.ch)
 		delete(b.subs, id)
 	}
+	b.count.Store(0)
 }
 
 // Subscribe registers a buffered channel for events matching kinds (no
@@ -142,7 +151,7 @@ func (c *Cache[K, V]) Subscribe(buf int, kinds ...EventKind) (<-chan Event[K, V]
 // subscriber whose channel was full. Cheap when no subscribers are
 // registered (the bus's RLock is uncontended).
 func (c *Cache[K, V]) publishEvent(e Event[K, V]) {
-	if c.events == nil {
+	if !c.events.active() {
 		return
 	}
 	c.events.publish(e, &c.counters.eventsDropped)

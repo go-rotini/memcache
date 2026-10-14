@@ -81,7 +81,7 @@ func TestInvalidateTagOnUnknownTagIsZero(t *testing.T) {
 }
 
 func TestInvalidateTagsUnion(t *testing.T) {
-	c, _ := New[string, int](WithMaxEntries(8))
+	c, _ := New[string, int](WithMaxEntries(8), WithShards(1))
 	defer c.Close()
 	_ = c.SetWithTags("a", 1, "x")
 	_ = c.SetWithTags("b", 2, "y")
@@ -210,7 +210,7 @@ func TestSetMulti(t *testing.T) {
 }
 
 func TestDeleteMulti(t *testing.T) {
-	c, _ := New[string, int](WithMaxEntries(8))
+	c, _ := New[string, int](WithMaxEntries(8), WithShards(1))
 	defer c.Close()
 	for _, k := range []string{"a", "b", "c"} {
 		_ = c.Set(k, 0)
@@ -305,7 +305,7 @@ func TestWithGroupCapsMembers(t *testing.T) {
 
 func TestWithGroupOnlyAffectsMatchingTags(t *testing.T) {
 	c, _ := New[string, int](
-		WithMaxEntries(32),
+		WithMaxEntries(32), WithShards(1),
 		WithGroup("bounded", 2),
 	)
 	defer c.Close()

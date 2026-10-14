@@ -8,7 +8,7 @@ import (
 )
 
 func TestItemsReturnsLiveEntries(t *testing.T) {
-	c, _ := New[string, int](WithMaxEntries(8))
+	c, _ := New[string, int](WithMaxEntries(8), WithShards(1))
 	defer c.Close()
 	for k, v := range map[string]int{"a": 1, "b": 2, "c": 3} {
 		_ = c.Set(k, v)

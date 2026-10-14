@@ -45,6 +45,13 @@ func TestExpvarFuncStringEncodesStats(t *testing.T) {
 	if err := json.Unmarshal([]byte(got), &into); err != nil {
 		t.Errorf("expvar string does not parse as JSON: %v: %q", err, got)
 	}
+	// memexpvar's TestPublishRendersStats expects the same object.
+	const want = `{"hits":1,"misses":1,"inserts":1,"updates":0,"deletes":0,"evictions":0,` +
+		`"expirations":0,"loads_total":0,"load_hits":0,"load_errors":0,"load_coalesced":0,` +
+		`"events_dropped":0,"entries":1,"bytes":1,"capacity":8,"hit_rate_permille":500}`
+	if got != want {
+		t.Errorf("got  %s\nwant %s", got, want)
+	}
 }
 
 func TestExpvarPublishEmptyNameNoop(t *testing.T) {

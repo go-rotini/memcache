@@ -56,7 +56,7 @@ func TestInvalidationSubscriber_ReceivesAndDeletes(t *testing.T) {
 	var mu sync.Mutex
 	publisherSeen := []EvictionReason{}
 	c, _ := New[string, int](
-		WithMaxEntries(8),
+		WithMaxEntries(8), WithShards(1),
 		WithInvalidationSubscriber(ch),
 		WithInvalidationPublisher(func(_ string, r EvictionReason) {
 			mu.Lock()
@@ -80,8 +80,9 @@ func TestInvalidationSubscriber_ReceivesAndDeletes(t *testing.T) {
 	}
 	mu.Lock()
 	defer mu.Unlock()
-	if len(publisherSeen) != 1 || publisherSeen[0] != EvictReasonRemote {
-		t.Errorf("publisher saw %v, want [Remote]", publisherSeen)
+	// A remote delete is not published again, or peers would echo it.
+	if len(publisherSeen) != 0 {
+		t.Errorf("publisher saw %v, want nothing", publisherSeen)
 	}
 }
 

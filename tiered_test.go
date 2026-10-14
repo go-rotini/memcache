@@ -3,6 +3,9 @@ package memcache
 import (
 	"context"
 	"errors"
+	"strconv"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -337,5 +340,126 @@ func TestTieredGetCtxRespectsCanceledContext(t *testing.T) {
 	_, _, err := tc.GetCtx(ctx, "k")
 	if !errors.Is(err, context.Canceled) {
 		t.Errorf("GetCtx with canceled ctx err = %v, want context.Canceled", err)
+	}
+}
+
+// failSetStore is a Store whose Set always fails, so a write through it
+// rolls memory back and fires OnEvict(EvictReasonStoreRollback).
+type failSetStore struct{ *MemoryStore[string, int] }
+
+func (failSetStore) Set(context.Context, string, int, time.Duration) error {
+	return errors.New("store down")
+}
+
+// finishes fails t when fn doesn't return within a few seconds.
+func finishes(t *testing.T, what string, fn func()) {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fn()
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("%s hung", what)
+	}
+}
+
+// A hook that a Tiered write fires may call Tiered for the same key.
+func TestTieredHooksMayCallTiered(t *testing.T) {
+	type tierSetup struct {
+		name    string
+		trigger func(tr *Tiered[string, int])
+		store   bool // L2 has a Store whose Set fails
+	}
+	triggers := []tierSetup{
+		{name: "Delete", trigger: func(tr *Tiered[string, int]) {
+			_ = tr.Set("k", 1)
+			tr.Delete("k")
+		}},
+		{name: "SetRollback", store: true, trigger: func(tr *Tiered[string, int]) { _ = tr.Set("k", 1) }},
+		{name: "SetWithTTLRollback", store: true, trigger: func(tr *Tiered[string, int]) { _ = tr.SetWithTTL("k", 1, time.Hour) }},
+		{name: "SetWithOptionsRollback", store: true, trigger: func(tr *Tiered[string, int]) { _ = tr.SetWithOptions("k", 1) }},
+	}
+	actions := map[string]func(tr *Tiered[string, int], k string){
+		"Set":    func(tr *Tiered[string, int], k string) { _ = tr.Set(k, 2) },
+		"Delete": func(tr *Tiered[string, int], k string) { tr.Delete(k) },
+	}
+	for _, tg := range triggers {
+		for _, hooked := range []string{"L1", "L2"} {
+			for an, action := range actions {
+				t.Run(tg.name+"/"+hooked+"/"+an, func(t *testing.T) {
+					var tc atomic.Pointer[Tiered[string, int]]
+					var fired atomic.Bool
+					hook := WithOnEvict(func(k string, _ int, _ EvictionReason) {
+						if tr := tc.Load(); tr != nil && fired.CompareAndSwap(false, true) {
+							action(tr, k)
+						}
+					})
+					l1Opts := []Option{WithMaxEntries(10)}
+					l2Opts := []Option{WithMaxEntries(10)}
+					if tg.store {
+						l2Opts = append(l2Opts, WithStore[string, int](failSetStore{NewMemoryStore[string, int](nil)}))
+					}
+					if hooked == "L1" {
+						l1Opts = append(l1Opts, hook)
+					} else {
+						l2Opts = append(l2Opts, hook)
+					}
+					l1, _ := New[string, int](l1Opts...)
+					l2, _ := New[string, int](l2Opts...)
+					tr := NewTiered(l1, l2)
+					defer tr.Close()
+					tc.Store(tr)
+					finishes(t, "the Tiered write", func() { tg.trigger(tr) })
+					if hooked == "L2" || !tg.store {
+						if !fired.Load() {
+							t.Fatal("the hook never fired")
+						}
+					}
+				})
+			}
+		}
+	}
+}
+
+// Two Tiered writers whose L1 eviction hooks write each other's keys
+// through Tiered.
+func TestTieredEvictHooksAcrossKeysDoNotDeadlock(t *testing.T) {
+	var tc atomic.Pointer[Tiered[string, int]]
+	l1, _ := New[string, int](WithMaxEntries(2), WithShards(1),
+		WithOnEvict(func(k string, _ int, r EvictionReason) {
+			if r == EvictReasonCapacity {
+				if tr := tc.Load(); tr != nil {
+					tr.Delete(k)
+				}
+			}
+		}))
+	l2, _ := New[string, int](WithMaxEntries(1000))
+	tr := NewTiered(l1, l2)
+	defer tr.Close()
+	tc.Store(tr)
+	finishes(t, "concurrent Tiered writers", func() {
+		var wg sync.WaitGroup
+		for g := range 4 {
+			wg.Go(func() {
+				for i := range 1000 {
+					_ = tr.Set(strconv.Itoa((i+g)%6), i)
+				}
+			})
+		}
+		wg.Wait()
+	})
+}
+
+// Tiered must stay comparable: a map key of type Tiered fails to compile
+// otherwise.
+var _ = map[Tiered[string, int]]bool{}
+
+func TestTieredComparable(t *testing.T) {
+	var a, b Tiered[string, int]
+	if a != b {
+		t.Error("zero Tiered values should compare equal")
 	}
 }

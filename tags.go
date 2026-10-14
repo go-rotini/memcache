@@ -83,12 +83,28 @@ func (idx *tagIndex[K]) snapshot(tag string) []K {
 	return keys
 }
 
-// reset drops every tag and key from the index. Used by [Cache.Reset]
-// and [Cache.Clear].
-func (idx *tagIndex[K]) reset() {
+// untagShardLocked removes every entry on s from the index, for
+// [Cache.Clear] and [Cache.Reset]. Running under s's lock keeps it from
+// dropping the tags of a key set on s once s is cleared. Caller MUST
+// hold s.mu (write).
+func (c *Cache[K, V]) untagShardLocked(s *shard[K, V]) {
+	if c.tags == nil {
+		return
+	}
+	idx := c.tags
 	idx.mu.Lock()
 	defer idx.mu.Unlock()
-	idx.keysByTag = make(map[string]map[K]struct{})
+	s.storage.each(func(e *entry[K, V]) bool {
+		for _, t := range e.tags {
+			if set, ok := idx.keysByTag[t]; ok {
+				delete(set, e.key)
+				if len(set) == 0 {
+					delete(idx.keysByTag, t)
+				}
+			}
+		}
+		return true
+	})
 }
 
 // distinctTagCount returns the number of distinct tags currently
@@ -99,29 +115,26 @@ func (idx *tagIndex[K]) distinctTagCount() int {
 	return len(idx.keysByTag)
 }
 
-// SetWithTags stores value under key and indexes the entry under
-// each supplied tag. The cache-level default TTL applies. Tags can
-// later be used to remove this and similarly-tagged entries in one
-// call via [Cache.InvalidateTag].
+// SetWithTags stores value under key with the cache's default TTL and
+// indexes the entry under each supplied tag, replacing any tags derived
+// from the value. [Cache.InvalidateTag] later removes every entry
+// carrying a tag in one call.
 //
-// Returns the same errors as [Cache.Set] plus, in future revisions,
-// [ErrTooManyTags] when limit options are added.
+// It is SetWithOptions(key, value, SetTags(tags...)); a tag set over
+// [WithMaxTagsPerEntry] or [WithMaxTagsTotal] returns a
+// [*CapacityError] matching [ErrTooManyTags].
 func (c *Cache[K, V]) SetWithTags(key K, value V, tags ...string) error {
 	return c.SetWithOptions(key, value, SetTags(tags...))
 }
 
-// InvalidateTag removes every entry currently tagged with tag.
-// Returns the number of entries removed; eviction stats record
-// each removal under [EvictReasonTag].
-//
-// Lock discipline: the tag→keys snapshot is taken under the index's
-// read lock and that lock is released before any per-shard write
-// lock is acquired, so InvalidateTag never holds both
-// simultaneously (matching spec §19.2.1).
+// InvalidateTag removes every entry currently tagged with tag and
+// returns the number removed. Each removal is recorded under
+// [EvictReasonTag].
 func (c *Cache[K, V]) InvalidateTag(tag string) int {
 	if c.closed.Load() || c.tags == nil {
 		return 0
 	}
+	c.applyAllPending()
 	c.counters.tagInvalidations.Add(1)
 	keys := c.tags.snapshot(tag)
 	count := 0
@@ -151,6 +164,7 @@ func (c *Cache[K, V]) InvalidateTags(tags ...string) int {
 	if c.closed.Load() || c.tags == nil || len(tags) == 0 {
 		return 0
 	}
+	c.applyAllPending()
 	c.counters.tagInvalidations.Add(1)
 	doomed := make(map[K]struct{})
 	for _, tag := range tags {
@@ -186,6 +200,7 @@ func (c *Cache[K, V]) Tags(key K) []string {
 		return nil
 	}
 	s := c.shardFor(key)
+	c.applyPendingKey(s, key)
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	e, ok := s.storage.get(key)

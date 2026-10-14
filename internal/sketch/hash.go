@@ -4,12 +4,12 @@ package sketch
 
 import "encoding/binary"
 
-// SipHash24 computes the SipHash-2-4 64-bit hash of data using key.
+// SipHash24 computes the SipHash-2-4 64-bit hash of data under the key
+// (k0, k1).
 //
-// SipHash is a fast, HashDoS-resistant pseudo-random function. Each
-// memcache.Cache initializes its own random key at construction time so
-// the hash distribution is unpredictable to attackers. SipHash-2-4 (2
-// compression rounds, 4 finalization rounds) is the standard variant.
+// SipHash is a fast keyed pseudo-random function; it resists HashDoS
+// only when the key is secret. SipHash-2-4 (2 compression rounds, 4
+// finalization rounds) is the standard variant.
 //
 // Reference: Aumasson & Bernstein, "SipHash: a fast short-input PRF"
 // https://www.aumasson.jp/siphash/siphash.pdf

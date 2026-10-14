@@ -1,6 +1,9 @@
 package memcache
 
-import "time"
+import (
+	"reflect"
+	"time"
+)
 
 // Cacheable is the umbrella interface for V types that participate in
 // cache-specific behaviors. Every method is independently optional; the
@@ -23,18 +26,19 @@ type CacheKeyer interface {
 }
 
 // CacheTTLer is implemented by values that supply their own TTL at insert
-// time. [Cache.Set] uses the returned duration in place of the configured
-// default; explicit TTLs from [Cache.SetWithTTL] / [Cache.SetWithOptions]
-// take precedence. Returning 0 means no expiry; a negative duration falls
-// back to the cache default.
+// time. [Cache.Set] and [Cache.SetCtx] use the returned duration in place
+// of [WithDefaultTTL]; other write methods ignore it. Returning 0 means no
+// expiry; a negative duration falls back to the cache default.
 type CacheTTLer interface {
 	CacheTTL() time.Duration
 }
 
-// CacheTagger is implemented by values that auto-tag themselves at insert
-// time. [Cache.Set] merges the returned tags into the entry's tag set;
-// [Cache.SetWithTags] and [Cache.SetWithOptions] override and drop
-// auto-tags. A nil or empty slice leaves the entry untagged.
+// CacheTagger is implemented by values that tag themselves at insert
+// time. [Cache.Set] and the other value-only writes ([Cache.SetWithTTL],
+// [Cache.SetIfAbsent], [Cache.GetOrSet], ...) tag the entry with the
+// returned tags plus any cache struct-tag template tags, replacing the
+// entry's previous tags. [Cache.SetWithTags], or [Cache.SetWithOptions]
+// with [SetTags], uses the explicit tags instead.
 type CacheTagger interface {
 	CacheTags() []string
 }
@@ -52,6 +56,51 @@ type SnapshotMarshaler interface {
 // implements it. Implementations almost always have a pointer receiver.
 type SnapshotUnmarshaler interface {
 	SnapshotUnmarshal(data []byte) error
+}
+
+// valueTraits records, per cache, which of the value hooks Set consults
+// V can have, so a V with none of them skips the checks. dynamic is set
+// when V is an interface type, whose values can have any of them.
+type valueTraits struct {
+	dynamic   bool
+	ttler     bool
+	tagger    bool
+	templates bool
+}
+
+var (
+	cacheTTLerType  = reflect.TypeFor[CacheTTLer]()
+	cacheTaggerType = reflect.TypeFor[CacheTagger]()
+)
+
+// valueTraitsOf works out V's [valueTraits].
+func valueTraitsOf[V any]() valueTraits {
+	t := reflect.TypeFor[V]()
+	if t.Kind() == reflect.Interface {
+		return valueTraits{dynamic: true}
+	}
+	pt := reflect.PointerTo(t)
+	return valueTraits{
+		ttler:     t.Implements(cacheTTLerType) || pt.Implements(cacheTTLerType),
+		tagger:    t.Implements(cacheTaggerType) || pt.Implements(cacheTaggerType),
+		templates: metaFor(t).hasTemplates,
+	}
+}
+
+// valueTTL is [extractCacheableTTL] for the cache's V.
+func (c *Cache[K, V]) valueTTL(value V, fallback time.Duration) time.Duration {
+	if !c.traits.dynamic && !c.traits.ttler {
+		return fallback
+	}
+	return extractCacheableTTL(value, fallback)
+}
+
+// autoTags is [deriveAutoTags] for the cache's V.
+func (c *Cache[K, V]) autoTags(value V) []string {
+	if !c.traits.dynamic && !c.traits.tagger && !c.traits.templates {
+		return nil
+	}
+	return deriveAutoTags(value)
 }
 
 func extractCacheableTTL[V any](value V, fallback time.Duration) time.Duration {
@@ -102,7 +151,7 @@ func SetCacheable[V CacheKeyer](c *Cache[string, V], v V, opts ...SetOption) err
 }
 
 // GetCacheable looks up an entry in c by deriving the key from
-// proto.CacheKey(). Returns the cached value or proto's zero on miss.
+// proto.CacheKey(). It returns the zero V and false on a miss.
 func GetCacheable[V CacheKeyer](c *Cache[string, V], proto V) (V, bool) {
 	return c.Get(proto.CacheKey())
 }

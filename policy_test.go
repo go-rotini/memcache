@@ -93,8 +93,8 @@ func TestPoliciesBeatRandomOnZipf(t *testing.T) {
 	}
 }
 
-// TestS3FIFOBeatsLRUOnZipf is the spec's headline guarantee: S3-FIFO
-// should outperform LRU on Zipfian workloads. This test runs both
+// TestS3FIFOBeatsLRUOnZipf checks the reason S3-FIFO is the default:
+// it should outperform LRU on Zipfian workloads. This test runs both
 // policies against the same trace and asserts S3-FIFO ≥ LRU. The
 // margin is small at this synthetic scale (capacity=64, 20k ops),
 // so we only assert the inequality, not a percentage gap.

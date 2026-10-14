@@ -73,44 +73,48 @@ type evictionPolicy[K comparable, V any] interface {
 	PromotionNeeded(e *entry[K, V]) bool
 }
 
-// PolicyDetailLRU is the [evictionPolicy.Snapshot] payload for
-// [PolicyLRU]. The list size equals the shard's entry count.
+// PolicyDetailLRU is the [Stats.PolicyDetail] value for [PolicyLRU].
+// Size is the shard's entry count.
 type PolicyDetailLRU struct {
 	Size int
 }
 
-// PolicyDetailFIFO is the snapshot payload for [PolicyFIFO].
+// PolicyDetailFIFO is the [Stats.PolicyDetail] value for [PolicyFIFO].
 type PolicyDetailFIFO struct {
 	Size int
 }
 
-// PolicyDetailLFU is the snapshot payload for [PolicyLFU]; reports
-// the number of distinct frequency buckets currently populated.
+// PolicyDetailLFU is the [Stats.PolicyDetail] value for [PolicyLFU].
+// DistinctBuckets is the number of populated frequency buckets.
 type PolicyDetailLFU struct {
 	Size            int
 	DistinctBuckets int
 }
 
-// PolicyDetailS3FIFO is the snapshot payload for [PolicyS3FIFO].
-// Sizes are the per-region counts; ghost is a key-only queue with
-// no associated entries.
+// PolicyDetailS3FIFO is the [Stats.PolicyDetail] value for
+// [PolicyS3FIFO]: the entry counts and budgets of the small and main
+// queues, and the size of the key-only ghost queue.
 type PolicyDetailS3FIFO struct {
 	SmallSize, MainSize, GhostSize int
 	SmallBudget, MainBudget        int
 }
 
-// PolicyDetailTinyLFU is the snapshot payload for [PolicyTinyLFU].
+// PolicyDetailTinyLFU is the [Stats.PolicyDetail] value for
+// [PolicyTinyLFU]. SketchOps counts frequency-sketch increments since
+// the sketch was last aged.
 type PolicyDetailTinyLFU struct {
 	WindowSize, MainSize int
 	SketchOps            uint64
 }
 
-// PolicyDetail2Q is the snapshot payload for [Policy2Q].
+// PolicyDetail2Q is the [Stats.PolicyDetail] value for [Policy2Q].
 type PolicyDetail2Q struct {
 	A1inSize, AmSize, A1outSize int
 }
 
-// PolicyDetailARC is the snapshot payload for [PolicyARC].
+// PolicyDetailARC is the [Stats.PolicyDetail] value for [PolicyARC]:
+// the sizes of the T1/T2 lists and B1/B2 ghost lists, and P, the
+// adaptive target size of T1.
 type PolicyDetailARC struct {
 	T1Size, T2Size, B1Size, B2Size int
 	P                              int
@@ -129,6 +133,8 @@ type PolicyDetailARC struct {
 type policyConfig[K comparable] struct {
 	budget int
 	hasher func(K) uint64
+	// lockFreeRead is set under [WithLockFreeRead]; see s3fifoPolicy.pinNodes.
+	lockFreeRead bool
 }
 
 // newPolicy constructs the eviction policy implementation for the
@@ -142,7 +148,9 @@ func newPolicy[K comparable, V any](p Policy, cfg policyConfig[K]) evictionPolic
 	case PolicyFIFO:
 		return newFIFO[K, V]()
 	case PolicyS3FIFO:
-		return newS3FIFO[K, V](cfg.budget)
+		p := newS3FIFO[K, V](cfg.budget)
+		p.pinNodes = cfg.lockFreeRead
+		return p
 	case PolicyLFU:
 		return newLFU[K, V]()
 	case PolicyTinyLFU:
@@ -154,4 +162,22 @@ func newPolicy[K comparable, V any](p Policy, cfg policyConfig[K]) evictionPolic
 	default:
 		return newLRU[K, V]()
 	}
+}
+
+// shedVictim returns an entry to evict when the cache is over its byte
+// budget. Unlike Victim it ignores the policy's entry sub-budgets, so it
+// yields a candidate whenever the policy holds one. With keepRecent,
+// S3-FIFO still refuses to give up the entry inserted by the current
+// Set.
+func shedVictim[K comparable, V any](p evictionPolicy[K, V], keepRecent bool) *entry[K, V] {
+	if v := p.Victim(); v != nil {
+		return v
+	}
+	switch p := p.(type) {
+	case *s3fifoPolicy[K, V]:
+		return p.shed(keepRecent)
+	case *tinyLFUPolicy[K, V]:
+		return p.shed()
+	}
+	return nil
 }

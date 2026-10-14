@@ -300,6 +300,10 @@ func (p *twoQPolicy[K, V]) Snapshot() any {
 	return PolicyDetail2Q{A1inSize: p.inSize, AmSize: p.amSize, A1outSize: p.outSize}
 }
 
-// PromotionNeeded always returns true: 2Q may promote A1in to Am on
-// access, so the read-only fast path is unsafe.
-func (p *twoQPolicy[K, V]) PromotionNeeded(*entry[K, V]) bool { return true }
+// PromotionNeeded reports whether OnAccess would move e: only an Am
+// entry that isn't already the most recent one. A1in hits change
+// nothing, so they take the read-lock fast path.
+func (p *twoQPolicy[K, V]) PromotionNeeded(e *entry[K, V]) bool {
+	n, ok := e.policyData.(*twoQNode[K, V])
+	return ok && n != nil && n.inAm && n != p.amHead
+}

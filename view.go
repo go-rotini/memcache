@@ -97,15 +97,25 @@ func (v *CacheView[K, V]) Stats() Stats {
 	return v.cache.Stats()
 }
 
-// Clone returns a new [Cache] populated with a snapshot of c's live
-// entries. Hit counts and policy positioning are not preserved. Holds
-// each source shard's read lock per pass; concurrent mutations produce
-// a per-shard-consistent (not cache-wide-consistent) snapshot.
+// Clone returns a new, independent [Cache], built with c's options and
+// populated with a snapshot of c's live entries. The clone shares no
+// outside wiring with c: it has no [WithStore] backend, no
+// [WithAutoLoad] or [WithAutoSave] path, and no
+// [WithInvalidationSubscriber] or [WithInvalidationPublisher]. Hit counts
+// and policy positioning are not preserved. The snapshot is consistent
+// per shard, not across the whole cache, when c is modified concurrently.
 func (c *Cache[K, V]) Clone() (*Cache[K, V], error) {
 	if c.closed.Load() {
 		return nil, ErrClosed
 	}
 	cfgCopy := *c.cfg
+	cfgCopy.maxEntries = int(c.maxEntries.Load())
+	cfgCopy.maxBytes = c.maxBytes.Load()
+	cfgCopy.store = nil
+	cfgCopy.autoLoadPath = ""
+	cfgCopy.autoSavePath = ""
+	cfgCopy.invalidationSubscriber = nil
+	cfgCopy.invalidationPublisher = nil
 	allowUnbounded := cfgCopy.maxEntries <= 0 && cfgCopy.maxBytes <= 0
 	clone, err := build[K, V](&cfgCopy, allowUnbounded)
 	if err != nil {
@@ -144,7 +154,7 @@ func (c *Cache[K, V]) Clone() (*Cache[K, V], error) {
 				lastAccess: e.lastAccess.Load(),
 				slidingTTL: e.slidingTTL,
 				tags:       tagsCopy,
-				flags:      e.flags,
+				flags:      e.flags.load(),
 			})
 			return true
 		})
@@ -164,10 +174,11 @@ func (c *Cache[K, V]) Clone() (*Cache[K, V], error) {
 		ne.inserted = ce.inserted
 		ne.lastAccess.Store(ce.lastAccess)
 		ne.expireAt.Store(ce.expireAt)
-		ne.flags = ce.flags
+		ne.flags.store(ce.flags)
 		ne.slidingTTL = ce.slidingTTL
 		ne.tags = ce.tags
 		ns.storage.set(ce.key, ne)
+		ns.markAmended()
 		// Register the entry with the shard's TTL backend so
 		// expirations are observable via the janitor (not just
 		// lazily on Get).

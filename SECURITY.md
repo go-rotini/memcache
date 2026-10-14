@@ -18,3 +18,7 @@ This package defaults to safe behavior to mitigate denial-of-service attacks:
 - **Hash function**: SipHash-2-4 with a per-cache random key resists HashDoS by default.
 
 These limits can be configured at construction time but are set to safe defaults out of the box.
+
+## /debug/vars
+
+This package imports the standard `expvar` package for the deprecated `WithExpvar` option. `expvar` registers a `/debug/vars` handler on `http.DefaultServeMux` that serves the process's command line and memory statistics, so any program that imports memcache and serves `http.DefaultServeMux` exposes them. Serve your own `http.ServeMux` on untrusted networks. Use the `memexpvar` subpackage to publish cache statistics; the next major version drops the `expvar` import from this package.

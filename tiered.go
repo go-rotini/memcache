@@ -24,8 +24,8 @@ type TieredStats struct {
 	// Misses is the count of Tiered.Get calls that found neither
 	// tier.
 	Misses uint64
-	// Promotions is L2Hits but recorded after the L1 promotion
-	// actually wrote successfully (failed Sets do not bump it).
+	// Promotions is the count of L2 hits that were successfully
+	// written to L1.
 	Promotions uint64
 }
 
@@ -42,6 +42,9 @@ type Tiered[K comparable, V any] struct {
 	misses     atomic.Uint64
 	promotions atomic.Uint64
 
+	// locks serializes Tiered writes of each key.
+	locks *keyLockTable[K]
+
 	closed atomic.Bool
 }
 
@@ -55,11 +58,12 @@ func NewTiered[K comparable, V any](l1, l2 *Cache[K, V]) *Tiered[K, V] {
 	if l2 == nil {
 		panic("memcache: NewTiered: l2 is nil")
 	}
-	return &Tiered[K, V]{l1: l1, l2: l2}
+	return &Tiered[K, V]{l1: l1, l2: l2, locks: &keyLockTable[K]{}}
 }
 
 // Get returns the cached value for key. Lookup order: L1, then L2 with
-// best-effort promotion to L1, then miss. A failed L1 promotion still
+// best-effort promotion to L1 (keeping the L2 entry's tags and expiry),
+// then miss. A failed L1 promotion still
 // returns the L2 hit.
 func (t *Tiered[K, V]) Get(key K) (V, bool) {
 	var zero V
@@ -70,43 +74,185 @@ func (t *Tiered[K, V]) Get(key K) (V, bool) {
 		t.l1Hits.Add(1)
 		return v, true
 	}
-	if v, ok := t.l2.Get(key); ok {
-		t.l2Hits.Add(1)
-		// Promotion: best-effort write into L1. We treat any L1
-		// Set failure (e.g., MaxValueWeight rejection) as a
-		// non-fatal hint and still return the L2 value.
-		if err := t.l1.Set(key, v); err == nil {
-			t.promotions.Add(1)
-		}
-		return v, true
+	v, ok, _ := t.getAndPromote(key, func() (V, bool, error) { //nolint:errcheck // the getter never fails
+		v, ok := t.l2.Get(key)
+		return v, ok, nil
+	})
+	if !ok {
+		t.misses.Add(1)
+		return zero, false
 	}
-	t.misses.Add(1)
-	return zero, false
+	return v, true
 }
 
-// Set writes value to BOTH tiers (write-through). Returns the
-// first error encountered; partial failure is possible but
-// uncommon (e.g., L1 succeeds but L2 hits a weight limit). In
-// that case L1 may carry a fresher value than L2 until the next
-// Set rebalances.
+// watchToken records whether a key was written, deleted or invalidated
+// since the watch began. Guarded by the owning shard's lock.
+type watchToken struct {
+	superseded bool
+	refs       int
+}
+
+// watchKey starts watching key: any later write, delete or
+// invalidation of it marks the returned token superseded. Callers MUST
+// call unwatchKey when done.
+func (c *Cache[K, V]) watchKey(key K) *watchToken {
+	s := c.shardFor(key)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.watchLocked(key)
+}
+
+// unwatchKey ends a watch started by watchKey.
+func (c *Cache[K, V]) unwatchKey(key K, w *watchToken) {
+	s := c.shardFor(key)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.unwatchLocked(key, w)
+}
+
+// watchLocked is watchKey for a caller holding s.mu (write).
+func (s *shard[K, V]) watchLocked(key K) *watchToken {
+	return s.watchLockedSpare(key, nil)
+}
+
+// watchLockedSpare is watchLocked that uses spare, when not nil, as the
+// key's token if the key isn't watched yet.
+func (s *shard[K, V]) watchLockedSpare(key K, spare *watchToken) *watchToken {
+	if s.watches == nil {
+		s.watches = make(map[K]*watchToken)
+	}
+	w := s.watches[key]
+	if w == nil {
+		w = spare
+		if w == nil {
+			w = &watchToken{}
+		}
+		s.watches[key] = w
+	}
+	w.refs++
+	return w
+}
+
+// unwatchLocked is unwatchKey for a caller holding s.mu (write).
+func (s *shard[K, V]) unwatchLocked(key K, w *watchToken) {
+	w.refs--
+	if w.refs == 0 && s.watches[key] == w {
+		delete(s.watches, key)
+	}
+}
+
+// watchCurrent reports whether key is unchanged since w began.
+func (c *Cache[K, V]) watchCurrent(key K, w *watchToken) bool {
+	s := c.shardFor(key)
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return !w.superseded
+}
+
+// getAndPromote reads key from L2 through get and copies a hit into L1.
+// Both tiers watch the key from before the read, and the L1 write
+// happens only if neither has seen a write, delete or invalidation of
+// it since, checked under the L1 shard lock: a Delete or InvalidateTag
+// clears L2 before L1, so a copy that passes the check is made before
+// the L1 clear and is removed by it.
+func (t *Tiered[K, V]) getAndPromote(key K, get func() (V, bool, error)) (V, bool, error) {
+	if t.l1 == t.l2 {
+		return get()
+	}
+	w1 := t.l1.watchKey(key)
+	defer t.l1.unwatchKey(key, w1)
+	w2 := t.l2.watchKey(key)
+	defer t.l2.unwatchKey(key, w2)
+	v, ok, err := get()
+	if err != nil || !ok {
+		return v, ok, err
+	}
+	t.l2Hits.Add(1)
+	// Promotion is best-effort: an L1 rejection (e.g. MaxValueWeight)
+	// or a superseded copy still returns the L2 value.
+	guard := func() bool { return !w1.superseded && t.l2.watchCurrent(key, w2) }
+	if t.promote(key, v, guard) == nil {
+		t.promotions.Add(1)
+	}
+	return v, true, nil
+}
+
+// promote copies an L2 hit into L1 with L2's tags, expiring no later
+// than the L2 entry (or L1's default TTL, if that is sooner), so an L1
+// copy never outlives its L2 entry or escapes a tag invalidation. guard
+// runs under the L1 shard lock; false drops the copy. A value L2 no
+// longer holds fresh, such as one served stale under
+// [WithStaleWhileRevalidate], is not copied.
+func (t *Tiered[K, V]) promote(key K, v V, guard func() bool) error {
+	exp, ok := t.l2.Expiry(key)
+	if !ok {
+		return errWriteSuperseded
+	}
+	opts := make([]SetOption, 0, 3)
+	opts = append(opts, setGuard(guard))
+	if tags := t.l2.Tags(key); len(tags) > 0 {
+		opts = append(opts, SetTags(tags...))
+	}
+	if !exp.IsZero() {
+		if d := t.l1.cfg.defaultTTL; d > 0 {
+			if l1Exp := t.l1.cfg.clock.Now().Add(d); l1Exp.Before(exp) {
+				exp = l1Exp
+			}
+		}
+		opts = append(opts, SetExpireAt(exp))
+	}
+	return t.l1.SetWithOptions(key, v, opts...)
+}
+
+// Set writes value to L1, then L2, and returns the first error. If the
+// L1 write fails, L2 is not written; if only the L2 write fails, L1
+// holds a newer value than L2. Tiered writes of one key run one at a
+// time, so concurrent writers leave both tiers with the same value. The
+// tiers' hooks fire once both writes are done, so a hook may call
+// Tiered for any key.
 func (t *Tiered[K, V]) Set(key K, value V) error {
 	if t.closed.Load() {
 		return ErrClosed
 	}
-	if err := t.l1.Set(key, value); err != nil {
+	return t.write(key, func(c *Cache[K, V], after *[]func()) error {
+		return c.setCtx(context.Background(), key, value, after)
+	})
+}
+
+// write applies set to L1 and then, when that succeeds, to L2, holding
+// key's Tiered write lock. The hooks both writes fire run after the lock
+// is released.
+func (t *Tiered[K, V]) write(key K, set func(c *Cache[K, V], after *[]func()) error) error {
+	var after []func()
+	defer runAll(&after)
+	defer t.locks.lock(key)()
+	if err := set(t.l1, &after); err != nil {
 		return err
 	}
-	return t.l2.Set(key, value)
+	return set(t.l2, &after)
+}
+
+// runAll calls each function in *fns in order.
+func runAll(fns *[]func()) {
+	for _, fn := range *fns {
+		fn()
+	}
 }
 
 // Delete removes key from BOTH tiers. Returns true when at least
-// one tier had an entry to remove.
+// one tier had an entry to remove. As with [Tiered.Set], the tiers'
+// hooks fire once both deletes are done.
 func (t *Tiered[K, V]) Delete(key K) bool {
 	if t.closed.Load() {
 		return false
 	}
-	d1 := t.l1.Delete(key)
-	d2 := t.l2.Delete(key)
+	var after []func()
+	defer runAll(&after)
+	defer t.locks.lock(key)()
+	// L2 first, so a concurrent Get can't promote the old L2 value
+	// back into an already-cleared L1.
+	d2 := t.l2.deleteInto(key, &after)
+	d1 := t.l1.deleteInto(key, &after)
 	return d1 || d2
 }
 
@@ -134,7 +280,9 @@ func (t *Tiered[K, V]) GetCtx(ctx context.Context, key K) (V, bool, error) {
 		}
 		return v, ok, err
 	}
-	v, ok, err := t.l2.GetCtx(ctx, key)
+	v, ok, err := t.getAndPromote(key, func() (V, bool, error) {
+		return t.l2.GetCtx(ctx, key)
+	})
 	if err != nil {
 		return zero, false, err
 	}
@@ -142,46 +290,39 @@ func (t *Tiered[K, V]) GetCtx(ctx context.Context, key K) (V, bool, error) {
 		t.misses.Add(1)
 		return zero, false, nil
 	}
-	t.l2Hits.Add(1)
-	if perr := t.l1.SetCtx(ctx, key, v); perr == nil {
-		t.promotions.Add(1)
-	}
 	return v, true, nil
 }
 
-// SetWithTTL writes value to BOTH tiers with the given TTL.
-// Returns the first error encountered.
+// SetWithTTL is [Tiered.Set] with the given TTL.
 func (t *Tiered[K, V]) SetWithTTL(key K, value V, ttl time.Duration) error {
 	if t.closed.Load() {
 		return ErrClosed
 	}
-	if err := t.l1.SetWithTTL(key, value, ttl); err != nil {
-		return err
-	}
-	return t.l2.SetWithTTL(key, value, ttl)
+	return t.write(key, func(c *Cache[K, V], after *[]func()) error {
+		return c.setWithTTL(key, value, ttl, after)
+	})
 }
 
-// SetWithOptions writes value to both tiers with the same options. For
-// per-tier overrides, call into [Tiered.L1] / [Tiered.L2] directly.
+// SetWithOptions is [Tiered.Set] with the same per-call options for
+// both tiers. For per-tier overrides, call into [Tiered.L1] /
+// [Tiered.L2] directly.
 func (t *Tiered[K, V]) SetWithOptions(key K, value V, opts ...SetOption) error {
 	if t.closed.Load() {
 		return ErrClosed
 	}
-	if err := t.l1.SetWithOptions(key, value, opts...); err != nil {
-		return err
-	}
-	return t.l2.SetWithOptions(key, value, opts...)
+	return t.write(key, func(c *Cache[K, V], after *[]func()) error {
+		return c.setWithOptions(key, value, after, opts...)
+	})
 }
 
-// InvalidateTag removes every entry tagged with t from BOTH tiers.
-// Returns the total number of entries removed across both tiers.
-// Negative-cache tombstones and invalidated read-snapshot entries
-// are not counted by either tier's InvalidateTag.
+// InvalidateTag removes every entry tagged with tag from both tiers and
+// returns the total number removed.
 func (t *Tiered[K, V]) InvalidateTag(tag string) int {
 	if t.closed.Load() {
 		return 0
 	}
-	return t.l1.InvalidateTag(tag) + t.l2.InvalidateTag(tag)
+	n := t.l2.InvalidateTag(tag)
+	return n + t.l1.InvalidateTag(tag)
 }
 
 // InvalidateTags removes every entry tagged with at least one of
@@ -190,7 +331,8 @@ func (t *Tiered[K, V]) InvalidateTags(tags ...string) int {
 	if t.closed.Load() {
 		return 0
 	}
-	return t.l1.InvalidateTags(tags...) + t.l2.InvalidateTags(tags...)
+	n := t.l2.InvalidateTags(tags...)
+	return n + t.l1.InvalidateTags(tags...)
 }
 
 // Sync waits for any background work in BOTH tiers (tag-cleanup
@@ -206,11 +348,8 @@ func (t *Tiered[K, V]) Sync(ctx context.Context) error {
 	return t.l2.Sync(ctx)
 }
 
-// Len returns the number of entries in L2. Because writes are
-// write-through, L1 ⊆ L2 in steady state, so reporting L2's Len
-// is the most accurate "how many distinct keys does this tiered
-// cache hold" measurement. Use [Tiered.L1]/[Tiered.L2] and their
-// own Len() if you need per-tier counts.
+// Len returns the number of entries in L2, since every Tiered write
+// reaches L2. Use [Tiered.L1] and [Tiered.L2] for per-tier counts.
 func (t *Tiered[K, V]) Len() int {
 	if t.closed.Load() {
 		return 0
@@ -230,18 +369,15 @@ func (t *Tiered[K, V]) Stats() TieredStats {
 	}
 }
 
-// L1 returns the underlying L1 [Cache]. Useful for callers that
-// need to apply L1-specific operations (e.g., InvalidateTag) that
-// the Tiered wrapper does not expose directly.
+// L1 returns the underlying L1 [Cache], for operations Tiered does not
+// expose.
 func (t *Tiered[K, V]) L1() *Cache[K, V] { return t.l1 }
 
 // L2 returns the underlying L2 [Cache]. Same caveats as [Tiered.L1].
 func (t *Tiered[K, V]) L2() *Cache[K, V] { return t.l2 }
 
-// Close closes BOTH tiers. The first non-nil error encountered is
-// returned; subsequent close errors are silently swallowed (the
-// caller cannot act on more than one shutdown failure usefully).
-// Idempotent: subsequent Close calls return nil.
+// Close closes both tiers and returns the first error. Subsequent
+// calls return nil.
 func (t *Tiered[K, V]) Close() error {
 	if !t.closed.CompareAndSwap(false, true) {
 		return nil

@@ -19,8 +19,8 @@ This package is used as the default in-memory cache package for [rotini](https:/
 - Atomic compute family: `Compute`, `ComputeIfAbsent`, `CompareAndSwap`, `Increment`/`Decrement`
 - Diagnostics: `Hottest`, `Coldest`, `Histogram`, `Items`, `Dump`
 - Subscribe to invalidation events; distributed-invalidation hooks
-- Comprehensive stats (hit rate, latency p50/p99, eviction breakdown, hash collisions)
-- DoS protection: bounded by construction, max key/value size, snapshot size limit
+- Comprehensive stats (hit rate, latency p50/p99, eviction breakdown, hash collisions), publishable through `expvar` with the `memexpvar` subpackage
+- Hard bounds: `WithMaxEntries` and `WithMaxBytes` are true cache-wide maximums, plus max key/value size and a snapshot size limit that also caps allocation and decompression while loading
 - Zero runtime dependencies
 
 ## Installation
@@ -95,15 +95,19 @@ func main() {
 | Streaming / scanning | `PolicyFIFO` |
 | Skewed-and-stable | `PolicyLFU` |
 | Mixed recency/frequency | `PolicyARC` |
+| Scan-resistant with a probation queue | `Policy2Q` |
 
 ## Snapshots & Restart
 
 ```go
+dir, _ := os.UserCacheDir()
+path := filepath.Join(dir, "myrepl", "cache.gob") // the directory must exist
+
 cache, _ := memcache.New[string, *Result](
     memcache.WithMaxEntries(10_000),
     memcache.WithDefaultTTL(15*time.Minute),
-    memcache.WithAutoLoad("~/.cache/myrepl/cache.gob"),
-    memcache.WithAutoSave("~/.cache/myrepl/cache.gob", 30*time.Second),
+    memcache.WithAutoLoad(path),
+    memcache.WithAutoSave(path, 30*time.Second),
     memcache.WithAutoLoadIgnoreErrors(true),
 )
 ```
@@ -122,7 +126,9 @@ cache, _ := memcache.New[string, *Token](
 )
 
 // 1000 concurrent goroutines all calling GetOrLoad("token") will trigger
-// the loader exactly once.
+// the loader exactly once. Past 75% of the TTL a hit also starts a
+// background refresh, and for 5 minutes after expiry the stale token is
+// returned while the refresh runs.
 token, err := cache.GetOrLoad(ctx, "token")
 ```
 
@@ -140,7 +146,7 @@ This project follows a code of conduct to ensure a welcoming community. See [COD
 
 ## Security
 
-To report a vulnerability, see [SECURITY.md](SECURITY.md).
+To report a vulnerability, see [SECURITY.md](SECURITY.md). It also explains why a program that imports memcache and serves `http.DefaultServeMux` exposes `/debug/vars`.
 
 ## License
 

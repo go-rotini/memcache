@@ -27,8 +27,8 @@ func ExampleNew() {
 	// Output: 42 true
 }
 
-// ExampleNew_unboundedRejected demonstrates the spec-mandated
-// safety check: New refuses to construct an unbounded cache.
+// ExampleNew_unboundedRejected shows that New refuses to construct an
+// unbounded cache.
 func ExampleNew_unboundedRejected() {
 	_, err := memcache.New[string, int]()
 	fmt.Println(errors.Is(err, memcache.ErrUnbounded))

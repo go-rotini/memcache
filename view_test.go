@@ -1,6 +1,9 @@
 package memcache
 
 import (
+	"context"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -300,5 +303,53 @@ func TestCloneRegistersTags(t *testing.T) {
 	}
 	if cl.Has("k") {
 		t.Error("clone still has 'k' after tag invalidation")
+	}
+}
+
+func TestCloneSharesNoOutsideWiring(t *testing.T) {
+	dir := t.TempDir()
+	store := NewMemoryStore[string, int](nil)
+	sub := make(chan string, 1)
+	var published []string
+	c, err := New[string, int](
+		WithMaxEntries(8),
+		WithStore(store),
+		WithAutoSave(filepath.Join(dir, "snap"), time.Hour),
+		WithInvalidationSubscriber(sub),
+		WithInvalidationPublisher(func(k string, _ EvictionReason) { published = append(published, k) }),
+		WithOnEvict(func(string, int, EvictionReason) {}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+	_ = c.Set("k", 1)
+
+	cl, err := c.Clone()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = cl.Set("only-clone", 2)
+	cl.Delete("k")
+	if _, ok, _ := store.Get(context.Background(), "only-clone"); ok {
+		t.Error("clone wrote through to the original's Store")
+	}
+	if _, ok, _ := store.Get(context.Background(), "k"); !ok {
+		t.Error("clone deleted through the original's Store")
+	}
+	if len(published) != 0 {
+		t.Errorf("clone published invalidations: %v", published)
+	}
+	_ = cl.Close()
+	if _, err := os.Stat(filepath.Join(dir, "snap")); err == nil {
+		t.Error("clone auto-saved to the original's path")
+	}
+	sub <- "k"
+	deadline := time.Now().Add(time.Second)
+	for c.Len() > 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if c.Len() > 0 {
+		t.Error("original's subscriber stopped working after the clone closed")
 	}
 }

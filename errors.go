@@ -5,70 +5,94 @@ import (
 	"fmt"
 )
 
-// Sentinel errors. All errors returned by this package satisfy errors.Is
-// against one of these.
+// Sentinel errors. Match them with [errors.Is]; several are carried as
+// the Cause of a [*CapacityError] or the Err of a [*SnapshotError].
 var (
-	// ErrNotFound is returned by Get-style methods when the key is absent
-	// or expired. Loaders may also return this to signal a not-found
-	// result, which the cache may negatively cache.
+	// ErrNotFound is returned by [Cache.Update] when the key is absent
+	// or expired, and by [Cache.GetOrLoad] on a negative-cache hit.
+	// A Loader returns it to signal a not-found result, which
+	// [WithNegativeCache] caches.
 	ErrNotFound = errors.New("memcache: not found")
 
 	// ErrClosed is returned when an operation is attempted on a closed
 	// cache.
 	ErrClosed = errors.New("memcache: cache is closed")
 
-	// ErrUnbounded is returned by New when no size bound is configured.
+	// ErrUnbounded is returned by [New] when neither [WithMaxEntries]
+	// nor [WithMaxBytes] is configured.
 	ErrUnbounded = errors.New("memcache: must specify WithMaxEntries or WithMaxBytes")
 
-	// ErrNoLoader is returned by GetOrLoad when no Loader is configured.
+	// ErrNoLoader is returned by the loading methods ([Cache.GetOrLoad],
+	// [Cache.Refresh], [Cache.GetMultiOrLoad]) when no [Loader] is
+	// configured, and by [Cache.GetOrLoadFn] when fn is nil.
 	ErrNoLoader = errors.New("memcache: no loader configured")
 
-	// ErrInvalidTTL is returned by SetWithTTL on a negative TTL.
+	// ErrInvalidTTL is returned when a write is given a negative TTL.
 	ErrInvalidTTL = errors.New("memcache: ttl must be non-negative")
 
-	// ErrSnapshotIncompatible is returned by Load when the snapshot format
-	// version is not understood.
+	// ErrSnapshotIncompatible is the Err of the [*SnapshotError] a load
+	// returns when the snapshot's signature, format version, codec or
+	// schema fingerprint does not match the cache.
 	ErrSnapshotIncompatible = errors.New("memcache: snapshot version not supported")
 
-	// ErrSnapshotCorrupt is returned by Load when the snapshot fails its
-	// CRC check or is otherwise malformed.
+	// ErrSnapshotCorrupt is the Err of the [*SnapshotError] a load
+	// returns when the snapshot fails its CRC check or is otherwise
+	// malformed.
 	ErrSnapshotCorrupt = errors.New("memcache: snapshot corrupt")
 
-	// ErrKeyTooLarge is returned by Set when a key exceeds WithMaxKeySize.
+	// ErrSnapshotTooLarge is the Err of the [*SnapshotError] a save
+	// returns when the snapshot would pass [WithMaxSnapshotBytes], or
+	// its [CompressedCodec] fields would decompress past the limit Load
+	// allows, and of the one a load returns for the latter.
+	ErrSnapshotTooLarge = errors.New("memcache: snapshot exceeds size limit")
+
+	// ErrKeyTooLarge is the Cause of the [*CapacityError] a write
+	// returns when a key exceeds [WithMaxKeySize].
 	ErrKeyTooLarge = errors.New("memcache: key exceeds size limit")
 
-	// ErrValueTooLarge is returned by Set when a value's weight exceeds
-	// WithMaxValueWeight.
+	// ErrValueTooLarge is the Cause of the [*CapacityError] a write
+	// returns when a value's weight exceeds [WithMaxValueWeight].
 	ErrValueTooLarge = errors.New("memcache: value exceeds weight limit")
 
-	// ErrTooManyTags is returned by SetWithTags when the entry has more
-	// tags than WithMaxTagsPerEntry permits.
+	// ErrTooManyTags is the Cause of the [*CapacityError] a write
+	// returns when its tags exceed [WithMaxTagsPerEntry] or
+	// [WithMaxTagsTotal].
 	ErrTooManyTags = errors.New("memcache: too many tags for entry")
 
-	// ErrLoaderRateLimited is returned by GetOrLoad when the loader rate
-	// limit (WithLoaderRateLimit) has been exceeded for this tick.
+	// ErrLoaderRateLimited is returned by [Cache.GetOrLoad] and
+	// [Cache.GetOrLoadFn] when [WithLoaderRateLimit] rejects a load.
 	ErrLoaderRateLimited = errors.New("memcache: loader rate limit exceeded")
 
-	// ErrLoaderTimeout is returned when a Loader exceeds the per-call
-	// deadline set by WithLoaderTimeout.
+	// ErrLoaderTimeout is joined with [context.DeadlineExceeded] when a
+	// Loader call exceeds [WithLoaderTimeout].
 	ErrLoaderTimeout = errors.New("memcache: loader timeout exceeded")
 
-	// ErrLoaderTooManyInFlight is returned by GetOrLoad when the number of
-	// in-flight Loader calls has reached WithMaxConcurrentLoads and the
-	// caller's context cancels before a slot opens.
+	// ErrLoaderPanic is wrapped in the [*LoadError] that every waiter
+	// of a load receives when the Loader (or the GetOrLoadFn function)
+	// panics. The panic value is part of the error text; the stack is
+	// logged through [WithLogger].
+	ErrLoaderPanic = errors.New("memcache: loader panicked")
+
+	// ErrLoaderTooManyInFlight is returned by [Cache.GetOrLoad] when
+	// [WithMaxConcurrentLoads] is reached and no slot frees up before
+	// the load's context ends ([WithLoaderTimeout] expires, or every
+	// waiting caller gives up).
 	ErrLoaderTooManyInFlight = errors.New("memcache: too many in-flight loads")
 
-	// ErrComputeReentrant is returned (panicked) when a Compute callback
-	// attempts to call back into the cache for the same key.
+	// ErrComputeReentrant is the panic value raised when a callback of
+	// [Cache.Compute], [Cache.ComputeIfAbsent], [Cache.ComputeIfPresent]
+	// or [Cache.Update] calls one of those methods again for a key on
+	// the same shard of the same cache, which would otherwise deadlock.
 	ErrComputeReentrant = errors.New("memcache: compute callback re-entered cache")
 )
 
-// ConfigError describes an invalid configuration passed to New.
+// ConfigError describes an option rejected by [New].
 type ConfigError struct {
 	Field   string
 	Message string
 }
 
+// Error implements the error interface.
 func (e *ConfigError) Error() string {
 	if e.Field == "" {
 		return "memcache: " + e.Message
@@ -82,16 +106,18 @@ func (e *ConfigError) Is(target error) bool {
 	return ok
 }
 
-// CapacityError describes a Set rejected because of size limits.
+// CapacityError describes a write rejected by a size or tag limit. Key
+// is the rejected key; Error leaves it out.
 type CapacityError struct {
 	Key        any
 	Reason     string
 	LimitField string
-	// Cause is the underlying sentinel (e.g. [ErrTooManyTags]).
-	// Optional; populated when the limit field has a dedicated sentinel.
+	// Cause is the sentinel for the limit that was hit:
+	// [ErrKeyTooLarge], [ErrValueTooLarge] or [ErrTooManyTags].
 	Cause error
 }
 
+// Error implements the error interface.
 func (e *CapacityError) Error() string {
 	return fmt.Sprintf("memcache: capacity (%s): %s", e.LimitField, e.Reason)
 }
@@ -99,8 +125,7 @@ func (e *CapacityError) Error() string {
 // Unwrap returns the underlying sentinel cause, if any.
 func (e *CapacityError) Unwrap() error { return e.Cause }
 
-// Is reports whether target is a *CapacityError or the cached
-// sentinel cause.
+// Is reports whether target is a *CapacityError or matches Cause.
 func (e *CapacityError) Is(target error) bool {
 	if _, ok := target.(*CapacityError); ok {
 		return true
@@ -111,14 +136,22 @@ func (e *CapacityError) Is(target error) bool {
 	return false
 }
 
-// LoadError wraps an error returned by a Loader.
+// LoadError wraps an error returned by a [Loader] or a [Cache.GetOrLoadFn]
+// function, as returned from [Cache.GetOrLoad] and [Cache.GetOrLoadFn].
+// [errors.Is] and [errors.As] see the Loader's error through Unwrap.
+// Key is the key being loaded; Error leaves it out, since keys are often
+// tokens or personal data that shouldn't reach logs.
 type LoadError struct {
 	Key any
 	Err error
 }
 
+// Error implements the error interface.
 func (e *LoadError) Error() string {
-	return fmt.Sprintf("memcache: load %v: %v", e.Key, e.Err)
+	if e.Err == nil {
+		return "memcache: load failed"
+	}
+	return "memcache: load: " + e.Err.Error()
 }
 
 // Unwrap returns the underlying error.
@@ -132,26 +165,34 @@ func (e *LoadError) Is(target error) bool {
 
 // SnapshotError describes a snapshot save or load failure.
 type SnapshotError struct {
-	Op      string // "save" or "load"
-	Path    string
+	Op   string // "save" or "load"
+	Path string
+	// Offset is, for a load, the byte offset in the snapshot where the
+	// failure was found; for a failure inside an encrypted snapshot's
+	// records, the offset of the encrypted block.
 	Offset  int64
 	Message string
 	Err     error
 }
 
+// Error implements the error interface. It includes Err's text.
 func (e *SnapshotError) Error() string {
+	msg := "memcache: snapshot " + e.Op
 	if e.Path != "" {
-		return fmt.Sprintf("memcache: snapshot %s %s: %s", e.Op, e.Path, e.Message)
+		msg += " " + e.Path
 	}
-	return fmt.Sprintf("memcache: snapshot %s: %s", e.Op, e.Message)
+	msg += ": " + e.Message
+	if e.Err != nil {
+		msg += ": " + e.Err.Error()
+	}
+	return msg
 }
 
 // Unwrap returns the underlying error.
 func (e *SnapshotError) Unwrap() error { return e.Err }
 
-// Is reports whether target is a *SnapshotError or one of the snapshot
-// sentinels (ErrSnapshotCorrupt, ErrSnapshotIncompatible) when the
-// corresponding error is wrapped.
+// Is reports whether target is a *SnapshotError or matches Err (for
+// example [ErrSnapshotCorrupt] or [ErrSnapshotIncompatible]).
 func (e *SnapshotError) Is(target error) bool {
 	if _, ok := target.(*SnapshotError); ok {
 		return true
@@ -159,13 +200,14 @@ func (e *SnapshotError) Is(target error) bool {
 	return errors.Is(e.Err, target)
 }
 
-// CodecError wraps an error from a Codec implementation.
+// CodecError wraps an error from a [Codec] implementation.
 type CodecError struct {
 	Op    string // "marshal" or "unmarshal"
 	Codec string // codec name ("gob", "json", "raw", ...)
 	Err   error
 }
 
+// Error implements the error interface.
 func (e *CodecError) Error() string {
 	return fmt.Sprintf("memcache: codec %s %s: %v", e.Codec, e.Op, e.Err)
 }

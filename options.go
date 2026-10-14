@@ -277,33 +277,45 @@ func nextPowerOfTwo(n int) int {
 	return p
 }
 
-// WithMaxEntries sets the maximum number of entries (across all
-// shards). Must be > 0.
+// WithMaxEntries sets the maximum number of entries across all shards.
+// Every write that adds an entry evicts until the whole cache is back
+// within n, so the bound holds whatever the shard count; only writes
+// running at the same moment can exceed it, briefly, by one entry each.
+// A negative n is a [*ConfigError] at [New]; 0 leaves the entry count
+// unbounded.
 func WithMaxEntries(n int) Option {
 	return func(c *config) { c.maxEntries = n }
 }
 
 // WithMaxBytes sets the maximum total weight of entries across the
-// cache. Effective only when the cache has a configured Weigher.
+// cache, as measured by the [Weigher]. A write that takes the cache over
+// it evicts policy-chosen victims, from the written shard first and then
+// from the others, until the total fits again. It requires [WithWeigher];
+// without one, [New] returns a [*ConfigError]. With [WithMaxEntries] as
+// well, both bounds apply.
 func WithMaxBytes(n int64) Option {
 	return func(c *config) { c.maxBytes = n }
 }
 
 // WithDefaultTTL sets the TTL applied by Set when no per-call TTL is
-// supplied. A zero duration means "no TTL by default".
+// supplied. A zero duration means "no TTL by default". Expiry is
+// jittered by ±5% of the TTL by default; see [WithTTLJitter].
 func WithDefaultTTL(d time.Duration) Option {
 	return func(c *config) { c.defaultTTL = d }
 }
 
 // WithSlidingTTL toggles sliding-TTL behavior on the cache's default TTL.
-// When true, every Get refreshes the entry's expiry to now+slidingTTL.
+// When true, a Get refreshes the entry's expiry to now plus its TTL;
+// refreshes less than a quarter of the TTL apart are skipped.
 func WithSlidingTTL(b bool) Option {
 	return func(c *config) { c.slidingTTL = b }
 }
 
 // WithTTLJitter sets the jitter window applied to TTL expirations: actual
-// expiry is ttl + uniform(-j, +j). Default is 5% of the resolved TTL; an
-// explicit zero disables jitter entirely.
+// expiry is ttl + uniform(-j, +j), so an entry can outlive its TTL by up
+// to j. Default is 5% of the resolved TTL; an explicit zero disables
+// jitter entirely. The jitter applies to every TTL: Set, SetWithTTL,
+// loads, [Cache.Touch] and [Cache.TouchWithTTL].
 func WithTTLJitter(j time.Duration) Option {
 	return func(c *config) {
 		c.ttlJitter = j
@@ -324,8 +336,9 @@ func WithPolicy(p Policy) Option {
 	return func(c *config) { c.policy = p }
 }
 
-// WithShards sets the shard count. Must be a power of two; values that
-// are not are rounded up at construction time.
+// WithShards sets the shard count. Values that are not a power of two
+// are rounded up to one; values below 1 become 1. The default is
+// 4×GOMAXPROCS rounded up to a power of two, capped at 1024.
 func WithShards(n int) Option {
 	return func(c *config) {
 		if n < 1 {
@@ -335,20 +348,22 @@ func WithShards(n int) Option {
 	}
 }
 
-// WithMaxKeySize rejects keys whose serialized representation exceeds
-// n bytes. Default 0 (no limit).
+// WithMaxKeySize rejects string keys longer than n bytes with a
+// [*CapacityError] matching [ErrKeyTooLarge]. Keys of other types are
+// not measured. Default 0 (no limit).
 func WithMaxKeySize(n int) Option {
 	return func(c *config) { c.maxKeySize = n }
 }
 
-// WithMaxValueWeight rejects values whose Weigher result exceeds n.
-// Default 0 (no limit).
+// WithMaxValueWeight rejects values whose weight exceeds n with a
+// [*CapacityError] matching [ErrValueTooLarge]. Default 0 (no limit).
 func WithMaxValueWeight(n int64) Option {
 	return func(c *config) { c.maxValueWeight = n }
 }
 
-// WithName attaches a human-readable name to the cache. Used in stats,
-// events, and error messages.
+// WithName attaches a human-readable name to the cache. It is written
+// to snapshot headers (see [SnapshotInfo]) and included in some log
+// messages.
 func WithName(name string) Option {
 	return func(c *config) { c.name = name }
 }
@@ -433,12 +448,43 @@ func WithAsyncWrites() Option {
 
 // WithStore wires a user-supplied [Store] behind the cache as the source
 // of truth. Reads check in-memory first then fall through to Store with
-// promotion; writes go through to Store and roll the in-memory entry
-// back on Store error; deletes go through and the in-memory delete
-// completes regardless of Store error. The cache does NOT close the
-// Store on [Cache.Close]. Iteration helpers ([Cache.Range],
-// [Cache.Keys]) walk only the in-memory portion. A Store whose K/V do
-// not match the cache parameters is a [ConfigError] at [New].
+// promotion; concurrent reads of one key share a single Store read.
+// Methods that act on whether a key is present (GetOrSet, PeekOrAdd,
+// SetIfAbsent, SetIfPresent, DeleteIf, the Compute family, Increment)
+// read a key missing from memory from the Store first, and return a
+// Store read error. Every write (Set and its variants, GetOrSet,
+// SetIfAbsent, the Compute family, Increment) goes through to Store and
+// rolls the in-memory entry back on Store error; deletes ([Cache.Delete],
+// DeleteIf, and the keys DeleteWhere and DeletePrefix find in memory) go
+// to the Store first and the in-memory delete completes regardless of
+// Store error. Writes of one key are serialized across memory and the
+// Store, so they reach both in the same order; hooks run after that, so
+// a hook may write the key whose write fired it.
+//
+// Some operations act on memory only: eviction, expiry, [Cache.Clear],
+// [Cache.Reset], [Cache.InvalidateTag], snapshot loads, and [Loader]
+// loads ([Cache.GetOrLoad], refresh-ahead and stale-while-revalidate),
+// which neither read nor write the Store. [Cache.GetMultiOrLoad] reads
+// each key as [Cache.GetCtx] does, and writes [BulkLoader] results to
+// the Store as [Cache.SetWithOptions] does.
+//
+// A Store hit is promoted with [WithDefaultTTL], since [Store.Get]
+// returns no TTL. For a Store that also implements [TTLStore], the cache
+// asks for the record's remaining TTL after the Get, one extra Store
+// call: the promoted copy then expires no later than the record, and is
+// not kept when the lookup finds the record gone. A write that keeps a
+// key's expiry (the Compute family, [Cache.Update],
+// [Cache.CompareAndSwap], [Increment]) keeps the Store record's TTL; it
+// looks that TTL up first unless the same call just read the key from the
+// Store. Without TTLStore, or when the TTL lookup fails or finds no
+// record, such a write gives the record the in-memory copy's TTL, or
+// [WithDefaultTTL] when memory keeps no copy. [MemoryStore] implements
+// TTLStore.
+//
+// Iteration helpers ([Cache.Range], [Cache.Keys]) walk only the
+// in-memory portion. The cache does NOT close the Store on
+// [Cache.Close]. A Store whose K/V do not match the cache parameters is
+// a [ConfigError] at [New].
 func WithStore[K comparable, V any](store Store[K, V]) Option {
 	return func(c *config) { c.store = store }
 }
@@ -469,9 +515,12 @@ func WithWeigher[V any](fn Weigher[V]) Option {
 	}
 }
 
-// WithHasher overrides the default key hasher. Useful when the caller
-// can supply a faster hasher for their key type than the package's
-// default reflect-based fallback.
+// WithHasher overrides the default key hasher. The default is keyed
+// randomly per cache, so key placement can't be predicted; it handles
+// string, integer and bool keys directly and hashes other key types
+// through their fmt %v form, so a custom hasher is faster for struct
+// or pointer keys. A hasher whose type does not match K is rejected by
+// [New] as a [*ConfigError].
 func WithHasher[K comparable](fn func(K) uint64) Option {
 	return func(c *config) {
 		if fn != nil {
@@ -481,7 +530,8 @@ func WithHasher[K comparable](fn func(K) uint64) Option {
 }
 
 // WithLoader attaches a [Loader] used by [Cache.GetOrLoad] and
-// related methods.
+// related methods. Loaded values are cached in memory only; with
+// [WithStore], loads neither read nor write the Store.
 func WithLoader[K comparable, V any](l Loader[K, V]) Option {
 	return func(c *config) {
 		if l != nil {
@@ -568,35 +618,51 @@ func WithNegativeCache(negativeTTL time.Duration) Option {
 
 // WithErrorTTL caches Loader errors (other than [ErrNotFound]) for d.
 // Subsequent [Cache.GetOrLoad] calls within the window return the cached
-// error without re-invoking the Loader.
+// error without re-invoking the Loader. Each shard keeps at most its
+// share of [WithMaxEntries] errors (at least 64), dropping expired ones
+// first when full.
 func WithErrorTTL(d time.Duration) Option {
 	return func(c *config) { c.errorTTL = d }
 }
 
-// WithLoaderTimeout sets the per-call deadline applied to Loader
-// contexts when the caller does not supply one.
+// WithLoaderTimeout sets a deadline on every Loader call. Loader
+// contexts are detached from the caller's context, so this is the only
+// deadline a Loader sees. A load that times out returns an error
+// matching both [ErrLoaderTimeout] and [context.DeadlineExceeded].
+// Zero (the default) sets no deadline.
 func WithLoaderTimeout(d time.Duration) Option {
 	return func(c *config) { c.loaderTimeout = d }
 }
 
 // WithRefreshAhead enables refresh-ahead: when an entry's age exceeds
-// refreshAt*TTL, the next [Cache.Get] triggers an asynchronous Loader
-// call. refreshAt must be in (0, 1); other values disable.
+// refreshAt*TTL, the next [Cache.Get] or [Cache.GetOrLoad] hit triggers
+// an asynchronous Loader call. refreshAt must be in (0, 1); other values disable.
 func WithRefreshAhead(refreshAt float64) Option {
 	return func(c *config) { c.refreshAheadAt = refreshAt }
 }
 
 // WithStaleWhileRevalidate enables stale-while-revalidate: when an entry
 // has expired but its expireAt was less than staleFor ago, the next
-// [Cache.Get] returns the stale value and triggers a background refresh.
+// [Cache.Get] or [Cache.GetOrLoad] returns the stale value and triggers
+// a background refresh.
 // staleFor <= 0 disables SWR.
 func WithStaleWhileRevalidate(staleFor time.Duration) Option {
 	return func(c *config) { c.swrStaleFor = staleFor }
 }
 
-// WithExpvar registers the cache's Stats under name in stdlib expvar as
-// a JSON object keyed on snake-case stat names. A duplicate registration
-// is silently a no-op.
+// WithExpvar publishes the cache's main [Stats] counters under name in
+// the standard expvar package, as a JSON object with snake_case keys.
+// While another live cache holds name, this is a no-op; once that cache
+// is closed, the next cache built with name takes it over. A name that
+// something other than memcache published makes [New] return a
+// [*ConfigError].
+//
+// Deprecated: Use memexpvar.Publish from the
+// github.com/go-rotini/memcache/memexpvar package. WithExpvar makes this
+// package import expvar, whose init serves the process's command line
+// and memory statistics at /debug/vars on [net/http.DefaultServeMux] in
+// every program that imports memcache, whether or not it calls
+// WithExpvar. The next major version drops WithExpvar and that import.
 func WithExpvar(name string) Option {
 	return func(c *config) {
 		if name != "" {
@@ -631,7 +697,12 @@ func WithSnapshotMetadata(meta map[string]string) Option {
 
 // WithMaxSnapshotBytes caps snapshots accepted by [Cache.Load] /
 // [Cache.LoadFile]. A non-positive value falls back to the default
-// (256 MiB).
+// (256 MiB). The fields of a [CompressedCodec] snapshot may decompress
+// to at most 16 times the cap in total. With the option set,
+// [Cache.Save] and [Cache.SaveFile] fail with [ErrSnapshotTooLarge]
+// rather than write a snapshot past either bound. Without it, they have
+// no size limit, except that SaveFile and auto-save to the [WithAutoLoad]
+// path apply the default one.
 func WithMaxSnapshotBytes(n int64) Option {
 	return func(c *config) { c.maxSnapshotBytes = n }
 }
@@ -648,8 +719,12 @@ func WithAutoSave(path string, interval time.Duration) Option {
 }
 
 // WithAutoLoad populates the cache from a snapshot at path during [New].
-// A missing file is not an error; any other load error fails [New]
-// unless [WithAutoLoadIgnoreErrors] is also set.
+// A missing file is not an error, and neither is an encrypted snapshot
+// written by memcache v1.0.2 or earlier: [Cache.Load] refuses those with
+// [ErrSnapshotIncompatible], so auto-load logs a warning and the cache
+// starts empty, as with no file, until the next save replaces it. Any
+// other load error fails [New] unless [WithAutoLoadIgnoreErrors] is also
+// set.
 func WithAutoLoad(path string) Option {
 	return func(c *config) { c.autoLoadPath = path }
 }
@@ -672,9 +747,9 @@ func WithEventsBuffer(n int) Option {
 }
 
 // WithOnHit registers a synchronous callback invoked on every Get hit.
-// The callback runs under the shard lock; slow callbacks block the Get
-// path and re-entering the cache for a same-shard key deadlocks. Use
-// [Cache.Subscribe] for asynchronous notification.
+// The callback may run while the shard lock is held; slow callbacks
+// block the Get path and re-entering the cache for a same-shard key
+// can deadlock. Use [Cache.Subscribe] for asynchronous notification.
 func WithOnHit[K comparable, V any](fn func(key K, value V)) Option {
 	return func(c *config) {
 		if fn != nil {
@@ -695,9 +770,9 @@ func WithOnMiss[K comparable](fn func(key K)) Option {
 }
 
 // WithOnEvict registers a callback invoked when an entry is removed for
-// any reason OTHER than TTL expiry. The callback fires AFTER the shard
-// lock is released, so re-entering the cache from the callback is safe.
-// Multiple removals from one locked section batch their callbacks.
+// any reason other than expiry. [Cache.Clear], [Cache.Reset] and
+// [Cache.Close] do not fire it. The callback fires after the shard lock
+// is released, so re-entering the cache from the callback is safe.
 func WithOnEvict[K comparable, V any](fn func(key K, value V, reason EvictionReason)) Option {
 	return func(c *config) {
 		if fn != nil {
@@ -728,12 +803,13 @@ func WithOnLoad[K comparable, V any](fn func(key K, value V, ttl time.Duration, 
 }
 
 // WithExpireFunc registers a per-entry expiry predicate. fn is called
-// on every Get and janitor sweep with the entry's metadata; true marks
-// it expired regardless of TTL. Removals via fn are recorded under
-// [EvictReasonExpireFunc]. fn MUST be fast and side-effect-free; it is
-// called under shard locks and is NOT routed through
-// [WithCallbackTimeout]. A panicking fn is recovered and the entry is
-// treated as fresh.
+// whenever a read checks an entry's freshness (Get, Peek, Has, Range and
+// similar); true marks the entry expired regardless of TTL. The janitor
+// and [Cache.DeleteExpired] check TTLs only. Removals via fn are
+// recorded under [EvictReasonExpireFunc]. fn must be fast and
+// side-effect-free; it is called under shard locks and is not routed
+// through [WithCallbackTimeout]. A panicking fn is recovered and the
+// entry is treated as fresh.
 func WithExpireFunc[K comparable, V any](fn func(key K, value V, meta Metadata) bool) Option {
 	return func(c *config) {
 		if fn != nil {

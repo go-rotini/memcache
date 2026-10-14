@@ -155,3 +155,73 @@ func (w *writeOnlyBuffer) Write(p []byte) (int, error) {
 	w.buf = append(w.buf, p...)
 	return len(p), nil
 }
+
+func BenchmarkGetHitWithOnHit(b *testing.B) {
+	c, _ := New[string, int](WithMaxEntries(1024), WithOnHit(func(string, int) {}))
+	defer c.Close()
+	_ = c.Set("k", 1)
+
+	for b.Loop() {
+		_, _ = c.Get("k")
+	}
+}
+
+func BenchmarkSetUpdate(b *testing.B) {
+	c, _ := New[string, int](WithMaxEntries(1024))
+	defer c.Close()
+
+	i := 0
+	for b.Loop() {
+		_ = c.Set("k", i)
+		i++
+	}
+}
+
+func BenchmarkIncrement(b *testing.B) {
+	c, _ := New[string, int](WithMaxEntries(1024))
+	defer c.Close()
+
+	for b.Loop() {
+		_, _ = Increment(c, "k")
+	}
+}
+
+func BenchmarkGetFlatStorage64Shards(b *testing.B) {
+	c, _ := New[int, int](WithMaxEntries(200_000), WithShards(64), WithFlatStorage())
+	defer c.Close()
+	const n = 100_000
+	for i := range n {
+		_ = c.Set(i, i)
+	}
+	i := 0
+	for b.Loop() {
+		_, _ = c.Get(i % n)
+		i += 7919
+	}
+}
+
+func BenchmarkGetHit2QParallel(b *testing.B) {
+	c, _ := New[int, int](WithMaxEntries(4096), WithPolicy(Policy2Q))
+	defer c.Close()
+	for i := range 1024 {
+		_ = c.Set(i, i)
+	}
+	b.RunParallel(func(pb *testing.PB) {
+		i := 0
+		for pb.Next() {
+			_, _ = c.Get(i % 1024)
+			i++
+		}
+	})
+}
+
+func BenchmarkSetWithStore(b *testing.B) {
+	c, _ := New[string, int](WithMaxEntries(1024), WithStore[string, int](NewMemoryStore[string, int](nil)))
+	defer c.Close()
+
+	i := 0
+	for b.Loop() {
+		_ = c.Set("k", i)
+		i++
+	}
+}

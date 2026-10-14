@@ -1,8 +1,9 @@
 //go:build !race
 
-// bench_perftargets_test.go validates the package against the
-// spec's §19.6.5 performance targets. Excluded under -race because
-// the race detector's instrumentation invalidates the targets.
+// bench_perftargets_test.go validates the package against its Get
+// latency targets (P50 < 200ns, P99 < 2µs on a hot key). Excluded under
+// -race because the race detector's instrumentation invalidates the
+// targets.
 //
 // Run with: go test -bench=BenchmarkPerfTargets -benchtime=3s -run='^$' .
 
@@ -95,8 +96,9 @@ func BenchmarkPerfTargets_VsSyncMap(b *testing.B) {
 	})
 }
 
-// TestPerfTargetsBaseline validates spec §19.6.5 with a 4x CI safety
-// margin against the spec targets.
+// TestPerfTargetsBaseline checks the Get latency targets with a 4x CI
+// safety margin. The typical latency is measured as testing.B ns/op,
+// which resolves single nanoseconds; the tail comes from a histogram.
 func TestPerfTargetsBaseline(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping perf baseline in -short mode")
@@ -112,6 +114,13 @@ func TestPerfTargetsBaseline(t *testing.T) {
 		c.Get("hot")
 	}
 
+	res := testing.Benchmark(func(b *testing.B) { //nolint:thelper // a benchmark body, not a helper
+		for b.Loop() {
+			c.Get("hot")
+		}
+	})
+	perOp := time.Duration(res.NsPerOp())
+
 	const samples = 10_000
 	var hist tdigest.Histogram
 	for range samples {
@@ -121,15 +130,15 @@ func TestPerfTargetsBaseline(t *testing.T) {
 	}
 	s := hist.Snapshot()
 	const (
-		// Spec §19.6.5: p50 < 200ns, p99 < 2µs; 4x CI safety margin.
-		p50Bound = 800 * time.Nanosecond
+		// Targets: typical < 200ns, P99 < 2µs; 4x CI safety margin.
+		opBound  = 800 * time.Nanosecond
 		p99Bound = 8 * time.Microsecond
 	)
-	if s.P50 > p50Bound {
-		t.Errorf("p50 = %v, exceeds 4x-safety bound of %v (spec target: 200ns)", s.P50, p50Bound)
+	if perOp > opBound {
+		t.Errorf("Get = %v/op, exceeds 4x-safety bound of %v (target: 200ns)", perOp, opBound)
 	}
 	if s.P99 > p99Bound {
-		t.Errorf("p99 = %v, exceeds 4x-safety bound of %v (spec target: 2µs)", s.P99, p99Bound)
+		t.Errorf("p99 = %v, exceeds 4x-safety bound of %v (target: 2µs)", s.P99, p99Bound)
 	}
-	t.Logf("p50=%v p99=%v mean=%v over %d samples", s.P50, s.P99, s.Mean, samples)
+	t.Logf("Get=%v/op p99=%v over %d samples", perOp, s.P99, samples)
 }

@@ -21,7 +21,7 @@ func TestAcceptanceREPLWarmRestart(t *testing.T) {
 
 	// First run: populate the cache and exit cleanly.
 	first, err := New[string, int](
-		WithMaxEntries(64),
+		WithMaxEntries(64), WithShards(1),
 		WithName("repl-1"),
 		WithAutoSave(path, 0), // final-save on Close only
 	)
@@ -39,7 +39,7 @@ func TestAcceptanceREPLWarmRestart(t *testing.T) {
 
 	// Second run: WithAutoLoad reads the snapshot at New() time.
 	second, err := New[string, int](
-		WithMaxEntries(64),
+		WithMaxEntries(64), WithShards(1),
 		WithName("repl-2"),
 		WithAutoLoad(path),
 	)
@@ -237,7 +237,7 @@ func TestAcceptanceNegativeCacheBlocksRepeatedLookups(t *testing.T) {
 // TestAcceptanceTieredWarmPool composes a tight L1 with a generous L2.
 func TestAcceptanceTieredWarmPool(t *testing.T) {
 	l1, _ := New[string, int](WithMaxEntries(4), WithShards(1))
-	l2, _ := New[string, int](WithMaxEntries(64))
+	l2, _ := New[string, int](WithMaxEntries(64), WithShards(1))
 	tc := NewTiered(l1, l2)
 	defer tc.Close()
 

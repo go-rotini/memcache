@@ -20,8 +20,8 @@
 //
 // # Bounded by Default
 //
-// The cache must be bounded at construction. [New] returns [ErrUnbounded]
-// if neither [WithMaxEntries] nor [WithMaxBytes] is supplied. Use
+// [New] returns [ErrUnbounded] if neither [WithMaxEntries] nor
+// [WithMaxBytes] is supplied. Use
 // [NewUnbounded] only when the key space is provably bounded by something
 // else.
 //
@@ -44,10 +44,9 @@
 // # Snapshot & Restore
 //
 // The cache can be persisted to disk and restored on the next process
-// launch, the killer feature for REPL-style workloads where a 30-second
-// warm-up cost dominates user perception. [Cache.Save] and [Cache.Load]
-// handle the basic flow; [WithAutoSave] and [WithAutoLoad] make persistence
-// transparent for the typical CLI case.
+// launch, so a restarted program starts warm. [Cache.Save] and
+// [Cache.Load] handle the basic flow; [WithAutoSave] and [WithAutoLoad]
+// make persistence automatic.
 //
 // # Tags
 //
@@ -63,11 +62,14 @@
 //
 // # Errors
 //
-// All errors implement [errors.Is]:
+// Failures are reported as sentinel errors such as [ErrClosed] and
+// [ErrNotFound], or as the typed errors [ConfigError], [CapacityError],
+// [SnapshotError] and [CodecError]. Match both kinds with [errors.Is]
+// and [errors.As]; a typed error also matches the sentinel it carries:
 //
 //	if errors.Is(err, memcache.ErrNotFound) { ... }
-//	if errors.Is(err, memcache.ErrClosed) { ... }
+//	if errors.Is(err, memcache.ErrTooManyTags) { ... } // a *CapacityError
 //
-// See [ConfigError], [CapacityError], [LoadError], [SnapshotError],
-// [CodecError], and the full error type list in errors.go.
+// Errors returned by a [Loader] reach the caller unwrapped; a load that
+// exceeds [WithLoaderTimeout] also matches [ErrLoaderTimeout].
 package memcache
