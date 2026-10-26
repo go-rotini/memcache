@@ -5,185 +5,38 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  workflow_dispatch:
 
 permissions:
   contents: read
 
 jobs:
-  test:
-    runs-on: ubuntu-latest
-    strategy:
-      matrix:
-        go-version: ["1.26.x", "stable"]
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
-        with:
-          go-version: ${{ matrix.go-version }}
-          check-latest: true
-
-      - name: Test
-        run: make test
-
-      - name: Upload coverage
-        if: matrix.go-version == '1.26.x'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: coverage
-          path: test.out
-
-  # Line endings, paths and snapshot files differ by OS.
-  test-os:
-    strategy:
-      matrix:
-        os: [macos-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      # Keep the checkout byte-identical to Linux: golden files and fixtures compare bytes.
-      - name: Check out with LF line endings
-        run: git config --global core.autocrlf false
-
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
-        with:
-          go-version: "1.26.x"
-          check-latest: true
-
-      - name: Test
-        run: go test -count=1 ./...
-
-      - name: Race detector
-        run: go test -race -count=1 ./...
-
-  acceptance:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
-        with:
-          go-version: "1.26.x"
-          check-latest: true
-
-      - name: Acceptance
-        run: make test-acceptance
-
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
-        with:
-          go-version: "1.26.x"
-          check-latest: true
-          # This job runs the development tools, which tools.mod pins separately from go.mod,
-          # so a tool bump has to change the cache key too.
-          cache-dependency-path: |
-            go.sum
-            tools.sum
-
-      - name: Lint
-        run: make lint
-
-  fuzz:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
-        with:
-          go-version: "1.26.x"
-          check-latest: true
-
-      - name: Fuzz smoke test
-        run: make test-fuzz
-
-  corpus:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
-        with:
-          go-version: "1.26.x"
-          check-latest: true
-
-      - name: Correctness corpus
-        run: make test-corpus
-
-  benchmark:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
-        with:
-          go-version: "1.26.x"
-          check-latest: true
-
-      - name: Benchmarks
-        run: make test-bench
-
-      - name: Upload benchmark results
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: benchmarks
-          path: test_bench.out
-
-  race:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
-        with:
-          go-version: "1.26.x"
-          check-latest: true
-
-      - name: Race detector
-        run: make test-race
-
-  dependency-review:
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-
-      - uses: actions/dependency-review-action@2031cfc080254a8a887f58cffee85186f0e49e48 # v4
-
-  commitlint:
-    if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
-        with:
-          fetch-depth: 0
-
-      # A squash merge makes the pull request's title the commit semantic-release reads, so the
-      # title is checked too. Merge commits (main merged into the branch) are skipped.
-      - name: Check conventional commits
-        env:
-          BASE: ${{ github.event.pull_request.base.sha }}
-          HEAD: ${{ github.event.pull_request.head.sha }}
-          TITLE: ${{ github.event.pull_request.title }}
-        run: |
-          PATTERN='^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|revert)(\(.+\))?(!)?: .+'
-          FAILED=0
-          if ! printf '%s\n' "$TITLE" | grep -qE "$PATTERN"; then
-            echo "BAD pull request title: $TITLE"
-            FAILED=1
-          fi
-          for SHA in $(git rev-list --no-merges "$BASE".."$HEAD"); do
-            MSG=$(git log --format=%s -n1 "$SHA")
-            if ! echo "$MSG" | grep -qE "$PATTERN"; then
-              echo "BAD: $MSG"
-              FAILED=1
-            fi
-          done
-          if [ "$FAILED" -eq 1 ]; then
-            echo "::error::The pull request title or some commits do not follow Conventional Commits (https://www.conventionalcommits.org)"
-            exit 1
-          fi
+  ci:
+    uses: go-rotini/.github/.github/workflows/go-ci.yml@main
+    with:
+      jobs: |
+        # The go.mod toolchain, and the newest Go release.
+        - name: test
+          run: make test
+          go: ["", stable]
+          artifact: test.out
+        # Line endings, paths and snapshot files differ by OS.
+        - name: test-os
+          os: [macos-latest, windows-latest]
+          lf: true
+          run: |
+            go test -count=1 ./...
+            go test -race -count=1 ./...
+        - name: acceptance
+          run: make test-acceptance
+        - name: lint
+          run: make lint
+        - name: fuzz
+          run: make test-fuzz
+        - name: corpus
+          run: make test-corpus
+        - name: benchmark
+          run: make test-bench
+          artifact: test_bench.out
+        - name: race
+          run: make test-race

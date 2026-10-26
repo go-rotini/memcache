@@ -106,8 +106,8 @@ func TestBulkLoadDoesNotOverwriteANewerWrite(t *testing.T) {
 }
 
 func TestClearKeepsTagsOfAConcurrentSet(t *testing.T) {
-	for _, clear := range []string{"Clear", "Reset"} {
-		t.Run(clear, func(t *testing.T) {
+	for _, method := range []string{"Clear", "Reset"} {
+		t.Run(method, func(t *testing.T) {
 			lost := 0
 			for r := range 100 {
 				c, _ := New[string, int](WithMaxEntries(100_000), WithShards(64))
@@ -116,7 +116,7 @@ func TestClearKeepsTagsOfAConcurrentSet(t *testing.T) {
 				}
 				var wg sync.WaitGroup
 				wg.Go(func() {
-					if clear == "Clear" {
+					if method == "Clear" {
 						c.Clear()
 					} else {
 						c.Reset()
@@ -137,7 +137,7 @@ func TestClearKeepsTagsOfAConcurrentSet(t *testing.T) {
 				_ = c.Close()
 			}
 			if lost > 0 {
-				t.Fatalf("InvalidateTag missed a key tagged during %s in %d of 100 rounds", clear, lost)
+				t.Fatalf("InvalidateTag missed a key tagged during %s in %d of 100 rounds", method, lost)
 			}
 		})
 	}
